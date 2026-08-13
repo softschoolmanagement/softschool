@@ -1,0 +1,92 @@
+package com.softschool.backend.service;
+
+import java.net.*;
+import java.nio.*;
+
+public class ZKHelper {
+    private String ip;
+    private int port;
+    private DatagramSocket socket;
+    private int sessionId = 0;
+    private int replyNumber = 0;
+
+    public ZKHelper(String ip, int port) {
+        this.ip = ip;
+        this.port = port;
+    }
+
+    public boolean connect() {
+        try {
+            socket = new DatagramSocket();
+            socket.setSoTimeout(2000);
+            InetAddress host = InetAddress.getByName(ip);
+
+            // 1. Send Handshake (Command 1000)
+            sendData((short) 1000, new byte[0]);
+
+            byte[] buffer = new byte[1024];
+            DatagramPacket reply = new DatagramPacket(buffer, buffer.length);
+            socket.receive(reply);
+
+            // 2. Extract Session ID (Bytes 12-13)
+            sessionId = (buffer[12] & 0xFF) | ((buffer[13] & 0xFF) << 8);
+            System.out.println("\n🔓 Machine Unlocked! Session ID: " + sessionId);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public String getLatestScan() {
+        try {
+            // 3. Request Logs (Command 13)
+            sendData((short) 13, new byte[0]);
+
+            byte[] buffer = new byte[1024];
+            DatagramPacket reply = new DatagramPacket(buffer, buffer.length);
+            socket.receive(reply);
+
+            // 4. Look for User ID 25 (0x19) in the data
+            if (reply.getLength() > 12) {
+                for (int i = 0; i < reply.getLength(); i++) {
+                    if ((buffer[i] & 0xFF) == 25) return "25";
+                }
+            }
+        } catch (Exception e) { }
+        return null;
+    }
+
+    // --- ZKTECO MATH ENGINE (Checksum Calculation) ---
+    private void sendData(short command, byte[] data) throws Exception {
+        ByteBuffer buf = ByteBuffer.allocate(16 + data.length).order(ByteOrder.LITTLE_ENDIAN);
+        buf.putShort(command);
+        buf.putShort((short) 0); // Checksum placeholder
+        buf.putShort((short) sessionId);
+        buf.putShort((short) replyNumber);
+        buf.put(data);
+
+        // Calculate Checksum
+        int checksum = 0;
+        byte[] packet = buf.array();
+        for (int i = 0; i < packet.length; i += 2) {
+            if (i + 1 < packet.length) {
+                checksum += ((packet[i] & 0xFF) | ((packet[i + 1] & 0xFF) << 8));
+            } else {
+                checksum += (packet[i] & 0xFF);
+            }
+        }
+        checksum = (checksum >> 16) + (checksum & 0xFFFF);
+        checksum = (~checksum) & 0xFFFF;
+
+        // Insert real checksum into byte 2-3
+        packet[2] = (byte) (checksum & 0xFF);
+        packet[3] = (byte) ((checksum >> 8) & 0xFF);
+
+        InetAddress host = InetAddress.getByName(ip);
+        socket.send(new DatagramPacket(packet, packet.length, host, port));
+    }
+
+    public void disconnect() {
+        if (socket != null) socket.close();
+    }
+}

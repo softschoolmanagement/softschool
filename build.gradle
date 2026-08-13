@@ -1,0 +1,69 @@
+plugins {
+	id 'java'
+	id 'org.springframework.boot' version '3.5.16'
+	id 'io.spring.dependency-management' version '1.1.7'
+}
+
+group = 'com.softschool'
+version = '0.0.1-SNAPSHOT'
+
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(17)
+	}
+}
+
+repositories {
+	mavenCentral()
+}
+
+dependencies {
+	implementation 'org.springframework.boot:spring-boot-starter-validation'
+	implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+	implementation 'org.springframework.boot:spring-boot-starter-web'
+	compileOnly 'org.projectlombok:lombok'
+	runtimeOnly 'com.mysql:mysql-connector-j'
+	annotationProcessor 'org.projectlombok:lombok'
+	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+	testCompileOnly 'org.projectlombok:lombok'
+	testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+	testAnnotationProcessor 'org.projectlombok:lombok'
+	implementation 'net.sf.ucanaccess:ucanaccess:5.0.1'
+}
+
+tasks.named('test') {
+	useJUnitPlatform()
+}
+
+// Auto-load .env into the process environment for `./gradlew bootRun`.
+// Spring Boot's ${VAR} placeholders only see real OS env vars / JVM system
+// properties, and Gradle does NOT read .env files on its own — without this,
+// every ${...:} placeholder in application.properties silently resolves to
+// empty when you run bootRun from the terminal.
+tasks.named('bootRun') {
+	doFirst {
+		def envFile = file('.env')
+		if (envFile.exists()) {
+			envFile.eachLine { rawLine ->
+				def line = rawLine.trim()
+				if (line && !line.startsWith('#')) {
+					int idx = line.indexOf('=')
+					if (idx > 0) {
+						String key = line.substring(0, idx).trim()
+						String value = line.substring(idx + 1).trim()
+						// strip surrounding quotes if present
+						if (value.length() >= 2 &&
+								((value.startsWith('"') && value.endsWith('"')) ||
+								 (value.startsWith("'") && value.endsWith("'")))) {
+							value = value.substring(1, value.length() - 1)
+						}
+						environment key, value
+					}
+				}
+			}
+			println "Loaded .env into bootRun environment"
+		} else {
+			println "WARNING: .env not found at ${envFile} - admin login and DB config will be unset"
+		}
+	}
+}
