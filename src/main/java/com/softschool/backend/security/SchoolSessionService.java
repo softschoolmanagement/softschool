@@ -26,7 +26,7 @@ public class SchoolSessionService {
     @Value("${school.session-secret-previous:}")
     private String previousSecret;
 
-    @Value("${school.session-ttl-minutes:1000")
+    @Value("${school.session-ttl-minutes:1000}")
     private long ttlMinutes;
 
     public boolean isConfigured() {
