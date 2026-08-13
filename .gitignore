@@ -40,8 +40,6 @@ out/
 # never committed. Only the .example templates get committed.
 .env
 !.env.example
-application.properties
-!application.properties.example
 
 *.hprof
 
