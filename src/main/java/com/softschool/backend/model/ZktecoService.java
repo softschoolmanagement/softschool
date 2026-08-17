@@ -1,4 +1,4 @@
-package com.softschool.backend.service;
+package com.softschool.backend.model;
 
 import com.softschool.backend.model.Attendance;
 import com.softschool.backend.model.Staff;

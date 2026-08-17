@@ -10,6 +10,7 @@ import org.springframework.stereotype.Service;
 
 import java.sql.*;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.List;
 import java.util.Optional;
@@ -70,7 +71,7 @@ public class ZktecoService {
                 Timestamp lastPunch = rs.getTimestamp("LastPunch");
 
                 if (badge != null && firstPunch != null) {
-                    processPunches(badge, name, firstPunch, lastPunch);
+                    processPunchesForSchool(schoolId, badge, name, firstPunch, lastPunch);
                 }
             }
         } catch (Exception e) {
@@ -130,7 +131,55 @@ public class ZktecoService {
         }
     }
 
+    /**
+     * Public entry point for external sources (currently: the local
+     * zkteco_sync_agent.py script, via BiometricController#syncPunches)
+     * that have already read today's punches out of the ZKTeco Time
+     * software's database themselves and just need them applied using the
+     * exact same rules as the old in-process syncFromZKSoftware() used —
+     * badge resolution, "don't overwrite manual absent/leave", and
+     * check-in-then-check-out semantics.
+     *
+     * schoolId is taken from the request rather than the mutable
+     * this.schoolId field, so this works correctly even if /link was never
+     * called (which is now the normal case, since the backend can't reach
+     * a local .mdb file once it's hosted on Railway).
+     *
+     * Returns how many of the given punches were actually processed
+     * (malformed entries are skipped, not counted).
+     */
+    public int ingestExternalPunches(String schoolId, List<com.softschool.backend.model.DevicePunch> punches) {
+        if (schoolId == null || schoolId.trim().isEmpty() || punches == null) return 0;
+
+        int processed = 0;
+        for (com.softschool.backend.model.DevicePunch p : punches) {
+            if (p == null) continue;
+            String badge = p.getBadgeNumber();
+            String firstRaw = p.getFirstPunch();
+            if (badge == null || badge.trim().isEmpty() || firstRaw == null || firstRaw.trim().isEmpty()) {
+                continue;
+            }
+            try {
+                LocalDateTime first = LocalDateTime.parse(firstRaw.trim());
+                String lastRaw = p.getLastPunch();
+                LocalDateTime last = (lastRaw != null && !lastRaw.trim().isEmpty())
+                        ? LocalDateTime.parse(lastRaw.trim())
+                        : first;
+                processPunchesForSchool(schoolId, badge.trim(), p.getName(), Timestamp.valueOf(first), Timestamp.valueOf(last));
+                processed++;
+            } catch (Exception e) {
+                System.err.println("⚠️ Biometric Sync: skipping malformed punch for badge "
+                        + badge + " (" + e.getMessage() + ")");
+            }
+        }
+        return processed;
+    }
+
     private void processPunches(String badgeNumber, String name, Timestamp first, Timestamp last) {
+        processPunchesForSchool(this.schoolId, badgeNumber, name, first, last);
+    }
+
+    private void processPunchesForSchool(String schoolId, String badgeNumber, String name, Timestamp first, Timestamp last) {
         LocalDate today = LocalDate.now();
 
         Optional<Staff> staffOpt = resolveStaff(badgeNumber, schoolId);
