@@ -112,6 +112,25 @@ public String testBiometric(@RequestParam String id) {
     return "Fingerprint process triggered for ID: " + id;
 }
 
+// BUGFIX — "Reports & Analytics' Attendance Trend graph and Avg Attendance
+// figure never show anything": Reports & Analytics needs a whole year's
+// worth of raw attendance rows at once (to bucket them into 12 monthly
+// present/total percentages), so it called plain GET /api/attendance with
+// only schoolId. But the ONLY GET mapped to that exact path is the
+// single-day summary below, which requires `date` as well — so that call
+// always came back 400 Bad Request, reports.js silently treated it as "no
+// data" (see _reportsGet's catch), and the chart/stat pill stayed empty
+// forever, even on schools with attendance marked every day. This endpoint
+// returns every row for the school, across every date, so Reports can
+// build its own per-month breakdown the same way the other trend charts do.
+@GetMapping("/all")
+public ResponseEntity<?> getAllAttendance(@RequestParam String schoolId) {
+    if (schoolId == null || schoolId.trim().isEmpty()) {
+        return ResponseEntity.badRequest().body("schoolId is required");
+    }
+    return ResponseEntity.ok(attendanceRepository.findBySchoolId(schoolId));
+}
+
 // Dashboard summary for one day: how many students/staff are marked
 // "present" so far, scoped to ONE school. Used by main.js (main page's
 // "Today's Attendance" widget) via GET /api/attendance?date=...&schoolId=...

@@ -34,13 +34,29 @@ public interface FinanceRepository extends JpaRepository<Finance, Long> {
     Optional<Finance> findByStaffIdAndMonthKeyAndRecordTypeAndSchoolId(
             String staffId, String monthKey, String recordType, String schoolId);
 
-    // ---- ADVANCE: outstanding (not-yet-settled) advances for a staff member in a given month ----
-    List<Finance> findByStaffIdAndMonthKeyAndRecordTypeAndSchoolIdAndPaymentStatus(
-            String staffId, String monthKey, String recordType, String schoolId, String paymentStatus);
+    // ---- ADVANCE: every outstanding advance for a staff member, regardless of
+    // which month it was originally taken in. Payroll settles whatever is
+    // still outstanding at payment time, not just advances tagged with the
+    // exact monthKey being paid — an advance taken mid-cycle or carried over
+    // from a month whose salary was paid late must still be picked up here,
+    // otherwise it's stuck showing as unsettled forever. Used by
+    // FinanceController#paySalary (replaces the old monthKey-scoped finder). ----
+    List<Finance> findByStaffIdAndRecordTypeAndSchoolIdAndPaymentStatus(
+            String staffId, String recordType, String schoolId, String paymentStatus);
 
     // ---- SALARY/ADVANCE history: every payroll record for a staff member, newest first ----
     List<Finance> findByStaffIdAndRecordTypeAndSchoolIdOrderByCreatedAtDesc(
             String staffId, String recordType, String schoolId);
+
+    // ---- Every SALARY/ADVANCE row that carries this staffId column, for this
+    // school — used to wipe a staff member's payroll history when they're
+    // deleted, so a later hire that reuses the same staffId (see
+    // manage-staff.js's generateStaffId(), which reuses the lowest free
+    // numeric suffix) never inherits a dead staff member's "already paid"
+    // salary record or leftover advance. Only SALARY/ADVANCE rows carry a
+    // real staffId column (bulk types like STAFF_BONUS only have it inside
+    // payloadJson), so this naturally only ever touches those two types. ----
+    long deleteByStaffIdAndSchoolId(String staffId, String schoolId);
 
     // ---- Generic "bulk list" support: every row of a given recordType for a
     // school (EXPENSE, CUSTOM_FEE, STAFF_BONUS, STAFF_FINE, VOUCHER,

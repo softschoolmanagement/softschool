@@ -32,7 +32,10 @@ import java.util.Date;
  *                  FineRecord entity. Many FINE rows roll up into one
  *                  STUDENT_FEE row's fineAmount/fineReason.
  *   SALARY      -> one row per staff salary payment for a month. Mirrors
- *                  the old SalaryRecord entity (paymentStatus = "Paid").
+ *                  the old SalaryRecord entity. paymentStatus is now
+ *                  derived by {@link #calculateSalaryDue()}: "Paid" only
+ *                  when amountPaid has caught up to totalDue, otherwise
+ *                  "Partial" or "Pending" — see that method's docs.
  *   ADVANCE     -> one row per staff salary advance. Also uses the old
  *                  SalaryRecord shape, but paymentStatus starts as
  *                  "Advance" and flips to "Settled" once a SALARY payment
@@ -121,7 +124,23 @@ public class Finance {
     private Double baseTuitionFee = 0.0;
     private Double transportFee = 0.0;
     private Double otherCharges = 0.0;   // includes rolled-over arrears
-    private Double fineAmount = 0.0;     // running total of this month's fines
+    private Double fineAmount = 0.0;     // running total of this month's CURRENTLY UNPAID fines
+                                          // (shrinks as individual fines get settled — still used
+                                          // for "Unpaid Fine" badges/defaulter lists elsewhere)
+    // BUGFIX — "Expected Fees drops the moment a fine is paid": netPayable
+    // used to be computed straight off `fineAmount` above, which is reduced
+    // to 0 the instant a fine is settled (see FinanceController#removeFineFromMaster
+    // / #settleCoveredFineRecords). That made Expected Fees / "Total with
+    // Fine" on both the Dashboard and Manage Finance visibly SHRINK right
+    // after a fine got paid, even though that fine was genuinely billed and
+    // genuinely collected. `totalFineCharged` is a separate running total —
+    // every fine ever added this month (see FinanceController#addFine), and
+    // it is NEVER reduced when a fine is later paid off. calculateNetPayable()
+    // below now uses this field, so Expected Fees stays permanently
+    // inclusive of every fine charged this month regardless of payment
+    // status; only Pending (remainingBalance, driven by paidAmount) still
+    // correctly drops to 0 once the bill — fine included — is actually paid.
+    private Double totalFineCharged = 0.0;
     private String fineReason;
     private Double totalDiscountApplied = 0.0;
 
@@ -134,7 +153,7 @@ public class Finance {
 
     // STUDENT_FEE: "Paid" | "Partial" | "Pending"
     // FINE / ADVANCE: "Pending" | "Paid" | "Settled"
-    // SALARY: "Paid" | "Advance"
+    // SALARY: "Paid" | "Partial" | "Pending" (see calculateSalaryDue())
     private String paymentStatus;
 
     @Temporal(TemporalType.TIMESTAMP)
@@ -154,8 +173,22 @@ public class Finance {
     private Double bonus;
     private Double fines;             // manual fine deducted in this payroll run
     private Double securityDeducted;
-    private Double advanceDeducted;
+    private Double advanceDeducted;   // advance(s) settled against this month's pay
+
+    // netPaid = the NEW cash handed over in *this* transaction only. It does
+    // NOT include the advance — the advance was already physically paid to
+    // the staff member earlier in the month, so it must not be paid out
+    // twice. This is what FinanceController#paySalary writes when it
+    // processes a (possibly partial) payment.
     private Double netPaid;
+
+    // ---- Derived SALARY totals — set by calculateSalaryDue(), never by
+    // hand. Kept as real columns (not computed on read) so salary history
+    // and reports can query/sort/filter on them directly. ----
+    private Double grossSalary;    // baseSalary + bonus
+    private Double totalDue;       // grossSalary - fines - securityDeducted
+    private Double amountPaid;     // advanceDeducted + netPaid ("Paid" = advance + current payment)
+    private Double pendingAmount;  // max(0, totalDue - amountPaid)
 
     private LocalDateTime paymentDate;
 
@@ -176,16 +209,20 @@ public class Finance {
         double tuition = (this.baseTuitionFee != null) ? this.baseTuitionFee : 0.0;
         double transport = (this.transportFee != null) ? this.transportFee : 0.0;
         double other = (this.otherCharges != null) ? this.otherCharges : 0.0;
-        double fineTotal = (this.fineAmount != null) ? this.fineAmount : 0.0;
+        // BUGFIX — use the PERMANENT fine total (totalFineCharged), not the
+        // shrinking "currently unpaid" fineAmount, so Expected Fees /
+        // netPayable never drops just because a fine got paid off. See the
+        // field doc on totalFineCharged above.
+        double fineTotal = (this.totalFineCharged != null) ? this.totalFineCharged : 0.0;
         double discount = (this.totalDiscountApplied != null) ? this.totalDiscountApplied : 0.0;
         double paid = (this.paidAmount != null) ? this.paidAmount : 0.0;
 
         double gross = tuition + transport + other + fineTotal;
         this.netPayable = Math.max(0.0, gross - discount);
-        // Never expose a negative balance after a payment that included a
-        // fine. When the fine is auto-settled, the master fineAmount is
-        // removed from netPayable while paidAmount still includes the money
-        // already collected for it.
+        // Pending correctly reaches 0 once paidAmount catches up to
+        // netPayable — including the fine, since paying it off (whether via
+        // the general bill payment or the individual "Pay Fine" button) adds
+        // that money into paidAmount rather than removing it from netPayable.
         this.remainingBalance = Math.max(0.0, this.netPayable - paid);
 
         if (this.remainingBalance <= 0.01) {
@@ -195,6 +232,58 @@ public class Finance {
         } else {
             this.paymentStatus = "Pending";
         }
+    }
+
+    /**
+     * SALARY math (recordType = SALARY). Mirrors calculateNetPayable()'s
+     * role for STUDENT_FEE: called once every field it depends on
+     * (baseSalary, bonus, fines, securityDeducted, advanceDeducted,
+     * netPaid) has been set, and it derives grossSalary/totalDue/
+     * amountPaid/pendingAmount/paymentStatus from them. Never set those
+     * derived fields directly — always go through this method so a Fine
+     * or an Advance can never drift out of sync with the totals.
+     *
+     * THE LOGIC:
+     *   1. Total Due   = Gross Salary (baseSalary + bonus) - Fine, less
+     *                    any security-deposit installment withheld this
+     *                    month (that money isn't owed to the staff member
+     *                    right now, so it can't count toward what's due).
+     *                    A Fine added before this is called always comes
+     *                    straight off Total Due.
+     *   2. Paid Amount = Advance + current payment (netPaid). The advance
+     *                    is a pre-payment already in the staff member's
+     *                    hands, so it counts as paid even though it was
+     *                    disbursed earlier in the month.
+     *   3. Pending      = max(0, Total Due - Paid Amount).
+     *   4. Status is "Paid" ONLY when Pending is ~0, i.e. Paid Amount has
+     *      actually caught up to Total Due — never just because a SALARY
+     *      row exists.
+     */
+    public void calculateSalaryDue() {
+        double gross = nz(this.baseSalary) + nz(this.bonus);
+        this.grossSalary = gross;
+
+        double fine = nz(this.fines);
+        double security = nz(this.securityDeducted);
+        this.totalDue = Math.max(0.0, gross - fine - security);
+
+        double advance = nz(this.advanceDeducted);
+        double current = nz(this.netPaid);
+        this.amountPaid = advance + current;
+
+        this.pendingAmount = Math.max(0.0, this.totalDue - this.amountPaid);
+
+        if (this.pendingAmount <= 0.01) {
+            this.paymentStatus = "Paid";
+        } else if (this.amountPaid > 0) {
+            this.paymentStatus = "Partial";
+        } else {
+            this.paymentStatus = "Pending";
+        }
+    }
+
+    private static double nz(Double d) {
+        return d != null ? d : 0.0;
     }
 
     /** Stamps applyDate/applyTime with "now", same format the old FineRecord constructor used. */

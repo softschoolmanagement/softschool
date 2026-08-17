@@ -93,6 +93,14 @@ public class Staff {
 
     private double fines;
 
+    // FEATURE — absence-fine wiring: derived, read-only, "right now" figure
+    // (never persisted — see StaffController#applyAbsenceFines, which fills
+    // this in every time staff are fetched). Lets manage-finance.js's salary
+    // pages and main.js's dashboard show the same absent-day count the fine
+    // above was actually calculated from, instead of just a lump number.
+    @Transient
+    private Integer absentDaysThisMonth;
+
     // Photo (Base64), stored the same way Student.photo is
     @Lob
     @Column(columnDefinition = "LONGTEXT")

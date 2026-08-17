@@ -1,14 +1,28 @@
 package com.softschool.backend.controller;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.softschool.backend.model.Attendance;
+import com.softschool.backend.model.DropoutStaffRecord;
+import com.softschool.backend.model.Finance;
+import com.softschool.backend.model.SchoolSettings;
 import com.softschool.backend.model.Staff;
+import com.softschool.backend.repository.AttendanceRepository;
+import com.softschool.backend.repository.DropoutStaffRecordRepository;
+import com.softschool.backend.repository.FinanceRepository;
+import com.softschool.backend.repository.SchoolSettingsRepository;
 import com.softschool.backend.repository.StaffRepository;
 import com.softschool.backend.service.PlanEnforcementService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.LocalDate;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -28,6 +42,20 @@ public class StaffController {
 
     @Autowired
     private PlanEnforcementService planEnforcementService;
+
+    @Autowired
+    private FinanceRepository financeRepository;
+
+    @Autowired
+    private DropoutStaffRecordRepository dropoutStaffRecordRepository;
+
+    @Autowired
+    private AttendanceRepository attendanceRepository;
+
+    @Autowired
+    private SchoolSettingsRepository schoolSettingsRepository;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @PostMapping
     public ResponseEntity<?> save(@RequestBody Staff staff) {
@@ -68,20 +96,237 @@ public class StaffController {
         if (isBlank(schoolId)) {
             return badRequest("schoolId query parameter is required.");
         }
-        return ResponseEntity.ok(staffRepository.findBySchoolId(schoolId));
+        List<Staff> staffList = staffRepository.findBySchoolId(schoolId);
+        applyAbsenceFines(staffList, schoolId);
+        return ResponseEntity.ok(staffList);
+    }
+
+    /**
+     * BUGFIX — "staff absent fine set from Settings never updates in
+     * Salaries or the Dashboard": nothing ever actually computed it. The
+     * Leave Penalty pay variable (Settings > Global Pay Variables ->
+     * SchoolSettings.payPenaltyType/payPenaltyValue, saved by
+     * SchoolSettingsController#saveAll) was always persisted correctly, and
+     * `Staff.fines` was always the field manage-finance.js's salary
+     * pages/panel and main.js's dashboard read (as `t.fines` /
+     * `member.fines`) — but the two were never wired together. The
+     * frontend's old client-side calculator (settings.js#computeAbsenceFine)
+     * was intentionally disabled the moment attendance moved server-side
+     * (see attendance.js#applyAbsenceFines: "Absence fines application
+     * handled by backend."), yet no backend replacement was ever written,
+     * so `fines` just silently stayed 0 forever, no matter what Leave
+     * Penalty was configured or how many days someone was actually marked
+     * absent.
+     *
+     * This fills `fines` (and the new `absentDaysThisMonth`, so the UI can
+     * show its work) in live, on every staff fetch, straight from real
+     * Attendance rows for the CURRENT calendar month and the school's Leave
+     * Penalty setting — "% per day" of that staff member's salary, or a
+     * flat Rs/day. Deliberately never persisted back to the DB: it's a
+     * derived, always-fresh "right now" figure, the same way
+     * main.js/_dashboardStaffFineTotals and manage-finance.js's
+     * getEffectiveSalaryDuePreview() already treat absence fines — a value
+     * that's only ever meaningful for the current month, not a historical
+     * fact to store.
+     */
+    private void applyAbsenceFines(List<Staff> staffList, String schoolId) {
+        if (staffList.isEmpty()) return;
+
+        LocalDate today = LocalDate.now();
+        LocalDate monthStart = today.withDayOfMonth(1);
+        LocalDate monthEnd = today.withDayOfMonth(today.lengthOfMonth());
+
+        List<Attendance> monthRows = attendanceRepository.findByMemberTypeAndSchoolIdAndDateBetween(
+                "STAFF", schoolId, monthStart, monthEnd);
+
+        Map<String, Integer> absentDaysByStaffId = new HashMap<>();
+        for (Attendance row : monthRows) {
+            if ("absent".equalsIgnoreCase(row.getStatus())) {
+                absentDaysByStaffId.merge(row.getMemberId(), 1, Integer::sum);
+            }
+        }
+
+        SchoolSettings settings = schoolSettingsRepository.findBySchoolId(schoolId).orElse(null);
+        String penaltyType = (settings != null && settings.getPayPenaltyType() != null)
+                ? settings.getPayPenaltyType()
+                : "percent";
+        double penaltyValue = (settings != null && settings.getPayPenaltyValue() != null)
+                ? settings.getPayPenaltyValue()
+                : 3.0;
+
+        for (Staff staff : staffList) {
+            int absentDays = absentDaysByStaffId.getOrDefault(staff.getStaffId(), 0);
+            staff.setAbsentDaysThisMonth(absentDays);
+            if (absentDays <= 0) {
+                staff.setFines(0);
+                continue;
+            }
+            double fine = "percent".equalsIgnoreCase(penaltyType)
+                    ? (staff.getSalary() * (penaltyValue / 100.0)) * absentDays
+                    : penaltyValue * absentDays;
+            staff.setFines(Math.round(fine));
+        }
     }
 
     @DeleteMapping("/{staffId}")
+    @Transactional
     public ResponseEntity<?> delete(@PathVariable String staffId, @RequestParam String schoolId) {
         if (isBlank(schoolId)) {
             return badRequest("schoolId query parameter is required.");
         }
         return staffRepository.findByStaffIdAndSchoolId(staffId, schoolId)
                 .map(existing -> {
+                    // BUGFIX — "deleted staff's paid salary/fines/advance
+                    // stop showing up anywhere on the dashboard": every
+                    // Finance row for this staffId is about to be wiped
+                    // below (see the next comment for why), so capture a
+                    // permanent snapshot of what was actually paid to this
+                    // staff member FIRST — before any of that history is
+                    // gone — and archive it as a DropoutStaffRecord. The
+                    // dashboard's "Dropout Staff Paid Salary" card (GET
+                    // /api/finance/dropout-staff) reads these archives back,
+                    // so money paid to now-deleted staff keeps counting
+                    // toward Net Expenses forever after, instead of
+                    // disappearing the moment the staff row is removed.
+                    archiveDropoutStaffSnapshot(existing, staffId, schoolId);
+
                     staffRepository.deleteById(existing.getId());
+
+                    // BUGFIX — "delete a staff member, add a new one, and the
+                    // new hire's salary shows Paid" / "add another after that
+                    // and it flips to Pending":
+                    //
+                    // manage-staff.js's generateStaffId() always reuses the
+                    // lowest free numeric suffix (e.g. delete staff #3, the
+                    // next hire becomes #3 again), but this endpoint used to
+                    // only delete the Staff row — every Finance row (SALARY,
+                    // ADVANCE, and staff bonus/fine entries) stayed behind,
+                    // still keyed by that same staffId. So the next hire who
+                    // got id #3 reused would immediately "inherit" whatever
+                    // salary/advance/bonus/fine history the deleted staff #3
+                    // had (e.g. an already-Paid salary row for the current
+                    // month), while the hire after that got a fresh, never
+                    // reused id and correctly showed Pending. Wiping every
+                    // finance record tied to this staffId here means a
+                    // reused id always starts with a clean slate.
+                    financeRepository.deleteByStaffIdAndSchoolId(staffId, schoolId);
+                    purgeStaffFromBulkFinanceLists(staffId, schoolId);
+
                     return ResponseEntity.ok().build();
                 })
                 .orElse(ResponseEntity.status(HttpStatus.NOT_FOUND).build());
+    }
+
+    /**
+     * Sums up everything this staff member was ever actually paid — every
+     * SALARY row's amountPaid (all months), every still-outstanding ADVANCE
+     * (paymentStatus != "Settled" — a settled advance is already folded
+     * into a SALARY row's amountPaid, so counting it here too would double
+     * it, mirroring how the live dashboard treats advances in main.js's
+     * _dashboardAdvanceTotal), and every STAFF_BONUS entry on file for
+     * them — plus their STAFF_FINE total, kept for record-keeping only
+     * (a fine is a deduction, not a payout, so it's never added into
+     * `total`). Only archives a record when there's actually something to
+     * remember, so deleting a staff member with zero finance history never
+     * clutters the dropout-staff list with a $0 row.
+     */
+    private void archiveDropoutStaffSnapshot(com.softschool.backend.model.Staff staff, String staffId, String schoolId) {
+        double paidSalaryTotal = financeRepository
+                .findByStaffIdAndRecordTypeAndSchoolIdOrderByCreatedAtDesc(staffId, Finance.TYPE_SALARY, schoolId)
+                .stream()
+                .mapToDouble(row -> {
+                    if (row.getAmountPaid() != null) return row.getAmountPaid();
+                    double netPaid = row.getNetPaid() != null ? row.getNetPaid() : 0.0;
+                    double advanceDeducted = row.getAdvanceDeducted() != null ? row.getAdvanceDeducted() : 0.0;
+                    return netPaid + advanceDeducted;
+                })
+                .sum();
+
+        double advancePaidTotal = financeRepository
+                .findByStaffIdAndRecordTypeAndSchoolIdOrderByCreatedAtDesc(staffId, Finance.TYPE_ADVANCE, schoolId)
+                .stream()
+                .filter(row -> !"Settled".equalsIgnoreCase(row.getPaymentStatus()))
+                .mapToDouble(row -> row.getAmount() != null ? row.getAmount() : 0.0)
+                .sum();
+
+        double bonusPaidTotal = sumBulkFinanceAmountForStaff(Finance.TYPE_STAFF_BONUS, staffId, schoolId);
+        double finesTotal = sumBulkFinanceAmountForStaff(Finance.TYPE_STAFF_FINE, staffId, schoolId);
+
+        double total = paidSalaryTotal + advancePaidTotal + bonusPaidTotal;
+        if (total <= 0.0 && finesTotal <= 0.0) {
+            return;
+        }
+
+        DropoutStaffRecord record = new DropoutStaffRecord();
+        record.setSchoolId(schoolId);
+        record.setStaffId(staffId);
+        record.setStaffName(staff.getName());
+        record.setPaidSalaryTotal(paidSalaryTotal);
+        record.setAdvancePaidTotal(advancePaidTotal);
+        record.setBonusPaidTotal(bonusPaidTotal);
+        record.setFinesTotal(finesTotal);
+        record.setTotal(total);
+        dropoutStaffRecordRepository.save(record);
+    }
+
+    /**
+     * Sums the "amount" field embedded in payloadJson for every row of a
+     * bulk-list recordType (STAFF_BONUS / STAFF_FINE) that belongs to this
+     * staff member — same lookup rowBelongsToStaff() below already does for
+     * purging, reused here to total them up before they're gone.
+     */
+    private double sumBulkFinanceAmountForStaff(String recordType, String staffId, String schoolId) {
+        return financeRepository.findByRecordTypeAndSchoolIdOrderByCreatedAtAsc(recordType, schoolId)
+                .stream()
+                .filter(row -> rowBelongsToStaff(row, staffId))
+                .mapToDouble(row -> {
+                    try {
+                        JsonNode node = objectMapper.readTree(row.getPayloadJson());
+                        return node.hasNonNull("amount") ? node.get("amount").asDouble() : 0.0;
+                    } catch (Exception e) {
+                        return 0.0;
+                    }
+                })
+                .sum();
+    }
+
+    /**
+     * STAFF_BONUS / STAFF_FINE / STAFF_ADVANCE_BULK rows (see Finance.java)
+     * don't carry a real staffId column — each row's staffId lives inside
+     * its payloadJson blob instead (as "staffId", falling back to "id").
+     * financeRepository.deleteByStaffIdAndSchoolId() can't reach those, so
+     * walk each bucket here and drop any row whose embedded staffId/id
+     * matches the staff member that was just deleted — otherwise a reused
+     * staffId could still surface a dead staff member's old bonus/fine
+     * entries once it's assigned to a new hire.
+     */
+    private void purgeStaffFromBulkFinanceLists(String staffId, String schoolId) {
+        List<String> bulkTypes = List.of(
+                Finance.TYPE_STAFF_BONUS,
+                Finance.TYPE_STAFF_FINE,
+                Finance.TYPE_STAFF_ADVANCE_BULK
+        );
+        for (String recordType : bulkTypes) {
+            List<Finance> rows = financeRepository.findByRecordTypeAndSchoolIdOrderByCreatedAtAsc(recordType, schoolId);
+            for (Finance row : rows) {
+                if (rowBelongsToStaff(row, staffId)) {
+                    financeRepository.delete(row);
+                }
+            }
+        }
+    }
+
+    private boolean rowBelongsToStaff(Finance row, String staffId) {
+        String payload = row.getPayloadJson();
+        if (isBlank(payload)) return false;
+        try {
+            JsonNode node = objectMapper.readTree(payload);
+            String embeddedStaffId = node.hasNonNull("staffId") ? node.get("staffId").asText()
+                    : node.hasNonNull("id") ? node.get("id").asText() : null;
+            return staffId.equals(embeddedStaffId);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private boolean isBlank(String s) {

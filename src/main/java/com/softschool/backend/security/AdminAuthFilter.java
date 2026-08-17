@@ -24,11 +24,12 @@ import java.io.IOException;
  * /api/admin-auth/login (see AdminSessionService for why that's safe to
  * keep client-side while the actual signing secret is not).
  *
- * Runs after RateLimitFilter (HIGHEST_PRECEDENCE) so brute-forcing logins
- * is already throttled before this even checks the token.
+ * Runs after CorsHeaderFilter and RateLimitFilter so brute-forcing logins
+ * is already throttled (and every response already carries CORS headers)
+ * before this even checks the token.
  */
 @Component
-@Order(Ordered.HIGHEST_PRECEDENCE + 1)
+@Order(Ordered.HIGHEST_PRECEDENCE + 11)
 public class AdminAuthFilter extends OncePerRequestFilter {
 
     private final AdminSessionService sessionService;

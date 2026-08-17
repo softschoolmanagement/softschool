@@ -25,6 +25,10 @@ import java.util.Set;
  * student/staff/finance/attendance/biometric/settings handler without a
  * server-issued school session. Any schoolId in a query, path, or JSON body
  * must match the school embedded in that signed session.
+ *
+ * Runs after CorsHeaderFilter so a rejection here (401/403) still reaches
+ * the browser as that real status code instead of being masked as a CORS
+ * failure.
  */
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE + 20)

@@ -2,9 +2,11 @@ package com.softschool.backend.controller;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.softschool.backend.model.DropoutStaffRecord;
 import com.softschool.backend.model.Finance;
 import com.softschool.backend.model.Staff;
 import com.softschool.backend.model.Student;
+import com.softschool.backend.repository.DropoutStaffRecordRepository;
 import com.softschool.backend.repository.FinanceRepository;
 import com.softschool.backend.repository.StaffRepository;
 import com.softschool.backend.repository.StudentRepository;
@@ -45,6 +47,7 @@ public class FinanceController {
     @Autowired private StudentRepository studentRepository;
     @Autowired private StaffRepository staffRepository;
     @Autowired private FinanceRepository financeRepository;
+    @Autowired private DropoutStaffRecordRepository dropoutStaffRecordRepository;
     @Autowired private PlanEnforcementService planEnforcementService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -142,10 +145,19 @@ public class FinanceController {
     public ResponseEntity<?> getAllFines(@PathVariable String monthKey, @RequestParam String schoolId) {
         if (isBlank(schoolId)) return badRequest("schoolId is required.");
 
+        // BUGFIX — "delete a student, their fine disappears from the
+        // dashboard/finance totals": this used to filter out any row whose
+        // linked student is no longer "active" (isActiveStudentInSchool),
+        // which meant the instant a student was soft-deleted (status ->
+        // "dropped" — see StudentController#deleteStudent), any fine they'd
+        // already been charged this month vanished from every screen that
+        // reads this endpoint, even though the fine (and any money already
+        // collected against it) genuinely happened. A student's current
+        // status must never rewrite finance history — see the identical fix
+        // on /status-all and /fine-details below.
         List<Finance> allRecords = financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
                 monthKey, Finance.TYPE_STUDENT_FEE, schoolId);
         List<Finance> withFines = allRecords.stream()
-                .filter(f -> isActiveStudentInSchool(f.getRegNo(), schoolId))
                 .filter(f -> f.getFineAmount() != null && f.getFineAmount() > 0)
                 .collect(Collectors.toList());
         return ResponseEntity.ok(withFines);
@@ -160,11 +172,29 @@ public class FinanceController {
     @GetMapping("/status-all/{monthKey}")
     public ResponseEntity<?> getAllStudentFeeStatus(@PathVariable String monthKey, @RequestParam String schoolId) {
         if (isBlank(schoolId)) return badRequest("schoolId is required.");
+        // BUGFIX — "delete a student and their collected fees vanish from
+        // the Dashboard / Manage Finance totals": this endpoint is the
+        // authoritative source every "Collected"/"Pending"/"Total Revenue"
+        // figure (main.js's calculateFinancials, manage-finance.js's
+        // updateFeeStatsHeader/updateClassFeeStats) sums across the whole
+        // school. It used to drop any row whose linked student was no
+        // longer "active" (isActiveStudentInSchool) — so the moment a
+        // student was soft-deleted (StudentController#deleteStudent just
+        // flips status to "dropped", it never removes the Finance row),
+        // money that had genuinely already been paid in for this billing
+        // month disappeared from every revenue figure on the site, and Net
+        // Profit/Total Revenue went wrong along with it. A student's
+        // CURRENT status must never rewrite what already happened
+        // financially — billing NEW fees onto a dropped student is still
+        // blocked (findStudentInSchool()/getOrCreateStudentFeeMaster()
+        // still require an active student), but reading back rows that
+        // already exist must not be. Front-end billing tables/selectors
+        // separately re-filter to active students for anything actionable
+        // (Pay Bill, Generate Voucher, etc.), so this doesn't resurrect a
+        // dropped student anywhere they could actually be billed again.
         List<Finance> records = financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
                 monthKey, Finance.TYPE_STUDENT_FEE, schoolId);
-        return ResponseEntity.ok(records.stream()
-                .filter(record -> isActiveStudentInSchool(record.getRegNo(), schoolId))
-                .collect(Collectors.toList()));
+        return ResponseEntity.ok(records);
     }
 
     // =========================================================
@@ -210,6 +240,13 @@ public class FinanceController {
         }
 
         master.setFineAmount(nz(master.getFineAmount()) + amount);
+        // BUGFIX — Expected Fees must permanently include this fine, even
+        // after it's later paid off. fineAmount above still tracks the
+        // CURRENTLY UNPAID portion (shrinks as fines are settled — used for
+        // "Unpaid Fine" badges/defaulter lists), but totalFineCharged is a
+        // running total that only ever grows, and is what
+        // Finance#calculateNetPayable() now uses for netPayable/Expected.
+        master.setTotalFineCharged(nz(master.getTotalFineCharged()) + amount);
         master.setFineReason(isBlank(master.getFineReason()) ? reason : master.getFineReason() + ", " + reason);
         master.calculateNetPayable();
         financeRepository.save(master);
@@ -267,6 +304,22 @@ public class FinanceController {
         if (discount > 0) {
             master.setTotalDiscountApplied(nz(master.getTotalDiscountApplied()) + discount);
         }
+        // BUGFIX — "Reports' Revenue vs Expenses / Net Cash Flow Trend
+        // charts show the wrong month for real money collected": this
+        // master row is created once (getOrCreateStudentFeeMaster, e.g.
+        // when the fee sheet is first opened for the month) and then
+        // updated in place every time a payment comes in — but nothing
+        // ever recorded WHEN a payment actually happened. Reports.js has
+        // always looked for that on lastTransactionDate/paymentDate first,
+        // falling back to createdAt (the row's *creation* time) only when
+        // nothing else is present — which was always, since this field was
+        // declared but never stamped. That silently misattributed revenue
+        // to whichever month the bill was first generated instead of the
+        // month it was actually paid (e.g. paying off a prior month's
+        // arrears, or paying late) — the underlying cause of "the graph
+        // doesn't show real revenue". Stamp it on every payment so the
+        // charts (and anything else reading it) reflect the true payment date.
+        master.setLastTransactionDate(new Date());
         master.calculateNetPayable();
 
         // Auto-settle individual fines covered by this payment and remove
@@ -338,8 +391,14 @@ public class FinanceController {
             return false;
         }
 
+        // BUGFIX — netPayable is now driven by totalFineCharged (the
+        // permanent fine total), not fineAmount (the shrinking unpaid
+        // portion) — see Finance#calculateNetPayable — so "fee amount minus
+        // fines" here must subtract totalFineCharged too, or this would
+        // overstate the base fee and mis-settle which individual fine rows
+        // count as covered.
         double feesWithoutFines = Math.max(0.0,
-                nz(master.getNetPayable()) - nz(master.getFineAmount()));
+                nz(master.getNetPayable()) - nz(master.getTotalFineCharged()));
         double coveredForFines = nz(master.getPaidAmount()) - feesWithoutFines;
         if (coveredForFines <= 0.01) {
             return false;
@@ -398,6 +457,20 @@ public class FinanceController {
 
     private void removeFineFromMaster(Finance master, Finance fine) {
         master.setFineAmount(Math.max(0, nz(master.getFineAmount()) - nz(fine.getAmount())));
+        // BUGFIX — "Collected/Pending don't move after paying a fine on its
+        // own": this individual settlement is real cash actually collected
+        // from the student, exactly like a general bill payment — so it now
+        // increases paidAmount the same way processPayment() does. This is
+        // what makes Pending (remainingBalance = netPayable - paidAmount)
+        // correctly drop by the fine amount, and Collected (paidAmount,
+        // summed on the Dashboard/Manage Finance) correctly rise by it, even
+        // though Expected/netPayable (driven by totalFineCharged, never
+        // reduced here) stays exactly where it was.
+        master.setPaidAmount(nz(master.getPaidAmount()) + nz(fine.getAmount()));
+        // Same fix as processPayment() above — this is real cash collected
+        // right now too, so it must move the master's "last paid" date the
+        // same way, or Reports will still misdate this money.
+        master.setLastTransactionDate(new Date());
         if (master.getFineReason() != null && fine.getReason() != null) {
             String updated = master.getFineReason().replace(fine.getReason(), "")
                     .replaceAll(",\\s*,", ",")
@@ -414,11 +487,13 @@ public class FinanceController {
                                              @PathVariable String monthKey,
                                              @RequestParam String schoolId) {
         if (isBlank(schoolId)) return badRequest("schoolId is required.");
+        // BUGFIX — see the identical fix on /status-all above: blanking this
+        // out for a dropped student erased their already-paid fine history
+        // from the Dashboard's "Student Late/Other Fines" boxes the instant
+        // they were deleted. A fine that was genuinely charged/paid stays
+        // visible regardless of the student's current roster status.
         List<Finance> fines = financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolIdOrderByCreatedAtDesc(
                 regNo, monthKey, Finance.TYPE_FINE, schoolId);
-        if (!isActiveStudentInSchool(regNo, schoolId)) {
-            return ResponseEntity.ok(Collections.emptyList());
-        }
         return ResponseEntity.ok(fines);
     }
 
@@ -426,13 +501,18 @@ public class FinanceController {
     // 7. SALARY PAYMENT (settles any pending advances + security deposit)
     // =========================================================
     @PostMapping("/salary/pay")
+    @Transactional
     public ResponseEntity<?> paySalary(@RequestBody Map<String, Object> payload) {
         try {
             String schoolId = str(payload, "schoolId");
             String staffId = str(payload, "staffId");
             String monthKey = str(payload, "monthKey");
             double bonus = doubleOr(payload, "bonus", 0);
-            double fine = doubleOr(payload, "fine", 0);
+            // Optional: how much cash is actually being handed over right
+            // now. Omit it (the existing frontend does) to settle the full
+            // remaining balance in one go; pass it explicitly to record a
+            // partial salary payment.
+            Double amountPaidInput = doubleOrNull(payload, "amountPaid");
 
             if (isBlank(schoolId)) return badRequest("schoolId is required.");
             planEnforcementService.requireFeature(schoolId, PlanEnforcementService.FEATURE_FINANCE);
@@ -450,9 +530,28 @@ public class FinanceController {
 
             double baseSalary = staff.getSalary();
 
-            // Settle any outstanding advances for this staff member this month
-            List<Finance> pendingAdvances = financeRepository.findByStaffIdAndMonthKeyAndRecordTypeAndSchoolIdAndPaymentStatus(
-                    staffId, monthKey, Finance.TYPE_ADVANCE, schoolId, "Advance");
+            // ---- "checks for existing Fines and Advances for that staff
+            // member in that month" before processing the payment ----
+
+            // FINES: sum whatever's already recorded in the STAFF_FINE list
+            // for this staff member this month, and use whichever is larger
+            // of that and the value the client sent. This way an existing,
+            // on-file fine can never be silently dropped just because the
+            // client didn't resend it, but the admin can still key in a
+            // fresh fine at payment time that isn't saved as a STAFF_FINE
+            // row yet.
+            double existingFineTotal = computeExistingStaffFineTotal(staffId, monthKey, schoolId);
+            double fine = Math.max(doubleOr(payload, "fine", 0), existingFineTotal);
+
+            // ADVANCES: settle every advance still outstanding for this
+            // staff member, not only ones tagged with this exact monthKey.
+            // An advance taken earlier (e.g. mid-cycle, or a month whose
+            // salary ended up being paid late) must still be picked up here
+            // — this is what was leaving advances stuck un-settled and
+            // showing "Pending" even after the staff member's salary had
+            // been paid in full.
+            List<Finance> pendingAdvances = financeRepository.findByStaffIdAndRecordTypeAndSchoolIdAndPaymentStatus(
+                    staffId, Finance.TYPE_ADVANCE, schoolId, "Advance");
             double advanceDeducted = 0.0;
             for (Finance adv : pendingAdvances) {
                 advanceDeducted += nz(adv.getAmount());
@@ -470,7 +569,18 @@ public class FinanceController {
                 staffRepository.save(staff);
             }
 
-            double netPaid = baseSalary + bonus - fine - advanceDeducted - securityDeducted;
+            // Total Due = Gross Salary (base + bonus) - Fine - security withheld.
+            double totalDue = Math.max(0.0, baseSalary + bonus - fine - securityDeducted);
+
+            // Current payment: cash disbursed in THIS transaction only —
+            // the advance is NOT re-paid here, it's already in the staff
+            // member's hands and gets folded into Paid Amount below.
+            // Defaults to "pay off whatever's left after the advance" so
+            // the normal pay-in-full flow needs no extra input; an explicit
+            // amountPaid records a partial payment instead.
+            double netPaid = (amountPaidInput != null)
+                    ? amountPaidInput
+                    : Math.max(0.0, totalDue - advanceDeducted);
 
             Finance record = new Finance();
             record.setSchoolId(schoolId);
@@ -484,12 +594,44 @@ public class FinanceController {
             record.setAdvanceDeducted(advanceDeducted);
             record.setNetPaid(netPaid);
             record.setPaymentDate(LocalDateTime.now());
-            record.setPaymentStatus("Paid");
+
+            // Paid Amount = Advance + New Payment; status becomes "Paid"
+            // only once Paid Amount >= Total Due (Salary - Fine), otherwise
+            // it stays "Pending" — see Finance#calculateSalaryDue().
+            record.calculateSalaryDue();
 
             return ResponseEntity.ok(financeRepository.save(record));
         } catch (Exception e) {
             return badRequest(e.getMessage());
         }
+    }
+
+    /**
+     * Sums the STAFF_FINE bulk-list entries (recordType = STAFF_FINE, saved
+     * via PUT /staff-fines) that belong to this staff member and month.
+     * Each entry is stored as raw JSON in payloadJson (see Finance.java's
+     * docs on the "bulk list" record types), so this reads staffId/id,
+     * monthKey and amount back out of that JSON rather than a real column.
+     * Used by paySalary() to make sure a fine that's already on file always
+     * counts against Total Due, even if the client didn't resend it.
+     */
+    private double computeExistingStaffFineTotal(String staffId, String monthKey, String schoolId) {
+        double total = 0.0;
+        for (Finance row : financeRepository.findByRecordTypeAndSchoolIdOrderByCreatedAtAsc(
+                Finance.TYPE_STAFF_FINE, schoolId)) {
+            try {
+                JsonNode node = objectMapper.readTree(row.getPayloadJson());
+                String rowStaffId = node.hasNonNull("staffId") ? node.get("staffId").asText()
+                        : (node.hasNonNull("id") ? node.get("id").asText() : null);
+                String rowMonthKey = node.hasNonNull("monthKey") ? node.get("monthKey").asText() : null;
+                if (staffId.equals(rowStaffId) && (rowMonthKey == null || monthKey.equals(rowMonthKey))) {
+                    total += node.hasNonNull("amount") ? node.get("amount").asDouble() : 0.0;
+                }
+            } catch (Exception ignored) {
+                // skip a row that isn't valid/expected JSON rather than failing the whole lookup
+            }
+        }
+        return total;
     }
 
     // =========================================================
@@ -537,7 +679,10 @@ public class FinanceController {
         if (isBlank(schoolId)) return badRequest("schoolId is required.");
         Optional<Finance> record = financeRepository.findByStaffIdAndMonthKeyAndRecordTypeAndSchoolId(
                 staffId, monthKey, Finance.TYPE_SALARY, schoolId);
-        return ResponseEntity.ok(Map.of("paid", record.isPresent()));
+        // A SALARY row can exist with "Pending" status if Paid Amount hasn't
+        // caught up to Total Due yet — only "Paid" actually means paid.
+        boolean paid = record.isPresent() && "Paid".equalsIgnoreCase(record.get().getPaymentStatus());
+        return ResponseEntity.ok(Map.of("paid", paid));
     }
 
     /**
@@ -552,6 +697,40 @@ public class FinanceController {
         return ResponseEntity.ok(
                 financeRepository.findByRecordTypeAndSchoolIdOrderByCreatedAtAsc(
                         Finance.TYPE_SALARY, schoolId));
+    }
+
+    // =========================================================
+    // 9b. DROPOUT STAFF — lifetime paid-salary/bonus/advance snapshot for
+    //     staff members who have since been deleted (see
+    //     StaffController#delete(), which archives a DropoutStaffRecord
+    //     right before wiping that staff member's Finance rows).
+    //
+    //     `total` is a lifetime figure, not scoped to any month — the
+    //     frontend dashboard (main.js's calculateFinancials) folds it into
+    //     the CURRENT month's Net Expenses only, since there's no honest
+    //     way to say which past month it "belongs" to.
+    // =========================================================
+    @GetMapping("/dropout-staff")
+    public ResponseEntity<?> getDropoutStaffSalaries(@RequestParam String schoolId) {
+        if (isBlank(schoolId)) return badRequest("schoolId is required.");
+        List<DropoutStaffRecord> records =
+                dropoutStaffRecordRepository.findBySchoolIdOrderByDeletedAtDesc(schoolId);
+        double total = records.stream().mapToDouble(r -> nz(r.getTotal())).sum();
+
+        // FEATURE — "deleting a staff member removes their fine from the
+        // dashboard's Staff Fine total": the STAFF_FINE bulk-list rows for
+        // a deleted staff member are wiped by StaffController#delete() (see
+        // its docs), but their fine total was captured into this same
+        // archive first (see archiveDropoutStaffSnapshot()) — surface it
+        // here too so main.js's dashboard can keep counting it after the
+        // staff member is gone, the same way it already does for `total`.
+        double finesTotal = records.stream().mapToDouble(r -> nz(r.getFinesTotal())).sum();
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("total", total);
+        result.put("finesTotal", finesTotal);
+        result.put("records", records);
+        return ResponseEntity.ok(result);
     }
 
     // =========================================================
@@ -677,8 +856,19 @@ public class FinanceController {
 
     /**
      * A bonus can be entered after payroll was already paid. Keep the
-     * corresponding SALARY row's bonus and netPaid columns synchronized with
-     * the current STAFF_BONUS list so salary history remains accurate.
+     * corresponding SALARY row's bonus (and its Total Due / Paid Amount /
+     * Pending Amount / status) synchronized with the current STAFF_BONUS
+     * list so salary history remains accurate.
+     *
+     * BUGFIX: this used to recompute netPaid by hand with a formula that
+     * subtracted advanceDeducted directly (double-counting the advance,
+     * since it's not repaid again — it's already folded into Paid Amount)
+     * and never touched totalDue/amountPaid/pendingAmount/paymentStatus at
+     * all. That's what could leave "Paid" showing an amount lower than what
+     * was actually given, and a row's status stuck stale after a late bonus
+     * edit. Now it goes through calculateSalaryDue(), the same single
+     * source of truth paySalary() uses, so a bonus edit can never desync
+     * the totals or the status.
      */
     @SuppressWarnings("unchecked")
     private void syncSalaryRecordsWithBonuses(List<?> items, String schoolId) {
@@ -713,12 +903,11 @@ public class FinanceController {
             if (Math.abs(nz(salary.getBonus()) - updatedBonus) <= 0.01) continue;
 
             salary.setBonus(updatedBonus);
-            double updatedNetPaid = nz(salary.getBaseSalary())
-                    + updatedBonus
-                    - nz(salary.getFines())
-                    - nz(salary.getSecurityDeducted())
-                    - nz(salary.getAdvanceDeducted());
-            salary.setNetPaid(updatedNetPaid);
+            // netPaid (this transaction's cash) doesn't change just because
+            // the gross went up — the extra bonus simply increases Total
+            // Due, which shows up as Pending Amount until it's actually
+            // paid out. Recompute everything else off of that.
+            salary.calculateSalaryDue();
             financeRepository.save(salary);
         }
     }
@@ -802,19 +991,11 @@ public class FinanceController {
         return null;
     }
 
-    /**
-     * Finance is an active-roster module. Student Management deliberately
-     * returns archived rows as well for its Archive Center, so every finance
-     * read that starts from stored ledger rows must re-check the linked
-     * student's current status before returning it.
-     */
-    private boolean isActiveStudentInSchool(String regNo, String schoolId) {
-        if (isBlank(regNo) || isBlank(schoolId)) return false;
-        return studentRepository.findByRegNoAndSchoolId(regNo, schoolId)
-                .map(this::isActiveStudent)
-                .orElse(false);
-    }
-
+    // NOTE: reading back already-recorded finance history (status-all,
+    // all-fines, fine-details above) deliberately does NOT re-check the
+    // linked student's current status any more — see the BUGFIX comments on
+    // those endpoints. isActiveStudent() below is still used to gate
+    // creating/billing NEW records for a student (findStudentInSchool).
     private boolean isActiveStudent(Student student) {
         if (student == null) return false;
         String status = student.getStatus();

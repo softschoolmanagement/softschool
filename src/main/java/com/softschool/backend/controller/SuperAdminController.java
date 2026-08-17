@@ -3,6 +3,7 @@ package com.softschool.backend.controller;
 import com.softschool.backend.model.Plan;
 import com.softschool.backend.model.School;
 import com.softschool.backend.repository.AttendanceRepository;
+import com.softschool.backend.repository.DropoutStaffRecordRepository;
 import com.softschool.backend.repository.FinanceRepository;
 import com.softschool.backend.repository.PlanRepository;
 import com.softschool.backend.repository.SchoolRepository;
@@ -44,6 +45,9 @@ public class SuperAdminController {
 
     @Autowired
     private StaffRepository staffRepository;
+
+    @Autowired
+    private DropoutStaffRecordRepository dropoutStaffRecordRepository;
 
     private static final String SCHOOL_ID_PREFIX = "SS_77";
     private static final String SECURITY_CODE_LETTERS = "abcdefghijklmnopqrstuvwxyz";
@@ -346,11 +350,19 @@ public ResponseEntity<?> updatePlan(@PathVariable String id, @RequestBody Plan p
     // Permanent delete = wipes the school's own students, all its finance
     // records (fee ledgers, fines, salaries, advances), its settings row
     // (class fees, late fee rules, pay variables, attendance timing), its
-    // attendance history, AND its staff (teaching + non-teaching) too. This
-    // is deliberately different from block/unblock (setStatus above), which
-    // only flips School.status and never touches students, staff, finance,
-    // settings, or attendance data — a blocked school's records are kept
-    // intact in case it's unblocked later.
+    // attendance history, its staff (teaching + non-teaching), AND its
+    // archived dropout-staff records (lifetime salary/bonus/fine totals for
+    // staff who were deleted while this school existed — see
+    // DropoutStaffRecord's class docs). Without clearing this table too, a
+    // deleted school's schoolId can be reissued to a brand-new school (see
+    // createSchool below), and that new school would instantly "inherit"
+    // the old school's dropout-staff salary/fine totals into its own
+    // dashboard, because DropoutStaffRecord rows are looked up purely by
+    // schoolId with no link back to the (now-deleted) School row itself.
+    // This is deliberately different from block/unblock (setStatus above),
+    // which only flips School.status and never touches students, staff,
+    // finance, settings, attendance, or dropout-staff data — a blocked
+    // school's records are kept intact in case it's unblocked later.
     @Transactional
     @DeleteMapping("/schools/{id}")
     public ResponseEntity<?> deleteSchool(@PathVariable Long id) {
@@ -360,6 +372,7 @@ public ResponseEntity<?> updatePlan(@PathVariable String id, @RequestBody Plan p
             financeRepository.deleteBySchoolId(school.getSchoolId());
             schoolSettingsRepository.deleteBySchoolId(school.getSchoolId());
             attendanceRepository.deleteBySchoolId(school.getSchoolId());
+            dropoutStaffRecordRepository.deleteBySchoolId(school.getSchoolId());
             schoolRepository.delete(school);
             return ResponseEntity.noContent().build();
         }).orElse(ResponseEntity.notFound().build());

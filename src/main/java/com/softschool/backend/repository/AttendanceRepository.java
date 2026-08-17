@@ -32,6 +32,20 @@ public interface AttendanceRepository extends JpaRepository<Attendance, Long> {
     // that happens to match one in another school never leaks in).
     List<Attendance> findByMemberIdAndSchoolIdOrderByDateDesc(String memberId, String schoolId);
 
+    // Every STAFF attendance row for one school within a date range, in a
+    // single query — used by StaffController#applyAbsenceFines to count
+    // this month's absent days for every staff member at once instead of
+    // querying per-person.
+    List<Attendance> findByMemberTypeAndSchoolIdAndDateBetween(
+            String memberType, String schoolId, LocalDate start, LocalDate end);
+
+    // EVERY attendance row (every member, every date) for one school —
+    // used by Reports & Analytics to build the 12-month Attendance Trend
+    // chart / Avg Attendance figure, which needs the whole year's raw marks
+    // at once rather than one day at a time. See AttendanceController's
+    // GET /all for why this had to be added.
+    List<Attendance> findBySchoolId(String schoolId);
+
     // Used by SuperAdminController#deleteSchool to permanently wipe every
     // attendance record for a school when the school itself is deleted.
     // NOT called on block/unblock — a blocked school's attendance history

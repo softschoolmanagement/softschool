@@ -132,15 +132,92 @@ public class StudentController {
         existing.setTransportFee(in.getTransportFee());
         existing.setNetPayable(in.getNetPayable());
         existing.setOtherFeesData(in.getOtherFeesData());
+        existing.setIsLifetime(in.getIsLifetime());
+        existing.setDiscountExpiry(in.getDiscountExpiry());
         if (in.getStatus() != null) {
             existing.setStatus(in.getStatus());
         }
+
+        // Graduation snapshot (see Student.graduatedDate for why this needs
+        // to be copied explicitly, same reasoning as droppedDate below).
+        existing.setGraduatedDate(in.getGraduatedDate());
+        existing.setGraduatedYear(in.getGraduatedYear());
+        existing.setGraduatedClass(in.getGraduatedClass());
+        existing.setGraduatedSection(in.getGraduatedSection());
+
+        // Sibling link fields — without copying these here, marking the
+        // ORIGINAL (already-admitted) student as part of a sibling group
+        // silently failed to persist: the entity gained the columns, but an
+        // update to an existing student only ever passed through this
+        // whitelist, which never listed them.
+        existing.setSiblingGroupId(in.getSiblingGroupId());
+        existing.setIsSibling(in.getIsSibling());
+        existing.setSiblingOf(in.getSiblingOf());
+        existing.setHasSiblings(in.getHasSiblings());
+
+        // Archive Center "Date Removed" — see Student.droppedDate for why
+        // this needs to be copied explicitly, same reasoning as the sibling
+        // fields above.
+        existing.setDroppedDate(in.getDroppedDate());
+
+        // Voucher / arrears state (manage-finance.js) — see Student.arrears
+        // for why these need to be copied explicitly, same reasoning as the
+        // sibling/droppedDate fields above: adding the columns alone does
+        // nothing unless an update actually overlays them onto the managed
+        // row here.
+        existing.setArrears(in.getArrears());
+        existing.setVoucherCustomFees(in.getVoucherCustomFees());
+        existing.setVoucherCustomFeesMonth(in.getVoucherCustomFeesMonth());
+        existing.setVoucherBulkDiscount(in.getVoucherBulkDiscount());
+        existing.setVoucherNote(in.getVoucherNote());
 
         // Guarded fields: only overwrite if the incoming value is non-blank,
         // so a save that (for whatever reason) arrives without a photo/certData
         // never erases the one already on file.
         if (!isBlank(in.getPhoto()))    existing.setPhoto(in.getPhoto());
         if (!isBlank(in.getCertData())) existing.setCertData(in.getCertData());
+    }
+
+    /**
+     * BUGFIX — "arrears/voucher edits never persist": manage-finance.js's
+     * saveStudentsCache() has always PUT-ed the whole roster to this exact
+     * URL ({@code PUT /api/students} with body {@code {items:[...],
+     * schoolId}}) every time it edits arrears, a voucher note, or a custom
+     * voucher breakdown. No handler existed for it — only POST "" (create
+     * one) and PUT "/{regNo}" (update one) did — so every one of those
+     * saves 404'd silently (_backendSave only console.warns on a failed
+     * request) and never reached the database at all.
+     *
+     * Upserts each item through the same existing-row-merge logic as the
+     * single-student endpoints above (never a delete-then-recreate of the
+     * whole table, which would be destructive for roster data and would
+     * mint new IDs). Unknown/malformed items are skipped rather than
+     * failing the whole batch, matching FinanceController#bulkSave's
+     * tolerance.
+     */
+    @PutMapping({"", "/"})
+    public ResponseEntity<?> bulkSaveStudents(@RequestBody(required = false) Map<String, Object> payload) {
+        if (payload == null) return badRequest("Request body is required.");
+        String schoolId = payload.get("schoolId") != null ? payload.get("schoolId").toString() : null;
+        if (isBlank(schoolId)) return badRequest("schoolId is required.");
+
+        Object itemsObj = payload.get("items");
+        if (!(itemsObj instanceof java.util.List)) return badRequest("items array is required.");
+
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        for (Object item : (java.util.List<?>) itemsObj) {
+            try {
+                Student incoming = mapper.convertValue(item, Student.class);
+                if (isBlank(incoming.getSchoolId())) incoming.setSchoolId(schoolId);
+                if (isBlank(incoming.getSchoolId())) continue; // still no schoolId — skip rather than fail the batch
+                persistStudent(incoming);
+            } catch (Exception e) {
+                // Skip a single malformed item rather than failing the whole batch —
+                // matches FinanceController#bulkSave's per-item tolerance.
+            }
+        }
+
+        return ResponseEntity.ok(studentRepository.findBySchoolId(schoolId));
     }
 
     @GetMapping

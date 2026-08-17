@@ -58,8 +58,10 @@ import java.util.Set;
  *   ratelimit.auth.identity-capacity=7
  *   ratelimit.auth.identity-window-seconds=300
  */
+// Runs after CorsHeaderFilter (HIGHEST_PRECEDENCE) so every response this
+// filter produces — including its 429s — already carries CORS headers.
 @Component
-@Order(Ordered.HIGHEST_PRECEDENCE)
+@Order(Ordered.HIGHEST_PRECEDENCE + 10)
 public class RateLimitFilter extends OncePerRequestFilter {
 
     private final RateLimiter rateLimiter;
