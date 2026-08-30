@@ -20,11 +20,14 @@ public interface StaffRepository extends JpaRepository<Staff, Long> {
     // "X / staffLimit" usage and trigger the near-limit alert.
     long countBySchoolId(String schoolId);
 
-    // PERFORMANCE FIX (slow Staff dashboard card) — see StaffSummaryDTO:
-    // selects only staffId + salary at the SQL level, so photo/agreementData/
-    // classAssignments/inchargeAssignments LONGTEXT columns are never read
-    // or sent over the wire just to compute a headcount + fines total.
+    // PERFORMANCE FIX (slow Staff dashboard card AND slow Attendance page
+    // roster cards) — see StaffSummaryDTO: selects only the plain columns
+    // main.js's dashboard and attendance.js's roster cards actually read,
+    // so photo/agreementData/classAssignments/inchargeAssignments LONGTEXT
+    // columns are never read or sent over the wire just to compute a
+    // headcount + fines total, or render a staff member's name/role.
     @Query("select new com.softschool.backend.dto.StaffSummaryDTO(" +
-            "s.staffId, s.salary) from Staff s where s.schoolId = :schoolId")
+            "s.staffId, s.salary, s.type, s.name, s.role, s.subjects, s.job) " +
+            "from Staff s where s.schoolId = :schoolId")
     List<StaffSummaryDTO> findSummaryBySchoolId(@Param("schoolId") String schoolId);
 }

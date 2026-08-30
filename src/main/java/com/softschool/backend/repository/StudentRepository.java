@@ -18,13 +18,16 @@ public interface StudentRepository extends JpaRepository<Student, Long> {
     List<Student> findBySchoolIdAndStatus(String schoolId, String status);
     Optional<Student> findByRegNoAndSchoolId(String regNo, String schoolId);
 
-    // PERFORMANCE FIX (slow Student dashboard card) — see StudentSummaryDTO
-    // for why this exists: a JPQL constructor expression that selects only
-    // regNo/status/admissionDate/admissionFee at the SQL level, so the
-    // photo/certData/otherFeesData LONGTEXT columns are never read or sent
-    // over the wire just to compute a headcount + attendance percentage.
+    // PERFORMANCE FIX (slow Student dashboard card AND slow Attendance page
+    // roster cards) — see StudentSummaryDTO for why this exists: a JPQL
+    // constructor expression that selects only the plain columns both
+    // main.js's dashboard and attendance.js's roster cards actually read,
+    // so the photo/certData/otherFeesData LONGTEXT columns are never read
+    // or sent over the wire just to compute a headcount, an attendance
+    // percentage, or render a student's name/class/section/guardian.
     @Query("select new com.softschool.backend.dto.StudentSummaryDTO(" +
-            "s.regNo, s.status, s.admissionDate, s.admissionFee) " +
+            "s.regNo, s.status, s.admissionDate, s.admissionFee, " +
+            "s.fullName, s.studentClass, s.section, s.guardianName) " +
             "from Student s where s.schoolId = :schoolId")
     List<StudentSummaryDTO> findSummaryBySchoolId(@Param("schoolId") String schoolId);
 
