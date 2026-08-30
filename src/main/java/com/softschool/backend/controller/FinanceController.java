@@ -498,6 +498,31 @@ public class FinanceController {
     }
 
     // =========================================================
+    // 6b. FINE DETAILS FOR EVERY STUDENT IN A MONTH (bulk — added so the
+    //     frontend's Fine Records page can stop calling /fine-details
+    //     once PER STUDENT (N requests) and instead make ONE request that
+    //     returns every fine row for the whole school+month; the frontend
+    //     then groups them by regNo itself. Purely additive: existing
+    //     single-student /fine-details/{regNo}/{monthKey} above is
+    //     untouched and still used everywhere it already was (e.g. the
+    //     per-student fine ledger view), so nothing that currently works
+    //     changes behavior.
+    // =========================================================
+    @GetMapping("/fine-details-all/{monthKey}")
+    public ResponseEntity<?> getAllFineDetailsForMonth(@PathVariable String monthKey,
+                                                        @RequestParam String schoolId) {
+        if (isBlank(schoolId)) return badRequest("schoolId is required.");
+        // Same table/columns as the single-student version above, just
+        // scoped by month+school instead of by regNo — one query instead
+        // of one-per-student. Same "never hide a dropped student's already-
+        // charged/paid fine history" rule applies here too, since this is
+        // the same underlying data.
+        List<Finance> fines = financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
+                monthKey, Finance.TYPE_FINE, schoolId);
+        return ResponseEntity.ok(fines);
+    }
+
+    // =========================================================
     // 7. SALARY PAYMENT (settles any pending advances + security deposit)
     // =========================================================
     @PostMapping("/salary/pay")
