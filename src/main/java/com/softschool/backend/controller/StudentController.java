@@ -228,6 +228,30 @@ public class StudentController {
         return ResponseEntity.ok(studentRepository.findBySchoolId(schoolId));
     }
 
+    /**
+     * PERFORMANCE FIX — the main dashboard's Student attendance card
+     * (main.js's calculateFinancials -> loadAttendanceData) used to call
+     * plain GET /api/students, which drags every student's base64
+     * photo/certData/otherFeesData LONGTEXT blob along with it (Hibernate
+     * fetches @Lob string columns eagerly here) even though the dashboard
+     * only ever reads regNo/status/admissionDate/admissionFee. For a school
+     * with a few hundred students with photos on file, that's megabytes of
+     * JSON parsed and thrown away on every single dashboard load.
+     *
+     * This lightweight endpoint (see StudentSummaryDTO / the JPQL
+     * projection in StudentRepository) selects only those 4 columns at the
+     * SQL level, so the LOB columns never get read off disk or sent over
+     * the wire for this call. Full student records (with photos) are still
+     * served as before by GET /api/students, for Manage Students.
+     */
+    @GetMapping("/summary")
+    public ResponseEntity<?> getStudentsSummary(@RequestParam(required = false) String schoolId) {
+        if (isBlank(schoolId)) {
+            return badRequest("schoolId query parameter is required.");
+        }
+        return ResponseEntity.ok(studentRepository.findSummaryBySchoolId(schoolId));
+    }
+
     @GetMapping("/{regNo}")
     public ResponseEntity<?> getStudent(@PathVariable String regNo, @RequestParam String schoolId) {
         if (isBlank(schoolId)) {

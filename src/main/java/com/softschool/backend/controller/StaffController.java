@@ -2,6 +2,7 @@ package com.softschool.backend.controller;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.softschool.backend.dto.StaffSummaryDTO;
 import com.softschool.backend.model.Attendance;
 import com.softschool.backend.model.DropoutStaffRecord;
 import com.softschool.backend.model.Finance;
@@ -102,6 +103,32 @@ public class StaffController {
     }
 
     /**
+     * PERFORMANCE FIX — the main dashboard's Staff attendance card (same
+     * main.js code path as StudentController#getStudentsSummary above)
+     * used to call plain GET /api/staff, which drags every staff member's
+     * base64 photo/agreementData/classAssignments/inchargeAssignments
+     * LONGTEXT blob along with it, even though the dashboard only ever
+     * reads staffId + salary (to derive headcount + absence fines).
+     *
+     * This lightweight endpoint (see StaffSummaryDTO / the JPQL projection
+     * in StaffRepository) selects only those 2 columns at the SQL level.
+     * The derived `fines` / `absentDaysThisMonth` figures are then filled
+     * in the same way as the full-entity endpoint above, just onto the
+     * lighter DTO — see applyAbsenceFinesToSummary. Full staff records
+     * (with photos) are still served as before by GET /api/staff, for
+     * Manage Staff.
+     */
+    @GetMapping("/summary")
+    public ResponseEntity<?> getSummary(@RequestParam(required = false) String schoolId) {
+        if (isBlank(schoolId)) {
+            return badRequest("schoolId query parameter is required.");
+        }
+        List<StaffSummaryDTO> summaryList = staffRepository.findSummaryBySchoolId(schoolId);
+        applyAbsenceFinesToSummary(summaryList, schoolId);
+        return ResponseEntity.ok(summaryList);
+    }
+
+    /**
      * BUGFIX — "staff absent fine set from Settings never updates in
      * Salaries or the Dashboard": nothing ever actually computed it. The
      * Leave Penalty pay variable (Settings > Global Pay Variables ->
@@ -131,7 +158,39 @@ public class StaffController {
      */
     private void applyAbsenceFines(List<Staff> staffList, String schoolId) {
         if (staffList.isEmpty()) return;
+        AbsenceFineContext ctx = buildAbsenceFineContext(schoolId);
+        for (Staff staff : staffList) {
+            int absentDays = ctx.absentDaysByStaffId.getOrDefault(staff.getStaffId(), 0);
+            staff.setAbsentDaysThisMonth(absentDays);
+            staff.setFines(computeFine(ctx, staff.getSalary(), absentDays));
+        }
+    }
 
+    /**
+     * Same absence-fine derivation as applyAbsenceFines above, applied onto
+     * the lightweight StaffSummaryDTO used by the dashboard's Staff card
+     * (GET /api/staff/summary) instead of the full Staff entity — kept as a
+     * separate method (rather than a generic one) because Staff and
+     * StaffSummaryDTO don't share a common setter interface.
+     */
+    private void applyAbsenceFinesToSummary(List<StaffSummaryDTO> staffList, String schoolId) {
+        if (staffList.isEmpty()) return;
+        AbsenceFineContext ctx = buildAbsenceFineContext(schoolId);
+        for (StaffSummaryDTO staff : staffList) {
+            int absentDays = ctx.absentDaysByStaffId.getOrDefault(staff.getStaffId(), 0);
+            staff.setAbsentDaysThisMonth(absentDays);
+            staff.setFines(computeFine(ctx, staff.getSalary(), absentDays));
+        }
+    }
+
+    /**
+     * Everything about absence fines that's the SAME for every staff member
+     * in a school this month (which staffIds were marked absent on which
+     * days, and what the school's Leave Penalty rule currently is) — computed
+     * once per request and reused for however many staff rows need it,
+     * instead of re-querying attendance/settings per row.
+     */
+    private AbsenceFineContext buildAbsenceFineContext(String schoolId) {
         LocalDate today = LocalDate.now();
         LocalDate monthStart = today.withDayOfMonth(1);
         LocalDate monthEnd = today.withDayOfMonth(today.lengthOfMonth());
@@ -154,18 +213,25 @@ public class StaffController {
                 ? settings.getPayPenaltyValue()
                 : 3.0;
 
-        for (Staff staff : staffList) {
-            int absentDays = absentDaysByStaffId.getOrDefault(staff.getStaffId(), 0);
-            staff.setAbsentDaysThisMonth(absentDays);
-            if (absentDays <= 0) {
-                staff.setFines(0);
-                continue;
-            }
-            double fine = "percent".equalsIgnoreCase(penaltyType)
-                    ? (staff.getSalary() * (penaltyValue / 100.0)) * absentDays
-                    : penaltyValue * absentDays;
-            staff.setFines(Math.round(fine));
-        }
+        AbsenceFineContext ctx = new AbsenceFineContext();
+        ctx.absentDaysByStaffId = absentDaysByStaffId;
+        ctx.penaltyType = penaltyType;
+        ctx.penaltyValue = penaltyValue;
+        return ctx;
+    }
+
+    private double computeFine(AbsenceFineContext ctx, double salary, int absentDays) {
+        if (absentDays <= 0) return 0;
+        double fine = "percent".equalsIgnoreCase(ctx.penaltyType)
+                ? (salary * (ctx.penaltyValue / 100.0)) * absentDays
+                : ctx.penaltyValue * absentDays;
+        return Math.round(fine);
+    }
+
+    private static class AbsenceFineContext {
+        Map<String, Integer> absentDaysByStaffId;
+        String penaltyType;
+        double penaltyValue;
     }
 
     @DeleteMapping("/{staffId}")
