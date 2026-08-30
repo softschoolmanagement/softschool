@@ -1,8 +1,11 @@
 package com.softschool.backend.repository;
 
 
+import com.softschool.backend.dto.StudentSummaryDTO;
 import com.softschool.backend.model.Student;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import java.util.List;
 import java.util.Optional;
 
@@ -14,6 +17,16 @@ public interface StudentRepository extends JpaRepository<Student, Long> {
     List<Student> findBySchoolId(String schoolId);
     List<Student> findBySchoolIdAndStatus(String schoolId, String status);
     Optional<Student> findByRegNoAndSchoolId(String regNo, String schoolId);
+
+    // PERFORMANCE FIX (slow Student dashboard card) — see StudentSummaryDTO
+    // for why this exists: a JPQL constructor expression that selects only
+    // regNo/status/admissionDate/admissionFee at the SQL level, so the
+    // photo/certData/otherFeesData LONGTEXT columns are never read or sent
+    // over the wire just to compute a headcount + attendance percentage.
+    @Query("select new com.softschool.backend.dto.StudentSummaryDTO(" +
+            "s.regNo, s.status, s.admissionDate, s.admissionFee) " +
+            "from Student s where s.schoolId = :schoolId")
+    List<StudentSummaryDTO> findSummaryBySchoolId(@Param("schoolId") String schoolId);
 
     // Used ONLY when a school is permanently deleted by the super admin —
     // wipes every student row belonging to that schoolId. Deliberately NOT
