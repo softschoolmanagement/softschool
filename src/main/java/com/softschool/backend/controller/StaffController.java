@@ -103,15 +103,19 @@ public class StaffController {
     }
 
     /**
-     * PERFORMANCE FIX — the main dashboard's Staff attendance card (same
-     * main.js code path as StudentController#getStudentsSummary above)
-     * used to call plain GET /api/staff, which drags every staff member's
-     * base64 photo/agreementData/classAssignments/inchargeAssignments
-     * LONGTEXT blob along with it, even though the dashboard only ever
-     * reads staffId + salary (to derive headcount + absence fines).
+     * PERFORMANCE FIX — both the main dashboard's Staff attendance card
+     * (same main.js code path as StudentController#getStudentsSummary
+     * above) AND the Attendance page's staff roster cards (attendance.js's
+     * loadRealStaff()) used to call plain GET /api/staff, which drags
+     * every staff member's base64 photo/agreementData/classAssignments/
+     * inchargeAssignments LONGTEXT blob along with it, even though neither
+     * caller ever reads those fields — main.js only needs staffId + salary
+     * (to derive headcount + absence fines), and attendance.js only needs
+     * staffId/type/name/role/subjects/job (to render the Teaching /
+     * Non-Teaching roster cards).
      *
      * This lightweight endpoint (see StaffSummaryDTO / the JPQL projection
-     * in StaffRepository) selects only those 2 columns at the SQL level.
+     * in StaffRepository) selects only those columns at the SQL level.
      * The derived `fines` / `absentDaysThisMonth` figures are then filled
      * in the same way as the full-entity endpoint above, just onto the
      * lighter DTO — see applyAbsenceFinesToSummary. Full staff records

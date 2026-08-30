@@ -229,17 +229,21 @@ public class StudentController {
     }
 
     /**
-     * PERFORMANCE FIX — the main dashboard's Student attendance card
-     * (main.js's calculateFinancials -> loadAttendanceData) used to call
-     * plain GET /api/students, which drags every student's base64
-     * photo/certData/otherFeesData LONGTEXT blob along with it (Hibernate
-     * fetches @Lob string columns eagerly here) even though the dashboard
-     * only ever reads regNo/status/admissionDate/admissionFee. For a school
-     * with a few hundred students with photos on file, that's megabytes of
-     * JSON parsed and thrown away on every single dashboard load.
+     * PERFORMANCE FIX — both the main dashboard's Student attendance card
+     * (main.js's calculateFinancials -> loadAttendanceData) and the
+     * Attendance page's student roster cards (attendance.js's
+     * loadRealStudents()) used to call plain GET /api/students, which
+     * drags every student's base64 photo/certData/otherFeesData LONGTEXT
+     * blob along with it (Hibernate fetches @Lob string columns eagerly
+     * here) even though neither caller ever reads those fields — main.js
+     * only needs regNo/status/admissionDate/admissionFee, and
+     * attendance.js only needs regNo/fullName/studentClass/section/
+     * guardianName/status. For a school with a few hundred students with
+     * photos on file, that's megabytes of JSON parsed and thrown away on
+     * every single dashboard/attendance-page load.
      *
      * This lightweight endpoint (see StudentSummaryDTO / the JPQL
-     * projection in StudentRepository) selects only those 4 columns at the
+     * projection in StudentRepository) selects only those columns at the
      * SQL level, so the LOB columns never get read off disk or sent over
      * the wire for this call. Full student records (with photos) are still
      * served as before by GET /api/students, for Manage Students.
