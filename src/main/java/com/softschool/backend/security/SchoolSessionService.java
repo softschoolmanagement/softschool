@@ -10,24 +10,34 @@ import java.security.MessageDigest;
 import java.util.Base64;
 
 /**
- * Issues and verifies short-lived signed sessions for a registered school.
+ * Issues and verifies signed sessions for a registered school.
  * The signing secret is server-only and must be supplied through
  * SCHOOL_SESSION_SECRET. Tokens contain the school identity, not a client-
  * supplied schoolId, so protected controllers can safely scope every request.
+ *
+ * NOTE — no session limit: school sessions used to expire after
+ * school.session-ttl-minutes (default 60) and silently log the school out,
+ * forcing a re-login. That auto-expiry has been removed on request — a
+ * school session now stays valid until the school explicitly logs out (or
+ * an admin rotates SCHOOL_SESSION_SECRET). The token still carries an
+ * "expiresAt" field for backward compatibility with the existing
+ * "schoolId.username.expiresAt" payload shape, but it's now set far in the
+ * future and is no longer checked in verifyToken().
  */
 @Service
 public class SchoolSessionService {
     public static final String SCHOOL_ID_ATTRIBUTE = SchoolSessionService.class.getName() + ".schoolId";
     private static final String ALGORITHM = "HmacSHA256";
 
+    // Effectively "never expires" — used to fill the legacy expiresAt slot
+    // in the token payload without actually limiting the session.
+    private static final long NO_EXPIRY = Long.MAX_VALUE;
+
     @Value("${school.session-secret:}")
     private String currentSecret;
 
     @Value("${school.session-secret-previous:}")
     private String previousSecret;
-
-    @Value("${school.session-ttl-minutes:1000}")
-    private long ttlMinutes;
 
     public boolean isConfigured() {
         return currentSecret != null && !currentSecret.isBlank();
@@ -38,8 +48,7 @@ public class SchoolSessionService {
         if (!isConfigured()) {
             throw new IllegalStateException("SCHOOL_SESSION_SECRET is not configured.");
         }
-        long expiresAt = System.currentTimeMillis() + (ttlMinutes * 60_000L);
-        String payload = encode(schoolId) + "." + encode(username) + "." + expiresAt;
+        String payload = encode(schoolId) + "." + encode(username) + "." + NO_EXPIRY;
         String payloadB64 = encode(payload);
         return payloadB64 + "." + sign(payloadB64, currentSecret);
     }
@@ -62,8 +71,11 @@ public class SchoolSessionService {
             String[] parts = new String(Base64.getUrlDecoder().decode(payloadB64), StandardCharsets.UTF_8)
                     .split("\\.", 3);
             if (parts.length != 3) return null;
+            // Session limit removed: expiresAt is still parsed (older
+            // tokens minted before this change carry a real timestamp
+            // here) but is intentionally no longer checked against the
+            // current time, so a school is never auto-logged-out.
             long expiresAt = Long.parseLong(parts[2]);
-            if (expiresAt <= System.currentTimeMillis()) return null;
             String schoolId = decode(parts[0]);
             String username = decode(parts[1]);
             if (schoolId.isBlank() || username.isBlank()) return null;
