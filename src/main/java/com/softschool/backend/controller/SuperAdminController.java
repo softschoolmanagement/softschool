@@ -293,11 +293,18 @@ public ResponseEntity<?> updatePlan(@PathVariable String id, @RequestBody Plan p
 }
 
 // 1. Update School Details
+    @Transactional
     @PutMapping("/schools/{id}")
     public ResponseEntity<?> updateSchool(@PathVariable Long id, @RequestBody CreateSchoolRequest req) {
         return schoolRepository.findById(id).map(school -> {
+            // Captured BEFORE overwriting, so we can tell below whether the
+            // Registration prefix actually changed and — if so — cascade that
+            // change onto every student/staff record this school already has.
+            String oldPrefix = school.getPrefix();
+            String newPrefix = req.getPrefix();
+
             school.setName(req.getName());
-            school.setPrefix(req.getPrefix());
+            school.setPrefix(newPrefix);
             school.setPlanId(req.getPlanId());
             school.setStudentLimit(req.getStudentLimit());
             school.setStaffLimit(req.getStaffLimit());
@@ -319,8 +326,139 @@ public ResponseEntity<?> updatePlan(@PathVariable String id, @RequestBody Plan p
             }
             
             schoolRepository.save(school);
+
+            // ── PREFIX CHANGE CASCADE ────────────────────────────────────
+            // Previously, changing a school's Registration prefix here only
+            // updated the School row. The frontend's regNo/staffId generator
+            // (manage-students.js#generateNextRegistrationNumber and
+            // access-control.js#nextStaffId) always scans for the CURRENT
+            // prefix only, so every already-admitted student/staff member —
+            // still carrying the OLD prefix — became invisible to that scan
+            // and the very next admission restarted the sequence at 1 under
+            // the new prefix, instead of continuing on from the last one.
+            //
+            // Fix: when the prefix actually changes, re-stamp every existing
+            // student's regNo and every existing staff member's staffId for
+            // THIS school with the new prefix, keeping each record's original
+            // sequence number intact (e.g. "PSC_7" -> "NEW_7"). After that,
+            // the frontend's existing "scan for the highest number already
+            // used with the current prefix" logic naturally continues the
+            // count from the highest renamed number — no frontend changes,
+            // and no other existing functionality touched.
+            if (newPrefix != null && !newPrefix.trim().isEmpty() && !newPrefix.trim().equalsIgnoreCase(oldPrefix)) {
+                cascadePrefixChange(school.getSchoolId(), newPrefix.trim().toUpperCase(Locale.ROOT));
+            }
+
             return ResponseEntity.ok(school);
         }).orElse(ResponseEntity.notFound().build());
+    }
+
+    // CURRENT regNo shape: "..._<YY>_<digits>" (e.g. "PSC_26_7") — the
+    // frontend now bakes the 2-digit admission year into every regNo. This
+    // captures the "YY_digits" tail so a rename only swaps the prefix text
+    // and keeps both the year AND the sequence number intact.
+    private static final java.util.regex.Pattern REG_NO_YEAR_SEQUENCE =
+            java.util.regex.Pattern.compile("^.*?_(\\d{2}_\\d+)$");
+
+    // LEGACY regNo shape from before the year segment existed: plain
+    // "..._<digits>" (e.g. "PSC_7"). Kept so schools with older records
+    // (registered before this feature) still rename cleanly instead of
+    // being skipped.
+    private static final java.util.regex.Pattern REG_NO_SEQUENCE =
+            java.util.regex.Pattern.compile("^.*?_(\\d+)$");
+
+    // CURRENT staffId shape: "..._<YY>_S_<digits>" (e.g. "PSC_26_S_3").
+    private static final java.util.regex.Pattern STAFF_ID_YEAR_SEQUENCE =
+            java.util.regex.Pattern.compile("^.*?_(\\d{2}_S_\\d+)$", java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    // LEGACY staffId shape: "..._S_<digits>" (e.g. "PSC_S_3").
+    private static final java.util.regex.Pattern STAFF_ID_SEQUENCE =
+            java.util.regex.Pattern.compile("^.*?_S_(\\d+)$", java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    /**
+     * Re-stamps every existing student regNo / staff staffId for a school
+     * with {@code newPrefix}, preserving each record's original sequence
+     * number, and follows each rename through to every OTHER table that
+     * stores that regNo/staffId as a plain string (Finance fee
+     * ledgers/fines/salaries/advances, Attendance history) so nothing gets
+     * silently orphaned. Records that don't match the expected
+     * "..._<digits>" (or "..._S_<digits>") shape are left untouched rather
+     * than guessed at.
+     */
+    private void cascadePrefixChange(String schoolId, String newPrefix) {
+        List<com.softschool.backend.model.Student> students = studentRepository.findBySchoolId(schoolId);
+        for (com.softschool.backend.model.Student s : students) {
+            String oldRegNo = s.getRegNo();
+            if (oldRegNo == null) continue;
+
+            String newRegNo = null;
+            java.util.regex.Matcher ym = REG_NO_YEAR_SEQUENCE.matcher(oldRegNo);
+            if (ym.matches()) {
+                newRegNo = newPrefix + "_" + ym.group(1); // preserves "YY_N"
+            } else {
+                java.util.regex.Matcher lm = REG_NO_SEQUENCE.matcher(oldRegNo);
+                if (lm.matches()) {
+                    newRegNo = newPrefix + "_" + lm.group(1); // legacy "N" only
+                }
+            }
+            if (newRegNo == null || newRegNo.equals(oldRegNo)) continue;
+
+            s.setRegNo(newRegNo);
+
+            // Follow the rename into finance (fee ledgers/fines) and
+            // attendance history so a renamed student's records stay
+            // attached to them instead of pointing at a regNo that no
+            // longer exists.
+            List<com.softschool.backend.model.Finance> financeRows =
+                    financeRepository.findBySchoolIdAndRegNo(schoolId, oldRegNo);
+            for (com.softschool.backend.model.Finance f : financeRows) {
+                f.setRegNo(newRegNo);
+            }
+            financeRepository.saveAll(financeRows);
+
+            List<com.softschool.backend.model.Attendance> attendanceRows =
+                    attendanceRepository.findByMemberIdAndSchoolIdOrderByDateDesc(oldRegNo, schoolId);
+            for (com.softschool.backend.model.Attendance a : attendanceRows) {
+                a.setMemberId(newRegNo);
+            }
+            attendanceRepository.saveAll(attendanceRows);
+        }
+        studentRepository.saveAll(students);
+
+        List<com.softschool.backend.model.Staff> staffMembers = staffRepository.findBySchoolId(schoolId);
+        for (com.softschool.backend.model.Staff st : staffMembers) {
+            String oldStaffId = st.getStaffId();
+            if (oldStaffId == null) continue;
+
+            String newStaffId = null;
+            java.util.regex.Matcher ym = STAFF_ID_YEAR_SEQUENCE.matcher(oldStaffId);
+            if (ym.matches()) {
+                newStaffId = newPrefix + "_" + ym.group(1); // preserves "YY_S_N"
+            } else {
+                java.util.regex.Matcher lm = STAFF_ID_SEQUENCE.matcher(oldStaffId);
+                if (lm.matches()) {
+                    newStaffId = newPrefix + "_S_" + lm.group(1); // legacy "S_N" only
+                }
+            }
+            if (newStaffId == null || newStaffId.equals(oldStaffId)) continue;
+
+            st.setStaffId(newStaffId);
+
+            List<com.softschool.backend.model.Finance> financeRows =
+                    financeRepository.findBySchoolIdAndStaffId(schoolId, oldStaffId);
+            for (com.softschool.backend.model.Finance f : financeRows) {
+                f.setStaffId(newStaffId);
+            }
+            financeRepository.saveAll(financeRows);
+
+            List<com.softschool.backend.model.Attendance> attendanceRows =
+                    attendanceRepository.findByMemberIdAndSchoolIdOrderByDateDesc(oldStaffId, schoolId);
+            for (com.softschool.backend.model.Attendance a : attendanceRows) {
+                a.setMemberId(newStaffId);
+            }
+            attendanceRepository.saveAll(attendanceRows);
+        }
+        staffRepository.saveAll(staffMembers);
     }
 
     // 2. Change Status (Block/Unblock)
