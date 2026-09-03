@@ -73,4 +73,16 @@ public interface FinanceRepository extends JpaRepository<Finance, Long> {
     // wipes every finance record (fee ledgers, fines, salaries, advances)
     // belonging to that schoolId. Deliberately NOT called from block/unblock.
     long deleteBySchoolId(String schoolId);
+
+    // ---- Every finance row (fee ledgers across all months, fines) that
+    // carries this exact regNo, for one school — used by
+    // SuperAdminController#cascadePrefixChange to re-point a student's
+    // whole finance history onto their new regNo when the Super Admin
+    // changes the school's Registration prefix, so fee ledgers/fines don't
+    // silently detach from the (renamed) student they belong to. ----
+    List<Finance> findBySchoolIdAndRegNo(String schoolId, String regNo);
+
+    // ---- Same idea, for every SALARY/ADVANCE row that carries this exact
+    // staffId, for one school — used by the same cascade for staff. ----
+    List<Finance> findBySchoolIdAndStaffId(String schoolId, String staffId);
 }
