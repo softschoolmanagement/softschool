@@ -2,6 +2,7 @@ package com.softschool.backend.repository;
 
 
 import com.softschool.backend.dto.StudentSummaryDTO;
+import com.softschool.backend.dto.StudentSyncDTO;
 import com.softschool.backend.model.Student;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
@@ -30,6 +31,24 @@ public interface StudentRepository extends JpaRepository<Student, Long> {
             "s.fullName, s.studentClass, s.section, s.guardianName) " +
             "from Student s where s.schoolId = :schoolId")
     List<StudentSummaryDTO> findSummaryBySchoolId(@Param("schoolId") String schoolId);
+
+    // PERFORMANCE FIX (Manage Students' 6s and Manage Finance's 10s
+    // background live-sync polls) — see StudentSyncDTO for the full
+    // rationale. Selects every field either page's sync loop actually
+    // reads EXCEPT photo/certData/hasSiblings, so those three LONGTEXT
+    // blobs are never re-read from disk or re-sent over the wire on a
+    // routine background poll. The frontend calls plain findBySchoolId
+    // (below) once on initial page load to get photo/certData/
+    // hasSiblings, then calls this for every poll after that.
+    @Query("select new com.softschool.backend.dto.StudentSyncDTO(" +
+            "s.regNo, s.status, s.fullName, s.studentClass, s.section, s.guardianName, " +
+            "s.admissionDate, s.standardFee, s.admissionFee, s.tuitionDiscount, " +
+            "s.transportDiscount, s.siblingDiscount, s.transportMode, s.transportType, " +
+            "s.transportFee, s.netPayable, s.otherFeesData, s.isLifetime, s.discountExpiry, " +
+            "s.arrears, s.voucherCustomFees, s.voucherCustomFeesMonth, s.voucherBulkDiscount, " +
+            "s.voucherNote, s.siblingGroupId, s.isSibling, s.siblingOf) " +
+            "from Student s where s.schoolId = :schoolId")
+    List<StudentSyncDTO> findSyncBySchoolId(@Param("schoolId") String schoolId);
 
     // Used ONLY when a school is permanently deleted by the super admin —
     // wipes every student row belonging to that schoolId. Deliberately NOT
