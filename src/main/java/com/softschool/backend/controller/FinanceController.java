@@ -59,24 +59,102 @@ public class FinanceController {
                                                 @PathVariable String monthKey,
                                                 @RequestParam String schoolId) {
         if (isBlank(schoolId)) return badRequest("schoolId is required.");
-        Finance f = getOrCreateStudentFeeMaster(regNoOrId, monthKey, schoolId);
-        if (f == null) {
-            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(errorBody("Student not found."));
+
+        // BUGFIX — "Dashboard shows Expected Fees before a single voucher
+        // was ever generated": this GET endpoint used to call
+        // getOrCreateStudentFeeMaster(), which PERSISTS a brand-new Finance
+        // row (with a real netPayable) the very first time anyone merely
+        // opens a student's fee page — Manage Student Fees does this
+        // automatically for every student in a class the moment you click
+        // into it, just to render the table. GET /status-all/{monthKey}
+        // (what the Dashboard sums for "Expected Fees") has no way to tell
+        // "this row exists because someone actually billed this student"
+        // apart from "this row exists because someone merely looked at
+        // their fee page" — both looked identical in the database. So
+        // opening classes to browse could silently manufacture thousands
+        // of rupees of "Expected Fees" with no voucher ever generated.
+        //
+        // Fix: a plain read never writes anything. If a real row already
+        // exists (a fine, payment, or voucher generation created it), it's
+        // returned as before. If not, compute and return the SAME preview
+        // the page needs to render — arrears, discounts, net payable — but
+        // do not save it. The row is only ever persisted for real by an
+        // actual write action (/add-fine, /pay), never by looking.
+        Optional<Finance> existing = financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolId(
+                regNoOrId, monthKey, Finance.TYPE_STUDENT_FEE, schoolId);
+        Finance f;
+        if (existing.isPresent()) {
+            f = existing.get();
+            // Reconcile older rows where the monthly bill was already paid with
+            // the fine included, but the individual FINE row or the master's
+            // running fineAmount was left pending by an earlier payment flow.
+            settleCoveredFineRecords(f, schoolId);
+        } else {
+            f = previewStudentFeeMaster(regNoOrId, monthKey, schoolId);
+            if (f == null) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND).body(errorBody("Student not found."));
+            }
         }
-        // Reconcile older rows where the monthly bill was already paid with
-        // the fine included, but the individual FINE row or the master's
-        // running fineAmount was left pending by an earlier payment flow.
-        settleCoveredFineRecords(f, schoolId);
         return ResponseEntity.ok(f);
     }
 
     /**
+     * Same calculation as getOrCreateStudentFeeMaster() below (gross fee,
+     * rolled-over arrears, profile discounts, net payable) but NEVER saves
+     * it — used only by the plain GET /status read path above, so simply
+     * viewing a student's fee page can never manufacture a billed row.
+     * Returns null only if regNoOrId doesn't resolve to a student in this school.
+     */
+    private Finance previewStudentFeeMaster(String regNoOrId, String monthKey, String schoolId) {
+        Student student = findStudentInSchool(regNoOrId, schoolId);
+        if (student == null) {
+            return null;
+        }
+
+        double previousArrears = 0.0;
+        try {
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM");
+            LocalDate currentMonthDate = LocalDate.parse(monthKey + "-01");
+            String prevMonthKey = currentMonthDate.minusMonths(1).format(formatter);
+            Optional<Finance> prevFinance = financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolId(
+                    regNoOrId, prevMonthKey, Finance.TYPE_STUDENT_FEE, schoolId);
+            if (prevFinance.isPresent()) {
+                previousArrears = nz(prevFinance.get().getRemainingBalance());
+            }
+        } catch (Exception e) {
+            // malformed monthKey — just skip roll-over
+        }
+
+        Finance f = new Finance();
+        f.setSchoolId(schoolId);
+        f.setRecordType(Finance.TYPE_STUDENT_FEE);
+        f.setRegNo(student.getRegNo());
+        f.setStudentName(student.getFullName());
+        f.setStudentClass(student.getStudentClass());
+        f.setSection(student.getSection());
+        f.setGuardianName(student.getGuardianName());
+        f.setBaseTuitionFee(student.getStandardFee());
+        f.setTransportFee(student.getTransportFee());
+        f.setOtherCharges(previousArrears); // roll-over arrears
+        f.setMonthKey(monthKey);
+
+        double profileDiscount = nz(student.getTuitionDiscount())
+                + nz(student.getTransportDiscount())
+                + nz(student.getSiblingDiscount());
+        f.setTotalDiscountApplied(profileDiscount);
+
+        f.calculateNetPayable();
+        return f; // NOT saved — preview only.
+    }
+
+    /**
      * Finds this student's STUDENT_FEE master row for the month, or creates
-     * it (rolling over the previous month's remaining balance as arrears)
-     * exactly like GET /status used to do inline. Used by /status itself,
-     * and also by /add-fine and /pay below so a fine or a payment never
-     * fails just because nobody happened to open this student's fee page
-     * first — the record is initialized on first touch either way.
+     * AND PERSISTS it (rolling over the previous month's remaining balance
+     * as arrears). Only called from real write actions below (/add-fine,
+     * /pay) — a fine or a payment genuinely needs a real row to record
+     * itself against, so those must still initialize one on first touch.
+     * The plain GET /status read path above uses previewStudentFeeMaster()
+     * instead, which computes the same thing without saving.
      * Returns null only if regNoOrId doesn't resolve to a student in this school.
      */
     private Finance getOrCreateStudentFeeMaster(String regNoOrId, String monthKey, String schoolId) {
