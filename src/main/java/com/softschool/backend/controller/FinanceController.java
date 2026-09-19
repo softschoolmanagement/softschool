@@ -276,6 +276,60 @@ public class FinanceController {
     }
 
     // =========================================================
+    // 2c. PERSIST A STUDENT'S BILL THE MOMENT A VOUCHER IS GENERATED
+    // =========================================================
+    /**
+     * FEATURE — "when I generate any voucher, the amount should count as
+     * Expected Fees straight away."
+     *
+     * Generating a voucher (manage-finance.js's recordVoucherGeneration) only
+     * ever wrote to the TYPE_VOUCHER bucket via PUT /vouchers — a note that
+     * says "this voucher was printed" — and never touched the real Finance
+     * TYPE_STUDENT_FEE billing row that /status-all sums for the Dashboard's
+     * Expected Fees and Manage Finance's own totals. That row was only ever
+     * created by /add-fine or an actual payment, so a freshly generated
+     * voucher with no fine and no payment yet showed nothing as billed,
+     * even though a real voucher had just been handed to a parent.
+     *
+     * This reuses getOrCreateStudentFeeMaster() — the exact same row every
+     * fine/payment already creates, with the exact same discount/arrears
+     * roll-over logic — so nothing about how the row is built changes. Only
+     * WHEN it gets created changes: now also at the moment of voucher
+     * generation, not only at the moment of a fine or a payment.
+     *
+     * Deliberately narrower than the old "reading a fee page persists a
+     * row" behaviour that a previous fix (see /status/{regNoOrId}/{monthKey}
+     * above) removed: that one fired on a passive read (opening a class to
+     * browse it), so merely looking around could manufacture Expected Fees
+     * with no voucher ever generated. This one only fires on an explicit,
+     * user-initiated action — clicking Generate Voucher — so it can't be
+     * triggered by simply navigating the app.
+     *
+     * Idempotent: calling it again for the same student+month (e.g. a
+     * second "Generate" click, or the frontend retrying after a dropped
+     * connection) returns the SAME existing row rather than creating a
+     * duplicate or resetting anything already billed/paid against it.
+     */
+    @PostMapping("/generate-voucher")
+    public ResponseEntity<?> generateVoucherBilling(@RequestBody Map<String, Object> payload) {
+        String schoolId = str(payload, "schoolId");
+        String regNo = str(payload, "regNo");
+        String monthKey = str(payload, "monthKey");
+
+        if (isBlank(schoolId)) return badRequest("schoolId is required.");
+        planEnforcementService.requireFeature(schoolId, PlanEnforcementService.FEATURE_FINANCE);
+        if (isBlank(regNo) || isBlank(monthKey)) {
+            return badRequest("regNo and monthKey are required.");
+        }
+
+        Finance f = getOrCreateStudentFeeMaster(regNo, monthKey, schoolId);
+        if (f == null) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(errorBody("Student not found."));
+        }
+        return ResponseEntity.ok(f);
+    }
+
+    // =========================================================
     // 3. ADD FINE (to a student)
     // =========================================================
     @PostMapping("/add-fine")
