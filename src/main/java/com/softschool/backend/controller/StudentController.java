@@ -205,19 +205,29 @@ public class StudentController {
         if (!(itemsObj instanceof java.util.List)) return badRequest("items array is required.");
 
         com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        int saved = 0;
         for (Object item : (java.util.List<?>) itemsObj) {
             try {
                 Student incoming = mapper.convertValue(item, Student.class);
                 if (isBlank(incoming.getSchoolId())) incoming.setSchoolId(schoolId);
                 if (isBlank(incoming.getSchoolId())) continue; // still no schoolId — skip rather than fail the batch
                 persistStudent(incoming);
+                saved++;
             } catch (Exception e) {
                 // Skip a single malformed item rather than failing the whole batch —
                 // matches FinanceController#bulkSave's per-item tolerance.
             }
         }
 
-        return ResponseEntity.ok(studentRepository.findBySchoolId(schoolId));
+        // PERFORMANCE FIX — this used to end with
+        //     return ResponseEntity.ok(studentRepository.findBySchoolId(schoolId));
+        // which re-read and re-serialised EVERY student in the school,
+        // base64 photos included, and shipped it all back to a browser that
+        // throws the response away (manage-finance.js's _backendSave ignores
+        // the body on success). On a roster with photos that is tens of
+        // megabytes of pure waste on every single fee edit. Returning a small
+        // acknowledgement instead costs nothing and changes no behaviour.
+        return ResponseEntity.ok(Collections.singletonMap("saved", saved));
     }
 
     @GetMapping
@@ -254,6 +264,114 @@ public class StudentController {
             return badRequest("schoolId query parameter is required.");
         }
         return ResponseEntity.ok(studentRepository.findSummaryBySchoolId(schoolId));
+    }
+
+    /**
+     * PERFORMANCE FIX / BUGFIX — the frontend (manage-students.js's
+     * syncWithBackend() and manage-finance.js's refreshStudentsCache())
+     * has always called GET /api/students/sync on every background poll,
+     * but this endpoint did not exist. The request therefore fell through
+     * to GET /{regNo} below with regNo = "sync", matched no student, and
+     * returned 404 on EVERY poll — so live sync silently never worked on
+     * either page: Manage Students showed its indicator as "offline" and
+     * Manage Finance's _backendGet returned null, which its
+     * `if (!Array.isArray(data)) return;` guard swallowed without a word.
+     *
+     * StudentSyncDTO and StudentRepository#findSyncBySchoolId already
+     * existed for exactly this route; only the controller method was
+     * missing. Returns every field either page's poll loop reads EXCEPT
+     * photo/certData/hasSiblings, so a routine 6-10 second poll never
+     * re-reads those LONGTEXT blobs off disk or back over the wire.
+     */
+    @GetMapping("/sync")
+    public ResponseEntity<?> getStudentsSync(@RequestParam(required = false) String schoolId) {
+        if (isBlank(schoolId)) {
+            return badRequest("schoolId query parameter is required.");
+        }
+        return ResponseEntity.ok(studentRepository.findSyncBySchoolId(schoolId));
+    }
+
+    /**
+     * PERFORMANCE FIX (Manage Students' 1-2 minute first load) — the full
+     * GET /api/students above returns complete Student entities, including
+     * the photo and certData LONGTEXT columns. Those hold base64 images,
+     * which are ~133% the size of the original file, so a 300-student
+     * school with photos on file is tens of megabytes of JSON read off
+     * disk, serialized, shipped Europe -> Asia, and parsed by the browser
+     * before a single row can render.
+     *
+     * This endpoint returns every field Manage Students actually needs to
+     * render its table, profile card and edit form — i.e. everything
+     * except photo and certData — plus a `hasPhoto` flag. The page then
+     * loads each photo lazily, one <img> at a time, from
+     * GET /{regNo}/photo below, which the browser can cache and fetch in
+     * parallel instead of blocking the whole page on them.
+     *
+     * The full endpoint is deliberately left untouched for any caller that
+     * genuinely needs the blobs inline (e.g. an export).
+     */
+    @GetMapping("/list")
+    public ResponseEntity<?> getStudentsList(@RequestParam(required = false) String schoolId) {
+        if (isBlank(schoolId)) {
+            return badRequest("schoolId query parameter is required.");
+        }
+        return ResponseEntity.ok(studentRepository.findListBySchoolId(schoolId));
+    }
+
+    /**
+     * Serves ONE student's photo as real image bytes rather than as base64
+     * text embedded in a JSON payload (see /list above for why).
+     *
+     * Three wins over inlining it:
+     *   1. Decoding the base64 back to bytes here removes the ~33% size
+     *      penalty base64 adds.
+     *   2. A real URL is cacheable — the Cache-Control header below means
+     *      the browser re-reads an unchanged photo from its own disk cache
+     *      instead of the network on every subsequent page load.
+     *   3. The browser fetches these in parallel, after the table has
+     *      already rendered, so photos no longer sit on the critical path.
+     *
+     * Accepts photos stored either as a bare base64 string or as a full
+     * "data:image/jpeg;base64,...." data URI, since both shapes exist in
+     * the table depending on when the row was written.
+     */
+    @GetMapping("/{regNo}/photo")
+    public ResponseEntity<?> getStudentPhoto(@PathVariable String regNo,
+                                            @RequestParam(required = false) String schoolId) {
+        if (isBlank(schoolId)) {
+            return badRequest("schoolId query parameter is required.");
+        }
+        Student student = studentRepository.findByRegNoAndSchoolId(regNo, schoolId).orElse(null);
+        if (student == null || isBlank(student.getPhoto())) {
+            return ResponseEntity.notFound().build();
+        }
+
+        String raw = student.getPhoto().trim();
+        String mediaType = "image/jpeg";
+        int comma = raw.indexOf(',');
+        if (raw.startsWith("data:") && comma > 0) {
+            String header = raw.substring(5, comma);          // e.g. "image/png;base64"
+            int semi = header.indexOf(';');
+            String declared = (semi > 0) ? header.substring(0, semi) : header;
+            if (!declared.isBlank()) mediaType = declared;
+            raw = raw.substring(comma + 1);
+        }
+        raw = raw.replaceAll("\\s", "");
+
+        byte[] bytes;
+        try {
+            bytes = java.util.Base64.getDecoder().decode(raw);
+        } catch (IllegalArgumentException e) {
+            // Not decodable base64 — treat it as "no usable photo" rather
+            // than throwing a 500, so the frontend just falls back to its
+            // generated initials avatar.
+            return ResponseEntity.notFound().build();
+        }
+
+        return ResponseEntity.ok()
+                .header("Content-Type", mediaType)
+                .header("Cache-Control", "private, max-age=86400")
+                .body(bytes);
     }
 
     @GetMapping("/{regNo}")
