@@ -1,6 +1,7 @@
 package com.softschool.backend.repository;
 
 
+import com.softschool.backend.dto.StudentListDTO;
 import com.softschool.backend.dto.StudentSummaryDTO;
 import com.softschool.backend.dto.StudentSyncDTO;
 import com.softschool.backend.model.Student;
@@ -49,6 +50,31 @@ public interface StudentRepository extends JpaRepository<Student, Long> {
             "s.voucherNote, s.siblingGroupId, s.isSibling, s.siblingOf) " +
             "from Student s where s.schoolId = :schoolId")
     List<StudentSyncDTO> findSyncBySchoolId(@Param("schoolId") String schoolId);
+
+    // PERFORMANCE FIX (Manage Students' 1-2 minute FIRST load) — see
+    // StudentListDTO for the full rationale. Selects every column that
+    // page renders EXCEPT photo and certData, so the two genuinely heavy
+    // base64 LONGTEXT columns are never read off disk for the roster
+    // fetch. `hasPhoto` is derived in SQL from whether photo is
+    // null/empty, which does NOT materialise the column's value — the
+    // frontend uses it to decide whether to point an <img> at
+    // GET /api/students/{regNo}/photo or go straight to its generated
+    // initials avatar.
+    @Query("select new com.softschool.backend.dto.StudentListDTO(" +
+            "s.id, s.regNo, s.fullName, s.rollNo, s.studentClass, s.section, " +
+            "s.admissionDate, s.gender, s.dob, s.age, s.studentBform, s.medicalIssues, " +
+            "s.orphanStatus, s.previousSchool, s.previousClass, s.guardianName, " +
+            "s.guardianRole, s.guardianCnic, s.phone1, s.phone2, s.permanentAddress, " +
+            "s.mailingAddress, s.standardFee, s.admissionFee, s.tuitionDiscount, " +
+            "s.transportDiscount, s.siblingDiscount, s.transportMode, s.transportType, " +
+            "s.transportFee, s.netPayable, s.otherFeesData, s.isLifetime, s.discountExpiry, " +
+            "s.status, s.graduatedDate, s.graduatedYear, s.graduatedClass, s.graduatedSection, " +
+            "s.siblingGroupId, s.isSibling, s.siblingOf, s.hasSiblings, s.droppedDate, " +
+            "s.arrears, s.voucherCustomFees, s.voucherCustomFeesMonth, s.voucherBulkDiscount, " +
+            "s.voucherNote, " +
+            "case when s.photo is not null and length(s.photo) > 0 then true else false end) " +
+            "from Student s where s.schoolId = :schoolId")
+    List<StudentListDTO> findListBySchoolId(@Param("schoolId") String schoolId);
 
     // Used ONLY when a school is permanently deleted by the super admin —
     // wipes every student row belonging to that schoolId. Deliberately NOT
