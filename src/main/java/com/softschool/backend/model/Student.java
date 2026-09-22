@@ -61,7 +61,21 @@ public class Student {
     private String permanentAddress;
     private String mailingAddress;
 
-    // Images (Stored as Base64 LongText)
+    // Student photo & B-Form/certificate scan.
+    //
+    // FILE-STORAGE MIGRATION — these used to hold the file's full base64
+    // content directly (hence the LONGTEXT column). They now hold a short
+    // RELATIVE PATH into the server's uploads/ folder instead — e.g.
+    // "photos/3f1c2a9e-....jpg" or "bforms/8b0d....pdf" — written by
+    // FileStorageService and served back out by
+    // StudentController#getStudentPhoto / #getStudentBform.
+    //
+    // The column type is deliberately left as LONGTEXT (rather than being
+    // shrunk to a short VARCHAR) so that any row saved before this
+    // migration — which still holds the old inline base64/data-URI value —
+    // keeps loading and serving correctly with no data migration required;
+    // FileStorageService#isManagedPath() is what tells the two shapes apart
+    // at read time.
     @Lob
     @Column(columnDefinition = "LONGTEXT")
     private String photo;
