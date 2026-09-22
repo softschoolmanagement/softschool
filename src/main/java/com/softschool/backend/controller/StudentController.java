@@ -2,12 +2,17 @@ package com.softschool.backend.controller;
 
 import com.softschool.backend.model.Student;
 import com.softschool.backend.repository.StudentRepository;
+import com.softschool.backend.service.FileStorageService;
 import com.softschool.backend.service.PlanEnforcementService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.Map;
 
@@ -21,6 +26,9 @@ public class StudentController {
 
     @Autowired
     private PlanEnforcementService planEnforcementService;
+
+    @Autowired
+    private FileStorageService fileStorageService;
 
     @PostMapping({"", "/"})
     public ResponseEntity<?> saveStudent(@RequestBody(required = false) Student incoming) {
@@ -174,8 +182,27 @@ public class StudentController {
         // Guarded fields: only overwrite if the incoming value is non-blank,
         // so a save that (for whatever reason) arrives without a photo/certData
         // never erases the one already on file.
-        if (!isBlank(in.getPhoto()))    existing.setPhoto(in.getPhoto());
-        if (!isBlank(in.getCertData())) existing.setCertData(in.getCertData());
+        //
+        // When the incoming value is a NEW managed file path (i.e. the user
+        // actually uploaded a replacement via /files/photo or /files/bform —
+        // see below) and it differs from what's already stored, the old file
+        // on disk is now orphaned, so it's deleted here. This never touches
+        // legacy inline base64 values (isManagedPath() only recognises our
+        // own "photos/…" / "bforms/…" paths).
+        if (!isBlank(in.getPhoto())) {
+            String oldPhoto = existing.getPhoto();
+            if (fileStorageService.isManagedPath(oldPhoto) && !in.getPhoto().equals(oldPhoto)) {
+                fileStorageService.deleteQuietly(oldPhoto);
+            }
+            existing.setPhoto(in.getPhoto());
+        }
+        if (!isBlank(in.getCertData())) {
+            String oldCert = existing.getCertData();
+            if (fileStorageService.isManagedPath(oldCert) && !in.getCertData().equals(oldCert)) {
+                fileStorageService.deleteQuietly(oldCert);
+            }
+            existing.setCertData(in.getCertData());
+        }
     }
 
     /**
@@ -319,6 +346,58 @@ public class StudentController {
     }
 
     /**
+     * FILE-STORAGE MIGRATION — accepts a student photo upload as a real
+     * multipart file, saves it to disk via FileStorageService (which
+     * auto-creates the uploads/photos folder on backend startup — see
+     * FileStorageService#init()), and returns the relative path the
+     * frontend should then send back as Student.photo on the normal
+     * save/update call.
+     *
+     * Deliberately NOT tied to an existing regNo: the frontend uploads the
+     * file the moment it's picked (during admission, before the student
+     * even has a regNo yet), then just carries the returned path along in
+     * the regular JSON save.
+     */
+    @PostMapping("/files/photo")
+    public ResponseEntity<?> uploadPhoto(@RequestParam("file") MultipartFile file,
+                                          @RequestParam String schoolId) {
+        if (isBlank(schoolId)) {
+            return badRequest("schoolId is required.");
+        }
+        try {
+            String path = fileStorageService.storePhoto(file);
+            return ResponseEntity.ok(Collections.singletonMap("path", path));
+        } catch (IllegalArgumentException e) {
+            return badRequest(e.getMessage());
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(errorBody("Could not store photo: " + e.getMessage()));
+        }
+    }
+
+    /**
+     * Same as /files/photo above, but for the B-Form / certificate upload
+     * (image or PDF). Returns the relative path to send back as
+     * Student.certData.
+     */
+    @PostMapping("/files/bform")
+    public ResponseEntity<?> uploadBform(@RequestParam("file") MultipartFile file,
+                                          @RequestParam String schoolId) {
+        if (isBlank(schoolId)) {
+            return badRequest("schoolId is required.");
+        }
+        try {
+            String path = fileStorageService.storeBform(file);
+            return ResponseEntity.ok(Collections.singletonMap("path", path));
+        } catch (IllegalArgumentException e) {
+            return badRequest(e.getMessage());
+        } catch (IOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(errorBody("Could not store B-Form file: " + e.getMessage()));
+        }
+    }
+
+    /**
      * Serves ONE student's photo as real image bytes rather than as base64
      * text embedded in a JSON payload (see /list above for why).
      *
@@ -342,11 +421,74 @@ public class StudentController {
             return badRequest("schoolId query parameter is required.");
         }
         Student student = studentRepository.findByRegNoAndSchoolId(regNo, schoolId).orElse(null);
-        if (student == null || isBlank(student.getPhoto())) {
+        if (student == null) {
             return ResponseEntity.notFound().build();
         }
+        return serveStoredFile(student.getPhoto());
+    }
 
-        String raw = student.getPhoto().trim();
+    /**
+     * FILE-STORAGE MIGRATION — mirrors getStudentPhoto above, but for the
+     * B-Form / certificate scan (Student.certData). Previously certData was
+     * only ever shipped inline as a base64 data URI inside the full student
+     * JSON; this endpoint lets the frontend fetch/preview/download it as a
+     * real file the same way photos already work, and is what the file
+     * actually resolves to once it's stored on disk instead of in the DB.
+     */
+    @GetMapping("/{regNo}/bform")
+    public ResponseEntity<?> getStudentBform(@PathVariable String regNo,
+                                              @RequestParam(required = false) String schoolId) {
+        if (isBlank(schoolId)) {
+            return badRequest("schoolId query parameter is required.");
+        }
+        Student student = studentRepository.findByRegNoAndSchoolId(regNo, schoolId).orElse(null);
+        if (student == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return serveStoredFile(student.getCertData());
+    }
+
+    /**
+     * Shared by getStudentPhoto/getStudentBform. Serves the given
+     * Student.photo / Student.certData value as real bytes.
+     *
+     * Handles BOTH shapes that can exist in the table:
+     *   - NEW rows: a relative path into the uploads/ folder written by
+     *     FileStorageService (e.g. "photos/uuid.jpg") — read straight off
+     *     disk.
+     *   - OLD rows saved before this migration: the file's full base64
+     *     content, either bare or as a "data:image/...;base64,...." URI —
+     *     decoded exactly as this endpoint always used to.
+     * This means existing students with a photo/B-Form uploaded before the
+     * migration keep working with no backfill/migration script required.
+     */
+    private ResponseEntity<?> serveStoredFile(String stored) {
+        if (isBlank(stored)) {
+            return ResponseEntity.notFound().build();
+        }
+        String raw = stored.trim();
+
+        if (fileStorageService.isManagedPath(raw)) {
+            Path path = fileStorageService.resolve(raw);
+            if (!Files.exists(path)) {
+                // DB points at a file that no longer exists on disk.
+                return ResponseEntity.notFound().build();
+            }
+            byte[] bytes;
+            try {
+                bytes = Files.readAllBytes(path);
+            } catch (IOException e) {
+                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                        .body(errorBody("Could not read file: " + e.getMessage()));
+            }
+            String mediaType = guessMediaType(path.toString());
+            return ResponseEntity.ok()
+                    .header("Content-Type", mediaType)
+                    .header("Cache-Control", "private, max-age=86400")
+                    .body(bytes);
+        }
+
+        // Legacy path: value is (or should be) inline base64.
         String mediaType = "image/jpeg";
         int comma = raw.indexOf(',');
         if (raw.startsWith("data:") && comma > 0) {
@@ -362,9 +504,9 @@ public class StudentController {
         try {
             bytes = java.util.Base64.getDecoder().decode(raw);
         } catch (IllegalArgumentException e) {
-            // Not decodable base64 — treat it as "no usable photo" rather
-            // than throwing a 500, so the frontend just falls back to its
-            // generated initials avatar.
+            // Not decodable base64 either — treat it as "nothing usable"
+            // rather than throwing a 500, so the frontend just falls back
+            // to its generated initials avatar / "no document" state.
             return ResponseEntity.notFound().build();
         }
 
@@ -372,6 +514,15 @@ public class StudentController {
                 .header("Content-Type", mediaType)
                 .header("Cache-Control", "private, max-age=86400")
                 .body(bytes);
+    }
+
+    private String guessMediaType(String filename) {
+        String lower = filename.toLowerCase();
+        if (lower.endsWith(".png"))  return "image/png";
+        if (lower.endsWith(".gif"))  return "image/gif";
+        if (lower.endsWith(".webp")) return "image/webp";
+        if (lower.endsWith(".pdf"))  return "application/pdf";
+        return "image/jpeg"; // .jpg/.jpeg and anything else image-like
     }
 
     @GetMapping("/{regNo}")
