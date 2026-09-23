@@ -72,7 +72,11 @@ public interface StudentRepository extends JpaRepository<Student, Long> {
             "s.siblingGroupId, s.isSibling, s.siblingOf, s.hasSiblings, s.droppedDate, " +
             "s.arrears, s.voucherCustomFees, s.voucherCustomFeesMonth, s.voucherBulkDiscount, " +
             "s.voucherNote, " +
-            "case when s.photo is not null and length(s.photo) > 0 then true else false end) " +
+             "case when s.photo is not null and length(s.photo) > 0 then true else false end, " +
+             // New uploads are short managed paths.  Do not select legacy
+             // base64 data into the list response; the photo endpoint serves
+             // those rows lazily just like it did before this optimization.
+             "case when s.photo like 'photos/%' then s.photo else null end) " +
             "from Student s where s.schoolId = :schoolId")
     List<StudentListDTO> findListBySchoolId(@Param("schoolId") String schoolId);
 
