@@ -102,6 +102,15 @@ public class StudentListDTO {
     /** True when this student has a photo on file, without shipping it. */
     private Boolean hasPhoto;
 
+    /**
+     * New file-storage rows contain a short relative path here.  It is
+     * included separately from hasPhoto so the frontend can build the photo
+     * URL without ever receiving legacy base64 content in the roster query.
+     * For legacy rows this remains null and the photo endpoint still serves
+     * the old inline base64 value.
+     */
+    private String photoPath;
+
     public StudentListDTO(
             Long id, String regNo, String fullName, String rollNo, String studentClass,
             String section, Date admissionDate, String gender, Date dob, String age,
@@ -117,7 +126,8 @@ public class StudentListDTO {
             String graduatedSection, String siblingGroupId, Boolean isSibling,
             String siblingOf, String hasSiblings, String droppedDate, Double arrears,
             Boolean voucherCustomFees, String voucherCustomFeesMonth,
-            Double voucherBulkDiscount, String voucherNote, Boolean hasPhoto) {
+             Double voucherBulkDiscount, String voucherNote, Boolean hasPhoto,
+             String photoPath) {
         this.id = id;
         this.regNo = regNo;
         this.fullName = fullName;
@@ -168,5 +178,6 @@ public class StudentListDTO {
         this.voucherBulkDiscount = voucherBulkDiscount;
         this.voucherNote = voucherNote;
         this.hasPhoto = hasPhoto;
+        this.photoPath = photoPath;
     }
 }
