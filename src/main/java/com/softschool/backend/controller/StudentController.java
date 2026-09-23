@@ -189,20 +189,49 @@ public class StudentController {
         // on disk is now orphaned, so it's deleted here. This never touches
         // legacy inline base64 values (isManagedPath() only recognises our
         // own "photos/…" / "bforms/…" paths).
-        if (!isBlank(in.getPhoto())) {
+        if (!isBlank(in.getPhoto()) && isAcceptableStoredFileValue(in.getPhoto())) {
             String oldPhoto = existing.getPhoto();
             if (fileStorageService.isManagedPath(oldPhoto) && !in.getPhoto().equals(oldPhoto)) {
                 fileStorageService.deleteQuietly(oldPhoto);
             }
             existing.setPhoto(in.getPhoto());
         }
-        if (!isBlank(in.getCertData())) {
+        if (!isBlank(in.getCertData()) && isAcceptableStoredFileValue(in.getCertData())) {
             String oldCert = existing.getCertData();
             if (fileStorageService.isManagedPath(oldCert) && !in.getCertData().equals(oldCert)) {
                 fileStorageService.deleteQuietly(oldCert);
             }
             existing.setCertData(in.getCertData());
         }
+    }
+
+    /**
+     * DEFENSE IN DEPTH — the blank check above was the only guard on
+     * in.getPhoto()/in.getCertData(), but "non-blank" is not the same as
+     * "a real thing to store". The frontend's roster cache turns a stored
+     * managed path into a resolved http(s) DISPLAY URL for <img src> (see
+     * manage-students.js studentPhotoUrl()); if any code path on that side
+     * ever sends that resolved URL back on an update instead of the raw
+     * path (or nothing), this previously accepted it as gospel — deleting
+     * the real file on disk (path mismatch against what's actually stored)
+     * and overwriting the DB column with the URL text itself, which then
+     * 404s forever since it's neither a managed path nor valid base64.
+     * That client-side bug is now fixed too, but this backend guard makes
+     * the same class of mistake harmless no matter where it originates
+     * (a different client, a future regression, a stray script, etc.).
+     *
+     * Acceptable values: our own managed relative path ("photos/…",
+     * "bforms/…"), or a legacy inline value (bare base64 or a
+     * "data:...;base64,…" URI). Anything that looks like a browsable URL
+     * (http:// or https://) is rejected — that is a DISPLAY artifact, never
+     * something that should be persisted as the stored value.
+     */
+    private boolean isAcceptableStoredFileValue(String value) {
+        String v = value.trim();
+        if (v.startsWith("http://") || v.startsWith("https://")) {
+            return false;
+        }
+        return true;
     }
 
     /**
