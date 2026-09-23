@@ -513,7 +513,12 @@ public class StudentController {
             String mediaType = guessMediaType(path.toString());
             return ResponseEntity.ok()
                     .header("Content-Type", mediaType)
-                    .header("Cache-Control", "private, max-age=86400")
+                    // Do not cache this URL for a day: the URL is based on the
+                    // student's regNo, so a replacement photo uses the same
+                    // URL.  A long cache lifetime made a newly saved photo
+                    // appear missing/stale until the browser cache expired.
+                    .header("Cache-Control", "no-store, private, max-age=0")
+                    .header("Content-Length", String.valueOf(bytes.length))
                     .body(bytes);
         }
 
@@ -541,7 +546,8 @@ public class StudentController {
 
         return ResponseEntity.ok()
                 .header("Content-Type", mediaType)
-                .header("Cache-Control", "private, max-age=86400")
+                .header("Cache-Control", "no-store, private, max-age=0")
+                .header("Content-Length", String.valueOf(bytes.length))
                 .body(bytes);
     }
 
