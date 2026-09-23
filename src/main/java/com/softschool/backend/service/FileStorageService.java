@@ -147,7 +147,19 @@ public class FileStorageService {
 
     /** Resolves a stored relative path to an absolute filesystem Path. */
     public Path resolve(String relativePath) {
-        return root.resolve(relativePath).normalize();
+        if (relativePath == null || relativePath.isBlank()) {
+            throw new IllegalArgumentException("File path is empty.");
+        }
+
+        // Values in the database are supposed to be paths returned by this
+        // service.  Normalize separators before resolving so a malformed or
+        // manually edited database value can never escape the upload root.
+        String safeRelativePath = relativePath.trim().replace('\\', '/');
+        Path resolved = root.resolve(safeRelativePath).normalize();
+        if (!resolved.startsWith(root)) {
+            throw new SecurityException("Invalid stored file path.");
+        }
+        return resolved;
     }
 
     /**
@@ -159,11 +171,11 @@ public class FileStorageService {
         if (!isManagedPath(relativePath)) return; // never touch legacy base64 values
         try {
             Path path = resolve(relativePath);
-            if (path.startsWith(root)) {
-                Files.deleteIfExists(path);
-            }
+            Files.deleteIfExists(path);
         } catch (IOException ignored) {
             // Non-fatal.
+        } catch (RuntimeException ignored) {
+            // A malformed old database value must never make an update fail.
         }
     }
 }
