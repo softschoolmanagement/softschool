@@ -326,6 +326,62 @@ public class FinanceController {
         if (f == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(errorBody("Student not found."));
         }
+
+        // BUGFIX — "Dashboard Generated/Pending never match what Manage
+        // Finance actually shows": getOrCreateStudentFeeMaster() above
+        // computes this row's netPayable purely from server-side state
+        // (roster standardFee/transportFee/profile discounts + whatever
+        // arrears IT thinks were rolled over from last month's own
+        // remainingBalance). manage-finance.js's own voucher engine
+        // (computeFeeBreakdown/recordVoucherGeneration) is the one the
+        // admin actually sees on the printed voucher, and it can legally
+        // differ — an on-the-spot custom fee row, a bulk discount, or the
+        // admin explicitly opting OUT of the arrears roll-forward (the
+        // "Carry forward previous pending balance" checkbox) all only ever
+        // lived client-side and were never sent here. So this row silently
+        // recomputed its own, potentially different, total every time —
+        // which is exactly why the Dashboard (which sums THIS row) could
+        // show a different Pending/Expected than Manage Finance forever,
+        // and why an unpaid remainder didn't roll into next month's
+        // voucher correctly (next month's rollover reads THIS row's
+        // remainingBalance, so if this row's total was wrong, the carried
+        // arrears were wrong too).
+        //
+        // Fix: accept the already-computed breakdown from the voucher that
+        // was actually generated (manage-finance.js's `f` object — the
+        // same source of truth Manage Finance's own header totals use) and
+        // overwrite this row's charge fields with it whenever it's
+        // supplied, then recalculate. This keeps a single source of truth:
+        // whatever Manage Finance shows the admin is now exactly what gets
+        // persisted here, so the Dashboard and next month's arrears
+        // roll-forward both agree with it. Fully backward compatible — a
+        // caller that sends only regNo/monthKey/schoolId (older frontend,
+        // or any other integration) still gets the old server-computed row
+        // untouched.
+        Double tuition = doubleOrNull(payload, "baseTuitionFee");
+        Double transport = doubleOrNull(payload, "transportFee");
+        Double otherCharges = doubleOrNull(payload, "otherCharges"); // rolled-over arrears + any custom fee rows, combined
+        Double discountApplied = doubleOrNull(payload, "totalDiscountApplied");
+        Double fineTotal = doubleOrNull(payload, "totalFineCharged");
+
+        boolean hasBreakdown = tuition != null || transport != null || otherCharges != null
+                || discountApplied != null || fineTotal != null;
+        if (hasBreakdown) {
+            if (tuition != null) f.setBaseTuitionFee(tuition);
+            if (transport != null) f.setTransportFee(transport);
+            if (otherCharges != null) f.setOtherCharges(otherCharges);
+            if (discountApplied != null) f.setTotalDiscountApplied(discountApplied);
+            // totalFineCharged must only ever grow (see its own field doc on
+            // Finance) — never let a stale/smaller client figure roll it
+            // backwards and silently erase a fine charged after the client
+            // snapshot was taken.
+            if (fineTotal != null && fineTotal > nz(f.getTotalFineCharged())) {
+                f.setTotalFineCharged(fineTotal);
+            }
+            f.calculateNetPayable();
+            f = financeRepository.save(f);
+        }
+
         return ResponseEntity.ok(f);
     }
 
