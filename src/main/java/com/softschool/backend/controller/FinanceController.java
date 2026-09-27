@@ -216,6 +216,42 @@ public class FinanceController {
         return financeRepository.save(f);
     }
 
+    /**
+     * BUGFIX — "paying a defaulter who's been deleted from Manage Students
+     * silently does nothing": processPayment() below used to resolve the
+     * bill to pay down via getOrCreateStudentFeeMaster(), which — via
+     * findStudentInSchool() — requires the linked student to currently be
+     * "active". That gate exists to stop a NEW bill from ever being
+     * created/extended for someone no longer enrolled, which is correct.
+     * But it was the ONLY path processPayment() had, so it also blocked
+     * paying down a bill that was already legitimately created while the
+     * student WAS active — exactly the case a Fee Defaulter who has since
+     * been dropped is in. The request was quietly rejected ("Student not
+     * found"), so the money was never actually recorded anywhere durable:
+     * the frontend's own feePayments array is local/session-only (the
+     * backend has no column for it — see manage-finance.js's
+     * saveStudentsCache), so nothing survived a page refresh, a different
+     * device, or the next status-all poll — the payment looked like it
+     * "didn't update" because, on the server, it truly never happened.
+     *
+     * Fix: for a PAYMENT specifically, look for the Finance row directly by
+     * regNo/monthKey/schoolId first — with no active-roster requirement —
+     * since collecting money against a bill that already exists must always
+     * be allowed regardless of the student's current roster status. Only
+     * fall back to the active-gated getOrCreateStudentFeeMaster() (which
+     * can legitimately CREATE a new row) when no bill exists yet for this
+     * student+month — there is nothing to pay down for a student who was
+     * never billed in the first place, active or not.
+     */
+    private Finance getStudentFeeMasterForPayment(String regNoOrId, String monthKey, String schoolId) {
+        Optional<Finance> existing = financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolId(
+                regNoOrId, monthKey, Finance.TYPE_STUDENT_FEE, schoolId);
+        if (existing.isPresent()) {
+            return existing.get();
+        }
+        return getOrCreateStudentFeeMaster(regNoOrId, monthKey, schoolId);
+    }
+
     // =========================================================
     // 2. ALL STUDENTS WITH FINES FOR A MONTH
     // =========================================================
@@ -483,7 +519,12 @@ public class FinanceController {
             return badRequest("regNo, monthKey and amount are required.");
         }
 
-        Finance master = getOrCreateStudentFeeMaster(regNo, monthKey, schoolId);
+        // BUGFIX — see getStudentFeeMasterForPayment's own docs: a payment
+        // must be able to settle an EXISTING bill regardless of whether the
+        // student is still on the active roster (getOrCreateStudentFeeMaster
+        // alone would silently reject this for anyone dropped since their
+        // last bill — exactly a Fee Defaulter who's since been deleted).
+        Finance master = getStudentFeeMasterForPayment(regNo, monthKey, schoolId);
         if (master == null) {
             return badRequest("Student not found.");
         }
