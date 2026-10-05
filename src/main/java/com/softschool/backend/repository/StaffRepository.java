@@ -14,6 +14,7 @@ import java.util.Optional;
 public interface StaffRepository extends JpaRepository<Staff, Long> {
     List<Staff> findBySchoolId(String schoolId);
     Optional<Staff> findByStaffIdAndSchoolId(String staffId, String schoolId);
+    List<Staff> findByStaffIdIgnoreCase(String staffId);
     void deleteBySchoolId(String schoolId);
 
     // Live staff count for a school, used by the super admin panel to show
