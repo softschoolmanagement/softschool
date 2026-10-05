@@ -41,6 +41,9 @@ public class SchoolAuthFilter extends OncePerRequestFilter {
     @Autowired
     private SchoolSessionService sessionService;
 
+    @Autowired
+    private TeacherAccessGuard teacherAccessGuard;
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Override
@@ -79,6 +82,16 @@ public class SchoolAuthFilter extends OncePerRequestFilter {
             }
         }
 
+        // Teacher sessions are restricted to a tiny allow-list (see TeacherAccessGuard).
+        boolean teacher = TeacherAccessGuard.isTeacher(principal);
+        if (teacher && !hasJsonBody(request)) {
+            String denied = teacherAccessGuard.violation(principal, request.getMethod(), request.getRequestURI(), null);
+            if (denied != null) {
+                writeError(response, HttpServletResponse.SC_FORBIDDEN, denied);
+                return;
+            }
+        }
+
         HttpServletRequest downstreamRequest = request;
         if (hasJsonBody(request)) {
             if (request.getContentLengthLong() > MAX_INSPECTED_BODY_BYTES) {
@@ -91,6 +104,14 @@ public class SchoolAuthFilter extends OncePerRequestFilter {
                 writeError(response, HttpServletResponse.SC_FORBIDDEN,
                         "The request body does not match the authenticated school.");
                 return;
+            }
+            if (teacher) {
+                String denied = teacherAccessGuard.violation(principal, request.getMethod(), request.getRequestURI(),
+                        new String(cached.getCachedBody(), StandardCharsets.UTF_8));
+                if (denied != null) {
+                    writeError(response, HttpServletResponse.SC_FORBIDDEN, denied);
+                    return;
+                }
             }
             downstreamRequest = cached;
         }
