@@ -1,5 +1,6 @@
 package com.softschool.backend.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import jakarta.persistence.*;
 import lombok.Data;
@@ -40,6 +41,11 @@ public class Staff {
 
     // Public-facing staff ID shown in the UI (e.g. "PSC_S_1").
     private String staffId;
+
+    /** Teacher-portal password (salted hash). Never serialized to or accepted from JSON. */
+    @JsonIgnore
+    @Column(length = 255)
+    private String passwordHash;
 
     // "Teaching" or "Non-Teaching" — drives which fields below apply and
     // which directory bucket this row belongs to on the frontend.
