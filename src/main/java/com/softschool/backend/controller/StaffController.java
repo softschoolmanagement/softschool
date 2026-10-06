@@ -45,6 +45,9 @@ public class StaffController {
     private PlanEnforcementService planEnforcementService;
 
     @Autowired
+    private com.softschool.backend.service.TeacherPasswordService teacherPasswordService;
+
+    @Autowired
     private FinanceRepository financeRepository;
 
     @Autowired
@@ -75,6 +78,7 @@ public class StaffController {
         boolean isNew = staffRepository.findByStaffIdAndSchoolId(staff.getStaffId(), staff.getSchoolId())
                 .map(existing -> {
                     staff.setId(existing.getId());
+                    staff.setPasswordHash(existing.getPasswordHash()); // not part of the JSON; keep it
                     return false;
                 })
                 .orElse(true);
@@ -90,6 +94,63 @@ public class StaffController {
 
         Staff saved = staffRepository.save(staff);
         return ResponseEntity.ok(saved);
+    }
+
+    /**
+     * Teacher changes her OWN portal password — allowed exactly once.
+     * Body: { staffId, currentPassword, newPassword }. The teacher session
+     * token may only call this for its own staffId (see TeacherAccessGuard).
+     */
+    @PostMapping("/change-password")
+    public ResponseEntity<?> changeOwnPassword(@RequestParam String schoolId,
+                                               @RequestBody Map<String, String> body) {
+        String staffId = body == null ? null : body.get("staffId");
+        String current = body == null ? null : body.get("currentPassword");
+        String next = body == null ? null : body.get("newPassword");
+        if (isBlank(staffId) || isBlank(current) || isBlank(next)) {
+            return badRequest("Current and new password are required.");
+        }
+        if (next.length() < 6) {
+            return badRequest("New password must be at least 6 characters.");
+        }
+        Staff staff = staffRepository.findByStaffIdAndSchoolId(staffId, schoolId).orElse(null);
+        if (staff == null || !"Teaching".equalsIgnoreCase(staff.getType())) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .body(Collections.singletonMap("error", "Teacher not found."));
+        }
+        if (teacherPasswordService.hasChanged(staff)) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Collections.singletonMap("error",
+                    "You have already changed your password once. Ask your admin to reset it."));
+        }
+        // 400 (not 401) on purpose: the portal treats 401 as "session expired".
+        if (!teacherPasswordService.verify(staff, current)) {
+            return badRequest("Current password is incorrect.");
+        }
+        if (next.equals(current)) {
+            return badRequest("New password must be different from the current one.");
+        }
+        staff.setPasswordHash(com.softschool.backend.security.PasswordHashUtil.hash(next));
+        staffRepository.save(staff);
+        return ResponseEntity.ok(Collections.singletonMap("message", "Password changed."));
+    }
+
+    /**
+     * Admin (Settings page) puts a teacher back on the school's default
+     * password, which also gives her one more password change.
+     * Teacher session tokens cannot reach this route (TeacherAccessGuard).
+     */
+    @PostMapping("/{staffId}/reset-password")
+    public ResponseEntity<?> resetTeacherPassword(@PathVariable String staffId,
+                                                  @RequestParam String schoolId) {
+        return staffRepository.findByStaffIdAndSchoolId(staffId, schoolId)
+                .<ResponseEntity<?>>map(staff -> {
+                    staff.setPasswordHash(null);
+                    staffRepository.save(staff);
+                    return ResponseEntity.ok(Collections.singletonMap("message",
+                            "Password reset. The teacher can now sign in with the default password."));
+                })
+                .orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND)
+                        .body(Collections.singletonMap("error", "Teacher ID not found.")));
     }
 
     @GetMapping

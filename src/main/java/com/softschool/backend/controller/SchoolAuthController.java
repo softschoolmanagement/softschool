@@ -1,6 +1,9 @@
 package com.softschool.backend.controller;
 
 import com.softschool.backend.model.School;
+import com.softschool.backend.model.Staff;
+import com.softschool.backend.repository.StaffRepository;
+import com.softschool.backend.service.TeacherPasswordService;
 import com.softschool.backend.repository.SchoolRepository;
 import com.softschool.backend.service.LoginAttemptService;
 import com.softschool.backend.security.SchoolSessionService;
@@ -53,6 +56,12 @@ public class SchoolAuthController {
 
     @Autowired
     private LoginAttemptService loginAttemptService;
+
+    @Autowired
+    private StaffRepository staffRepository;
+
+    @Autowired
+    private TeacherPasswordService teacherPasswordService;
 
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final int REMEMBER_TOKEN_DAYS = 30;
@@ -206,6 +215,57 @@ public class SchoolAuthController {
         view.rememberToken = rememberToken; // null unless "Remember Me" was checked
         view.sessionToken = schoolSessionService.issueToken(saved.getSchoolId(), saved.getUsername());
         return ResponseEntity.ok(view);
+    }
+
+    /**
+     * TEACHER PORTAL login (teacher-portal.html via index.html).
+     * Body: { staffId, password }. Returns { token, schoolId, staff }.
+     * The token is a normal school-scoped session whose username is
+     * "teacher:<staffId>", which SchoolAuthFilter/TeacherAccessGuard restrict to
+     * student list + attendance for the teacher's own incharge class.
+     * Unknown ID and wrong password give the same 401, and failures share the
+     * same 5-attempt lockout as school logins.
+     */
+    @PostMapping("/teacher-login")
+    public ResponseEntity<?> teacherLogin(@RequestBody Map<String, String> req) {
+        String staffId = trim(req == null ? null : req.get("staffId"));
+        String password = req == null ? null : req.get("password");
+        if (staffId == null || staffId.isEmpty() || password == null || password.isEmpty()) {
+            return badRequest("Please enter your Teacher ID and password.");
+        }
+
+        String lockKey = "teacher:" + staffId.toLowerCase();
+        LoginAttemptService.LockStatus lockStatus = loginAttemptService.checkLocked(lockKey);
+        if (lockStatus.locked) {
+            return tooManyAttempts(lockStatus.retryAfterSeconds);
+        }
+
+        for (Staff staff : staffRepository.findByStaffIdIgnoreCase(staffId)) {
+            // Default password (set by the admin in Settings) until the teacher changes her own.
+            if (!"Teaching".equalsIgnoreCase(staff.getType())
+                    || !teacherPasswordService.verify(staff, password)) {
+                continue;
+            }
+            School school = schoolRepository.findBySchoolId(staff.getSchoolId()).orElse(null);
+            if (school == null) continue;
+            if ("blocked".equalsIgnoreCase(school.getStatus())) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(errorBody("This school account is blocked."));
+            }
+            if (school.getExpiryDate() != null && school.getExpiryDate().isBefore(LocalDate.now())) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(errorBody("This school's subscription has expired."));
+            }
+
+            loginAttemptService.recordSuccess(lockKey);
+            boolean passwordChanged = teacherPasswordService.hasChanged(staff);
+            staff.setAgreementData(null); // large and not needed by the portal
+            Map<String, Object> out = new HashMap<>();
+            out.put("token", schoolSessionService.issueToken(staff.getSchoolId(), "teacher:" + staff.getStaffId()));
+            out.put("schoolId", staff.getSchoolId());
+            out.put("staff", staff);
+            out.put("passwordChanged", passwordChanged);
+            return ResponseEntity.ok(out);
+        }
+        return handleFailedLogin(lockKey);
     }
 
     /**
