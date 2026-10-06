@@ -65,6 +65,35 @@ public class SchoolSettingsController {
      * PUT /api/settings/{schoolId} — "Save All": school info, class fee structure
      * (+ sections), late fee rules and global pay variables, for this school.
      */
+    /** Whether the admin has set a default teacher password (the password itself is never returned). */
+    @GetMapping("/{schoolId}/teacher-password")
+    public ResponseEntity<?> teacherPasswordStatus(@PathVariable String schoolId) {
+        boolean set = repository.findBySchoolId(schoolId)
+                .map(s -> s.getTeacherPasswordHash() != null && !s.getTeacherPasswordHash().isEmpty())
+                .orElse(false);
+        return ResponseEntity.ok(Collections.singletonMap("set", set));
+    }
+
+    /** Admin sets / changes the default password that teachers use to sign in to the Teacher Portal. */
+    @PutMapping("/{schoolId}/teacher-password")
+    public ResponseEntity<?> setTeacherPassword(@PathVariable String schoolId,
+                                                @RequestBody Map<String, String> body) {
+        planEnforcementService.requireFeature(schoolId, PlanEnforcementService.FEATURE_SETTINGS);
+        String password = body == null ? null : body.get("password");
+        if (password == null || password.length() < 6) {
+            return ResponseEntity.badRequest()
+                    .body(Collections.singletonMap("error", "Password must be at least 6 characters."));
+        }
+        SchoolSettings settings = repository.findBySchoolId(schoolId).orElseGet(() -> {
+            SchoolSettings fresh = new SchoolSettings();
+            fresh.setSchoolId(schoolId);
+            return fresh;
+        });
+        settings.setTeacherPasswordHash(com.softschool.backend.security.PasswordHashUtil.hash(password));
+        repository.save(settings);
+        return ResponseEntity.ok(Collections.singletonMap("message", "Default teacher password saved."));
+    }
+
     @Transactional
     @PutMapping("/{schoolId}")
     public ResponseEntity<SchoolSettings> saveAll(@PathVariable String schoolId, @RequestBody SchoolSettings incoming) {
