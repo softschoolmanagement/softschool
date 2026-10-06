@@ -24,6 +24,7 @@ import java.util.List;
  *   - GET  /api/attendance/students     (to see today's saved marks)
  *   - POST /api/attendance/save         (student records, today only, and only
  *                                        for the class/section she is incharge of)
+ *   - POST /api/staff/change-password   (her own password, one time only)
  * Everything else is denied. Called from SchoolAuthFilter.
  */
 @Component
@@ -50,7 +51,21 @@ public class TeacherAccessGuard {
         if (post && "/api/attendance/save".equals(uri)) {
             return checkSave(p.getSchoolId(), p.getUsername().substring(PREFIX.length()), body);
         }
+        if (post && "/api/staff/change-password".equals(uri)) {
+            return checkOwnPassword(p.getUsername().substring(PREFIX.length()), body);
+        }
         return "Teacher accounts cannot access this resource.";
+    }
+
+    /** The change-password body must name the token's own staffId. */
+    private String checkOwnPassword(String staffId, String body) {
+        try {
+            JsonNode root = mapper.readTree(body == null ? "" : body);
+            return staffId.equalsIgnoreCase(root.path("staffId").asText("")) ? null
+                    : "You can only change your own password.";
+        } catch (Exception e) {
+            return "Invalid request.";
+        }
     }
 
     private String checkSave(String schoolId, String staffId, String body) {
