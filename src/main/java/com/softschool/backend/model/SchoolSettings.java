@@ -1,5 +1,6 @@
 package com.softschool.backend.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 import java.util.ArrayList;
 import java.util.List;
@@ -73,8 +74,19 @@ public class SchoolSettings {
     @CollectionTable(name = "school_settings_classes", joinColumns = @JoinColumn(name = "settings_id"))
     private List<ClassFee> classes = new ArrayList<>();
 
+    /** Default password for teacher-portal logins (salted hash). Never serialized to JSON. */
+    @JsonIgnore
+    @Column(length = 255)
+    private String teacherPasswordHash;
+
     public SchoolSettings() {
     }
+
+    @JsonIgnore
+    public String getTeacherPasswordHash() { return teacherPasswordHash; }
+
+    @JsonIgnore
+    public void setTeacherPasswordHash(String teacherPasswordHash) { this.teacherPasswordHash = teacherPasswordHash; }
 
     /** Embeddable row for one class in the fee structure grid. */
     @Embeddable
