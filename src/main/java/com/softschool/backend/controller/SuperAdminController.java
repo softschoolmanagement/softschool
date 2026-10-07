@@ -63,12 +63,16 @@ public class SuperAdminController {
     // fresh from student/staff tables rather than cached anywhere, since
     // students and staff can be added/removed from each school's own portal
     // at any time.
+    // Student usage counts ONLY active students (status null/'active').
+    // Archived students (status 'graduated' / 'dropped') are excluded so they
+    // don't eat into the plan's studentLimit — they have their own
+    // archiveStudentLimit.
     @GetMapping("/schools")
     public List<SchoolWithUsage> getAllSchools() {
         return schoolRepository.findAll().stream()
                 .map(school -> new SchoolWithUsage(
                         school,
-                        studentRepository.countBySchoolId(school.getSchoolId()),
+                        studentRepository.countActiveBySchoolId(school.getSchoolId()),
                         staffRepository.countBySchoolId(school.getSchoolId())))
                 .collect(Collectors.toList());
     }
