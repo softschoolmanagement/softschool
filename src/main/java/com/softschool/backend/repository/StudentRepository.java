@@ -89,4 +89,13 @@ public interface StudentRepository extends JpaRepository<Student, Long> {
     // Live enrolled-student count for a school, used by the super admin
     // panel to show "X / studentLimit" usage and trigger the near-limit alert.
     long countBySchoolId(String schoolId);
+
+    // Live ACTIVE-student count for a school (status null or 'active').
+    // Archived students (status 'graduated' / 'dropped') are excluded so they
+    // do not count against the plan's studentLimit. Used by the super admin
+    // panel's "X / studentLimit" usage display.
+    @Query("select count(s) from Student s " +
+            "where s.schoolId = :schoolId " +
+            "and (s.status is null or s.status = 'active')")
+    long countActiveBySchoolId(@Param("schoolId") String schoolId);
 }
