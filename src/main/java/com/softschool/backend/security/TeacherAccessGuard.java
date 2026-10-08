@@ -3,6 +3,7 @@ package com.softschool.backend.security;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.softschool.backend.model.Staff;
+import com.softschool.backend.repository.AttendanceRepository;
 import com.softschool.backend.repository.StaffRepository;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -23,7 +24,8 @@ import java.util.List;
  *   - GET  /api/students/summary        (to list her incharge class)
  *   - GET  /api/attendance/students     (to see today's saved marks)
  *   - POST /api/attendance/save         (student records, today only, and only
- *                                        for the class/section she is incharge of)
+ *                                        for the class/section she is incharge of,
+ *                                        and only ONCE per student per day)
  *   - POST /api/staff/change-password   (her own password, one time only)
  * Everything else is denied. Called from SchoolAuthFilter.
  */
@@ -34,6 +36,9 @@ public class TeacherAccessGuard {
 
     @Autowired
     private StaffRepository staffRepository;
+
+    @Autowired
+    private AttendanceRepository attendanceRepository;
 
     private final ObjectMapper mapper = new ObjectMapper();
 
@@ -94,6 +99,11 @@ public class TeacherAccessGuard {
                 LocalDate date = LocalDate.parse(rec.path("date").asText(""));
                 if (date.isBefore(today.minusDays(1)) || date.isAfter(today.plusDays(1))) {
                     return "Teachers can only mark today's attendance.";
+                }
+                // Attendance is marked ONCE. After that only the admin can correct it.
+                String memberId = rec.path("memberId").asText("");
+                if (!memberId.isBlank() && attendanceRepository.findByMemberIdAndDateAndSchoolId(memberId, date, schoolId).isPresent()) {
+                    return "Attendance already marked for today. Ask the admin to change it.";
                 }
                 String cls = rec.path("className").asText("");
                 String sec = rec.path("section").asText("");
