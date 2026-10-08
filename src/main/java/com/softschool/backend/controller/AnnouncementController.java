@@ -1,236 +1,140 @@
-package com.softschool.backend.controller;
+package com.softschool.teacherportal;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.softschool.backend.model.Announcement;
-import com.softschool.backend.model.Staff;
-import com.softschool.backend.repository.AnnouncementRepository;
-import com.softschool.backend.repository.StaffRepository;
-import com.softschool.backend.security.SchoolSessionService;
-import com.softschool.backend.security.TeacherAccessGuard;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import jakarta.servlet.http.HttpServletRequest;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
 
-import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.*;
-import java.util.stream.Collectors;
 
 /**
- * Announcements between the admin and the Teacher Portal.
- *
- *   GET    /api/announcements?schoolId=        teacher: notices for her | admin: everything
- *   GET    /api/announcements/inbox?schoolId=  admin only: messages teachers sent to admin
- *   POST   /api/announcements                  admin only: post a notice
- *   POST   /api/announcements/teacher          teacher only: send from the portal
- *   DELETE /api/announcements/{id}?schoolId=   admin only
- *
- * The school boundary is enforced by SchoolAuthFilter (schoolId must match the
- * token). What a teacher token may call is enforced by TeacherAccessGuard; the
- * role checks below are a second line of defence.
+ *  Admin  -> teachers
+ *    GET    /api/announcements?schoolId=&audience=teachers      (teachers + admin) newest 100
+ *    POST   /api/announcements                                   (admin only) { title, body, priority?, createdBy? }
+ *    DELETE /api/announcements/{id}                              (admin only)
+ *  Teacher -> admin / parents
+ *    POST   /api/announcements/teacher                           (teacher) { audience:"admin"|"parents"|"class", className?, title, body, priority? }
+ *    GET    /api/announcements/teacher-messages?audience=admin|parents&className=   (admin inbox, and the parent portal)
+ *    POST   /api/announcements/teacher-messages/{id}/read        (admin only)
  */
 @RestController
 @RequestMapping("/api/announcements")
-@CrossOrigin(origins = "*")
 public class AnnouncementController {
+    private static final int MAX_PER_HOUR = 30;     // a teacher can't flood parents
 
-    private static final int MAX_LIST = 100;
-    private static final int TEACHER_DAILY_LIMIT = 20;
+    private final AnnouncementRepository news;
+    private final TeacherMessageRepository msgs;
 
-    @Autowired private AnnouncementRepository announcementRepository;
-    @Autowired private StaffRepository staffRepository;
-    @Autowired private SchoolSessionService sessionService;
+    public AnnouncementController(AnnouncementRepository news, TeacherMessageRepository msgs) { this.news = news; this.msgs = msgs; }
 
-    private final ObjectMapper mapper = new ObjectMapper();
-
-    // ───────────── READ ─────────────
-
+    /* ───────── admin -> teachers ───────── */
     @GetMapping
-    public ResponseEntity<?> list(@RequestParam String schoolId, HttpServletRequest req) {
-        SchoolSessionService.Principal p = principal(req);
-        if (p == null) return error(HttpStatus.UNAUTHORIZED, "Please log in again.");
-
-        List<Announcement> rows;
-        if (TeacherAccessGuard.isTeacher(p)) {
-            String staffId = staffIdOf(p);
-            rows = announcementRepository.findVisibleToTeacher(p.getSchoolId(), staffId, PageRequest.of(0, MAX_LIST));
-        } else {
-            rows = announcementRepository.findBySchoolIdOrderByCreatedAtDesc(p.getSchoolId(), PageRequest.of(0, MAX_LIST));
+    public List<Map<String, Object>> received(HttpServletRequest req, @RequestParam(defaultValue = "teachers") String audience) {
+        String school = TeacherPortalAuth.schoolId(req);
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Announcement a : news.findBySchoolIdAndAudienceOrderByCreatedAtDesc(school, audience, PageRequest.of(0, 100))) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", a.id); m.put("title", a.title); m.put("body", a.body);
+            m.put("from", a.createdBy == null || a.createdBy.isBlank() ? "Admin" : a.createdBy);
+            m.put("date", java.time.Instant.ofEpochMilli(a.createdAt).toString());
+            m.put("priority", a.priority);
+            out.add(m);
         }
-        return ResponseEntity.ok(rows.stream().map(this::view).collect(Collectors.toList()));
+        return out;
     }
-
-    @GetMapping("/inbox")
-    public ResponseEntity<?> adminInbox(@RequestParam String schoolId, HttpServletRequest req) {
-        SchoolSessionService.Principal p = principal(req);
-        if (p == null) return error(HttpStatus.UNAUTHORIZED, "Please log in again.");
-        if (TeacherAccessGuard.isTeacher(p)) return error(HttpStatus.FORBIDDEN, "Admin only.");
-        List<Announcement> rows = announcementRepository.findBySchoolIdAndAudienceOrderByCreatedAtDesc(
-                p.getSchoolId(), Announcement.AUD_ADMIN, PageRequest.of(0, MAX_LIST));
-        return ResponseEntity.ok(rows.stream().map(this::view).collect(Collectors.toList()));
-    }
-
-    // ───────────── ADMIN POSTS ─────────────
 
     @PostMapping
-    public ResponseEntity<?> adminPost(@RequestBody JsonNode body, HttpServletRequest req) {
-        SchoolSessionService.Principal p = principal(req);
-        if (p == null) return error(HttpStatus.UNAUTHORIZED, "Please log in again.");
-        if (TeacherAccessGuard.isTeacher(p)) return error(HttpStatus.FORBIDDEN, "Only the admin can post announcements.");
-
-        String audience = text(body, "audience", 10).toLowerCase();
-        if (audience.isEmpty()) audience = Announcement.AUD_TEACHERS;
-        if (!Set.of(Announcement.AUD_TEACHERS, Announcement.AUD_TEACHER, Announcement.AUD_CLASS).contains(audience)) {
-            return error(HttpStatus.BAD_REQUEST, "audience must be teachers, teacher or class.");
-        }
-        String title = text(body, "title", 120), msg = text(body, "body", 2000);
-        if (title.isEmpty() || msg.isEmpty()) return error(HttpStatus.BAD_REQUEST, "Title and message are required.");
-
+    @Transactional
+    public Map<String, Object> create(HttpServletRequest req, @RequestBody ObjectNode b) {
+        TeacherPortalAuth.requireAdmin(req);
         Announcement a = new Announcement();
-        a.setSchoolId(p.getSchoolId());
-        a.setSenderType(Announcement.SENDER_ADMIN);
-        a.setSenderId("admin");
-        String sender = text(body, "senderName", 80);
-        a.setSenderName(sender.isEmpty() ? "Admin" : sender);
-        a.setAudience(audience);
-        a.setTitle(title);
-        a.setBody(msg);
-        a.setPriority(priority(body));
-
-        if (Announcement.AUD_TEACHER.equals(audience)) {
-            String target = text(body, "targetStaffId", 60);
-            Staff t = target.isEmpty() ? null : staffRepository.findByStaffIdAndSchoolId(target, p.getSchoolId()).orElse(null);
-            if (t == null) return error(HttpStatus.BAD_REQUEST, "That teacher was not found in this school.");
-            a.setTargetStaffId(t.getStaffId());
-        }
-        if (Announcement.AUD_CLASS.equals(audience)) {
-            String cls = text(body, "className", 80);
-            if (cls.isEmpty()) return error(HttpStatus.BAD_REQUEST, "className is required for a class announcement.");
-            a.setClassName(cls);
-        }
-        return ResponseEntity.status(HttpStatus.CREATED).body(view(announcementRepository.save(a)));
+        a.schoolId = TeacherPortalAuth.schoolId(req);
+        a.audience = "teachers";
+        a.title = required(b, "title", 120);
+        a.body = required(b, "body", 2000);
+        a.createdBy = optional(b, "createdBy", 120);
+        a.priority = "urgent".equals(optional(b, "priority", 10)) ? "urgent" : "normal";
+        a.createdAt = System.currentTimeMillis();
+        news.save(a);
+        return Map.of("ok", true, "id", a.id);
     }
 
     @DeleteMapping("/{id}")
-    public ResponseEntity<?> delete(@PathVariable Long id, @RequestParam String schoolId, HttpServletRequest req) {
-        SchoolSessionService.Principal p = principal(req);
-        if (p == null) return error(HttpStatus.UNAUTHORIZED, "Please log in again.");
-        if (TeacherAccessGuard.isTeacher(p)) return error(HttpStatus.FORBIDDEN, "Admin only.");
-        return announcementRepository.findByIdAndSchoolId(id, p.getSchoolId()).map(a -> {
-            announcementRepository.delete(a);
-            return ResponseEntity.noContent().build();
-        }).orElse(ResponseEntity.notFound().build());
+    @Transactional
+    public Map<String, Object> delete(HttpServletRequest req, @PathVariable Long id) {
+        TeacherPortalAuth.requireAdmin(req);
+        String school = TeacherPortalAuth.schoolId(req);
+        news.findById(id).filter(a -> a.schoolId.equals(school)).ifPresent(news::delete);
+        return Map.of("ok", true);
     }
 
-    // ───────────── TEACHER SENDS ─────────────
-
+    /* ───────── teacher -> admin / parents ───────── */
     @PostMapping("/teacher")
-    public ResponseEntity<?> teacherSend(@RequestBody JsonNode body, HttpServletRequest req) {
-        SchoolSessionService.Principal p = principal(req);
-        if (p == null) return error(HttpStatus.UNAUTHORIZED, "Please log in again.");
-        if (!TeacherAccessGuard.isTeacher(p)) return error(HttpStatus.FORBIDDEN, "Teacher accounts only.");
+    @Transactional
+    public Map<String, Object> send(HttpServletRequest req, @RequestBody ObjectNode b) {
+        String school = TeacherPortalAuth.schoolId(req);
+        String staff = TeacherPortalAuth.actingStaff(req, optional(b, "staffId", 64));
+        String audience = optional(b, "audience", 20);
+        if ("class".equals(audience)) audience = "parents";                  // older app versions
+        if (!"admin".equals(audience) && !"parents".equals(audience)) throw bad("Send to admin or parents");
+        String cls = optional(b, "className", 60);
+        if ("parents".equals(audience) && (cls == null || cls.isBlank())) throw bad("Choose a class for parents");
 
-        String staffId = staffIdOf(p);
-        // Never trust the staffId/staffName in the body — the token decides who is sending.
-        Staff teacher = staffRepository.findByStaffIdAndSchoolId(staffId, p.getSchoolId()).orElse(null);
-        if (teacher == null || !"Teaching".equalsIgnoreCase(teacher.getType())) {
-            return error(HttpStatus.FORBIDDEN, "This teacher account is no longer active.");
+        long now = System.currentTimeMillis();
+        if (msgs.countByStaffIdAndSchoolIdAndCreatedAtAfter(staff, school, now - 3_600_000L) >= MAX_PER_HOUR)
+            throw new ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "Too many messages. Try again later.");
+
+        TeacherMessage m = new TeacherMessage();
+        m.schoolId = school; m.staffId = staff; m.staffName = optional(b, "staffName", 120);
+        m.audience = audience; m.className = "parents".equals(audience) ? cls : null;
+        m.title = required(b, "title", 120); m.body = required(b, "body", 1000);
+        m.priority = "urgent".equals(optional(b, "priority", 10)) ? "urgent" : "normal";
+        m.createdAt = now;
+        msgs.save(m);
+        return Map.of("ok", true, "id", m.id);
+    }
+
+    @GetMapping("/teacher-messages")
+    public List<Map<String, Object>> inbox(HttpServletRequest req, @RequestParam(required = false) String audience,
+                                           @RequestParam(required = false) String className) {
+        String school = TeacherPortalAuth.schoolId(req);
+        List<TeacherMessage> rows = (audience != null && className != null)
+                ? msgs.findBySchoolIdAndAudienceAndClassNameOrderByCreatedAtDesc(school, audience, className, PageRequest.of(0, 100))
+                : msgs.findBySchoolIdOrderByCreatedAtDesc(school, PageRequest.of(0, 200));
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (TeacherMessage m : rows) {
+            if (TeacherPortalAuth.isTeacher(req) && !m.staffId.equals(TeacherPortalAuth.staffId(req))) continue;   // teachers only see their own
+            if (audience != null && !audience.equals(m.audience)) continue;
+            Map<String, Object> o = new LinkedHashMap<>();
+            o.put("id", m.id); o.put("from", m.staffName); o.put("staffId", m.staffId); o.put("audience", m.audience);
+            o.put("className", m.className); o.put("title", m.title); o.put("body", m.body); o.put("priority", m.priority);
+            o.put("date", java.time.Instant.ofEpochMilli(m.createdAt).toString()); o.put("read", m.readByAdmin);
+            out.add(o);
         }
-
-        String audience = text(body, "audience", 10).toLowerCase();
-        if (!Set.of(Announcement.AUD_ADMIN, Announcement.AUD_TEACHERS, Announcement.AUD_CLASS).contains(audience)) {
-            return error(HttpStatus.BAD_REQUEST, "audience must be admin, teachers or class.");
-        }
-        String title = text(body, "title", 120), msg = text(body, "body", 2000);
-        if (title.isEmpty() || msg.isEmpty()) return error(HttpStatus.BAD_REQUEST, "Title and message are required.");
-
-        String cls = text(body, "className", 80);
-        if (Announcement.AUD_CLASS.equals(audience) && !teachesClass(teacher, cls)) {
-            return error(HttpStatus.FORBIDDEN, "You can only message classes you teach.");
-        }
-
-        long today = announcementRepository.countBySchoolIdAndSenderTypeAndSenderIdAndCreatedAtAfter(
-                p.getSchoolId(), Announcement.SENDER_TEACHER, staffId, Instant.now().minus(1, ChronoUnit.DAYS));
-        if (today >= TEACHER_DAILY_LIMIT) {
-            return error(HttpStatus.TOO_MANY_REQUESTS, "Daily message limit reached. Try again tomorrow.");
-        }
-
-        Announcement a = new Announcement();
-        a.setSchoolId(p.getSchoolId());
-        a.setSenderType(Announcement.SENDER_TEACHER);
-        a.setSenderId(staffId);
-        a.setSenderName(teacher.getName());
-        a.setAudience(audience);
-        a.setClassName(Announcement.AUD_CLASS.equals(audience) ? cls : null);
-        a.setTitle(title);
-        a.setBody(msg);
-        a.setPriority(priority(body));
-        return ResponseEntity.status(HttpStatus.CREATED).body(view(announcementRepository.save(a)));
+        return out;
     }
 
-    // ───────────── helpers ─────────────
-
-    private Map<String, Object> view(Announcement a) {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("id", a.getId());
-        m.put("title", a.getTitle());
-        m.put("body", a.getBody());
-        m.put("from", a.getSenderName() == null || a.getSenderName().isBlank() ? "Admin" : a.getSenderName());
-        m.put("senderType", a.getSenderType());
-        m.put("audience", a.getAudience());
-        m.put("className", a.getClassName());
-        m.put("targetStaffId", a.getTargetStaffId());
-        m.put("priority", a.getPriority());
-        m.put("date", a.getCreatedAt().toString()); // ISO-8601 UTC, e.g. 2026-10-06T09:30:00Z
-        return m;
+    @PostMapping("/teacher-messages/{id}/read")
+    @Transactional
+    public Map<String, Object> markRead(HttpServletRequest req, @PathVariable Long id) {
+        TeacherPortalAuth.requireAdmin(req);
+        String school = TeacherPortalAuth.schoolId(req);
+        msgs.findById(id).filter(m -> m.schoolId.equals(school)).ifPresent(m -> { m.readByAdmin = true; msgs.save(m); });
+        return Map.of("ok", true);
     }
 
-    private SchoolSessionService.Principal principal(HttpServletRequest req) {
-        String h = req.getHeader("Authorization");
-        String token = h != null && h.startsWith("Bearer ") ? h.substring(7).trim() : null;
-        return sessionService.verifyToken(token);
+    private static String optional(ObjectNode b, String f, int max) {
+        if (!b.hasNonNull(f)) return null;
+        String s = b.get(f).asText().trim();
+        return s.length() > max ? s.substring(0, max) : s;
     }
-
-    private String staffIdOf(SchoolSessionService.Principal p) {
-        return p.getUsername().substring(TeacherAccessGuard.PREFIX.length());
+    private static String required(ObjectNode b, String f, int max) {
+        String s = optional(b, f, max);
+        if (s == null || s.isBlank()) throw bad(f + " is required");
+        return s;
     }
-
-    private String text(JsonNode n, String field, int max) {
-        String v = n.path(field).asText("").trim();
-        return v.length() > max ? v.substring(0, max) : v;
-    }
-
-    private String priority(JsonNode n) {
-        return "urgent".equalsIgnoreCase(n.path("priority").asText("")) ? "urgent" : "normal";
-    }
-
-    /** True when the class (e.g. "Class 5 - A" or "Class 5") is one the teacher teaches or is incharge of. */
-    private boolean teachesClass(Staff s, String label) {
-        if (label == null || label.isBlank()) return false;
-        String[] parts = label.split("\\s+-\\s+", 2);
-        String cls = parts[0].trim(), sec = parts.length > 1 ? parts[1].trim() : "";
-        for (String json : new String[]{s.getClassAssignments(), s.getInchargeAssignments()}) {
-            try {
-                if (json == null || json.isBlank()) continue;
-                JsonNode arr = mapper.readTree(json);
-                if (!arr.isArray()) continue;
-                for (JsonNode n : arr) {
-                    String c = n.path("cls").asText("").trim(), sc = n.path("section").asText("").trim();
-                    if (c.equalsIgnoreCase(cls) && (sc.isEmpty() || sec.isEmpty() || sc.equalsIgnoreCase(sec))) return true;
-                }
-            } catch (Exception ignored) { /* try the next source */ }
-        }
-        if (s.getClasses() != null) {
-            for (String c : s.getClasses().split(",")) if (c.trim().equalsIgnoreCase(cls)) return true;
-        }
-        return s.getAssignedClass() != null && s.getAssignedClass().trim().equalsIgnoreCase(cls);
-    }
-
-    private ResponseEntity<?> error(HttpStatus status, String message) {
-        return ResponseEntity.status(status).body(Collections.singletonMap("error", message));
-    }
+    private static ResponseStatusException bad(String m) { return new ResponseStatusException(HttpStatus.BAD_REQUEST, m); }
 }
