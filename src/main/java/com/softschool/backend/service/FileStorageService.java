@@ -63,6 +63,7 @@ public class FileStorageService {
             root = Paths.get(uploadDirProperty).toAbsolutePath().normalize();
             Files.createDirectories(root.resolve("photos"));
             Files.createDirectories(root.resolve("bforms"));
+            Files.createDirectories(root.resolve("diary"));
         } catch (IOException e) {
             throw new IllegalStateException(
                     "Could not create upload directory at " + uploadDirProperty, e);
@@ -80,6 +81,11 @@ public class FileStorageService {
      */
     public String storeBform(MultipartFile file) throws IOException {
         return store(file, "bforms", ALLOWED_BFORM_EXT);
+    }
+
+    /** Stores one homework-diary picture. Returns the relative path ("diary/uuid.jpg"). */
+    public String storeDiaryImage(MultipartFile file) throws IOException {
+        return store(file, "diary", ALLOWED_IMAGE_EXT);
     }
 
     private String store(MultipartFile file, String subfolder, Set<String> allowedExt) throws IOException {
@@ -142,7 +148,7 @@ public class FileStorageService {
     public boolean isManagedPath(String stored) {
         return stored != null
                 && !stored.startsWith("data:")
-                && (stored.startsWith("photos/") || stored.startsWith("bforms/"));
+                && (stored.startsWith("photos/") || stored.startsWith("bforms/") || stored.startsWith("diary/"));
     }
 
     /** Resolves a stored relative path to an absolute filesystem Path. */
