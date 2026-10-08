@@ -1,125 +1,158 @@
-package com.softschool.teacherportal;
+package com.softschool.backend.controller;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.softschool.backend.model.TeacherTest;
+import com.softschool.backend.repository.StaffRepository;
+import com.softschool.backend.repository.TeacherTestRepository;
+import com.softschool.backend.security.SchoolSessionService;
+import com.softschool.backend.security.TeacherAccessGuard;
 import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.server.ResponseStatusException;
 
-import java.util.*;
+import java.time.Instant;
+import java.util.Collections;
+import java.util.List;
 import java.util.regex.Pattern;
 
 /**
- * Tests / papers a teacher adds, plus the marks they enter.
- *   GET    /api/teacher-tests?schoolId=&staffId=     -> [ {test}, ... ]   (teacher: own tests; admin: whole school, or one teacher with staffId)
- *   PUT    /api/teacher-tests/{id}                   -> create or replace one test (idempotent, so the app can safely retry)
- *   DELETE /api/teacher-tests/{id}?schoolId=&staffId=
+ * Quizzes / tests created in the Teacher Portal (questions + checked results).
  *
- * Test JSON (exactly what teacher-portal.js sends):
- *   { id, kind, title, cls, subject, date, totalMarks, passPct, syllabus, marked, created,
- *     results: { "<regNo>": { absent:boolean, score:number, at:number } } }
+ *   GET    /api/teacher-tests?schoolId=[&staffId=]   teacher: her own | admin: whole school or one teacher
+ *   PUT    /api/teacher-tests/{testId}               teacher only: create or update one of her tests
+ *   DELETE /api/teacher-tests/{testId}?schoolId=     teacher only: delete one of her tests
+ *
+ * A teacher can only ever see or change tests under her own staffId — the id
+ * comes from the signed token, never from the request.
  */
 @RestController
 @RequestMapping("/api/teacher-tests")
+@CrossOrigin(origins = "*")
 public class TeacherTestController {
+
+    private static final int MAX_PAYLOAD_CHARS = 600_000;
+    private static final int MAX_QUESTIONS = 200;
+    private static final int MAX_TESTS_PER_TEACHER = 500;
     private static final Pattern ID = Pattern.compile("^[A-Za-z0-9_-]{1,40}$");
-    private static final int MAX_PAYLOAD = 600_000;   // ~600 KB: a class of 200 students is ~20 KB
 
-    private final TeacherTestRepository repo;
-    private final ObjectMapper om;
-
-    public TeacherTestController(TeacherTestRepository repo, ObjectMapper om) { this.repo = repo; this.om = om; }
+    @Autowired private TeacherTestRepository testRepository;
+    @Autowired private StaffRepository staffRepository;
+    @Autowired private SchoolSessionService sessionService;
+    private final ObjectMapper mapper = new ObjectMapper();
 
     @GetMapping
-    public List<JsonNode> list(HttpServletRequest req, @RequestParam(required = false) String staffId) throws Exception {
-        String school = TeacherPortalAuth.schoolId(req);
-        List<TeacherTest> rows = TeacherPortalAuth.isTeacher(req)
-                ? repo.findBySchoolIdAndStaffIdOrderByCreatedAtDesc(school, TeacherPortalAuth.staffId(req))
-                : (staffId != null && !staffId.isBlank()
-                        ? repo.findBySchoolIdAndStaffIdOrderByCreatedAtDesc(school, staffId.trim())
-                        : repo.findBySchoolIdOrderByCreatedAtDesc(school));
-        List<JsonNode> out = new ArrayList<>();
-        for (TeacherTest t : rows) {
-            ObjectNode n = (ObjectNode) om.readTree(t.payload);
-            n.put("id", t.id);
-            n.put("staffId", t.staffId);
-            n.put("staffName", t.staffName);
-            out.add(n);
+    public ResponseEntity<?> list(@RequestParam String schoolId,
+                                  @RequestParam(required = false) String staffId,
+                                  HttpServletRequest req) {
+        SchoolSessionService.Principal p = principal(req);
+        if (p == null) return error(HttpStatus.UNAUTHORIZED, "Please log in again.");
+
+        List<TeacherTest> rows;
+        if (TeacherAccessGuard.isTeacher(p)) {
+            rows = testRepository.findBySchoolIdAndStaffIdOrderByUpdatedAtDesc(p.getSchoolId(), staffIdOf(p));
+        } else if (staffId != null && !staffId.isBlank()) {
+            rows = testRepository.findBySchoolIdAndStaffIdOrderByUpdatedAtDesc(p.getSchoolId(), staffId.trim());
+        } else {
+            rows = testRepository.findBySchoolIdOrderByUpdatedAtDesc(p.getSchoolId());
         }
-        return out;
+
+        ArrayNode out = mapper.createArrayNode();
+        for (TeacherTest t : rows) {
+            try {
+                JsonNode node = mapper.readTree(t.getPayloadJson());
+                if (node.isObject()) ((com.fasterxml.jackson.databind.node.ObjectNode) node).put("staffId", t.getStaffId());
+                out.add(node);
+            } catch (Exception ignored) { /* skip a corrupt row rather than fail the list */ }
+        }
+        return ResponseEntity.ok(out);
     }
 
-    @PutMapping("/{id}")
+    @PutMapping("/{testId}")
     @Transactional
-    public Map<String, Object> put(HttpServletRequest req, @PathVariable String id, @RequestBody ObjectNode body) throws Exception {
-        String school = TeacherPortalAuth.schoolId(req);
-        String staff = TeacherPortalAuth.actingStaff(req, text(body, "staffId"));
-        if (!ID.matcher(id).matches()) throw bad("Invalid test id");
+    public ResponseEntity<?> upsert(@PathVariable String testId, @RequestBody JsonNode body, HttpServletRequest req) {
+        SchoolSessionService.Principal p = principal(req);
+        if (p == null) return error(HttpStatus.UNAUTHORIZED, "Please log in again.");
+        if (!TeacherAccessGuard.isTeacher(p)) return error(HttpStatus.FORBIDDEN, "Teacher accounts only.");
+        if (!ID.matcher(testId).matches()) return error(HttpStatus.BAD_REQUEST, "Invalid test id.");
+        if (!body.isObject() || !testId.equals(body.path("id").asText(""))) {
+            return error(HttpStatus.BAD_REQUEST, "Test id in the body must match the URL.");
+        }
 
-        String title = text(body, "title"), cls = text(body, "cls"), subject = text(body, "subject");
-        if (title == null || title.isBlank()) throw bad("Test name is required");
-        if (cls == null || cls.isBlank()) throw bad("Class is required");
-        if (subject == null || subject.isBlank()) throw bad("Subject is required");
+        String staffId = staffIdOf(p);
+        var teacher = staffRepository.findByStaffIdAndSchoolId(staffId, p.getSchoolId()).orElse(null);
+        if (teacher == null || !"Teaching".equalsIgnoreCase(teacher.getType())) {
+            return error(HttpStatus.FORBIDDEN, "This teacher account is no longer active.");
+        }
+        // New paper tests carry totalMarks; old quizzes carry a questions array. Either is accepted.
+        JsonNode questions = body.path("questions");
+        boolean legacy = questions.isArray() && questions.size() > 0;
+        if (legacy && questions.size() > MAX_QUESTIONS) return error(HttpStatus.BAD_REQUEST, "Too many questions (max " + MAX_QUESTIONS + ").");
         double total = body.path("totalMarks").asDouble(0);
-        boolean legacy = body.has("questions");                       // tests made by the old question builder
-        if (total <= 0 && !legacy) throw bad("Total marks must be greater than 0");
-
-        // marks sanity: 0 <= score <= totalMarks, and no more than a school-sized number of rows
+        if (!legacy && total <= 0) return error(HttpStatus.BAD_REQUEST, "Total marks must be greater than 0.");
+        if (body.path("title").asText("").isBlank()) return error(HttpStatus.BAD_REQUEST, "Test name is required.");
+        if (body.path("cls").asText("").isBlank() || body.path("subject").asText("").isBlank()) {
+            return error(HttpStatus.BAD_REQUEST, "Class and subject are required.");
+        }
         JsonNode results = body.path("results");
         if (results.isObject()) {
-            if (results.size() > 3000) throw bad("Too many results");
-            for (Iterator<Map.Entry<String, JsonNode>> it = results.fields(); it.hasNext(); ) {
-                Map.Entry<String, JsonNode> e = it.next();
-                if (e.getKey().length() > 64) throw bad("Invalid registration number");
-                double s = e.getValue().path("score").asDouble(0);
-                if (s < 0 || (!legacy && s > total)) throw bad("A mark is outside 0 – " + (long) total);
+            if (results.size() > 3000) return error(HttpStatus.BAD_REQUEST, "Too many results.");
+            var it = results.fields();
+            while (it.hasNext()) {
+                var e = it.next();
+                double sc = e.getValue().path("score").asDouble(0);
+                if (e.getKey().length() > 64 || sc < 0 || (!legacy && sc > total)) {
+                    return error(HttpStatus.BAD_REQUEST, "A mark is outside 0 - " + (long) total + ".");
+                }
             }
         }
 
-        Optional<TeacherTest> existing = repo.findBySchoolIdAndId(school, id);
-        if (existing.isPresent() && !existing.get().staffId.equals(staff) && TeacherPortalAuth.isTeacher(req))
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "This test belongs to another teacher");
+        String payload;
+        try { var copy = ((com.fasterxml.jackson.databind.node.ObjectNode) body).deepCopy(); copy.remove(java.util.List.of("staffId", "staffName")); payload = mapper.writeValueAsString(copy); } catch (Exception e) { return error(HttpStatus.BAD_REQUEST, "Invalid test data."); }
+        if (payload.length() > MAX_PAYLOAD_CHARS) return error(HttpStatus.PAYLOAD_TOO_LARGE, "This test is too large to save.");
 
-        ObjectNode clean = body.deepCopy();
-        clean.remove(Arrays.asList("schoolId", "staffId", "staffName"));   // identity lives in columns, never trusted from the payload
-        String payload = om.writeValueAsString(clean);
-        if (payload.length() > MAX_PAYLOAD) throw bad("Test is too large");
-
-        long now = System.currentTimeMillis();
-        TeacherTest t = existing.orElseGet(TeacherTest::new);
-        t.schoolId = school; t.id = id;
-        t.staffId = existing.map(x -> x.staffId).orElse(staff);
-        t.staffName = clip(text(body, "staffName"), 120);
-        t.kind = clip(text(body, "kind"), 30);
-        t.title = clip(title.trim(), 120); t.cls = clip(cls.trim(), 60); t.subject = clip(subject.trim(), 80);
-        t.testDate = clip(text(body, "date"), 10);
-        t.totalMarks = total;
-        t.marked = body.path("marked").asBoolean(false);
-        t.payload = payload;
-        t.createdAt = body.hasNonNull("created") ? body.get("created").asLong() : (t.createdAt != null ? t.createdAt : now);
-        t.updatedAt = now;
-        repo.save(t);
-        return Map.of("ok", true, "id", id, "updatedAt", now);
+        TeacherTest t = testRepository.findBySchoolIdAndStaffIdAndTestId(p.getSchoolId(), staffId, testId).orElse(null);
+        if (t == null) {
+            if (testRepository.countBySchoolIdAndStaffId(p.getSchoolId(), staffId) >= MAX_TESTS_PER_TEACHER) {
+                return error(HttpStatus.CONFLICT, "Test limit reached. Delete old tests first.");
+            }
+            t = new TeacherTest();
+            t.setSchoolId(p.getSchoolId());
+            t.setStaffId(staffId);
+            t.setTestId(testId);
+        }
+        t.setTitle(clip(body.path("title").asText(""), 200));
+        t.setClassName(clip(body.path("cls").asText(""), 100));
+        t.setSubject(clip(body.path("subject").asText(""), 100));
+        t.setType("quiz".equalsIgnoreCase(body.path("kind").asText(body.path("type").asText(""))) ? "quiz" : "test");
+        t.setPayloadJson(payload);
+        t.setUpdatedAt(Instant.now());
+        testRepository.save(t);
+        return ResponseEntity.ok(Collections.singletonMap("saved", true));
     }
 
-    @DeleteMapping("/{id}")
+    @DeleteMapping("/{testId}")
     @Transactional
-    public ResponseEntity<Map<String, Object>> delete(HttpServletRequest req, @PathVariable String id) {
-        String school = TeacherPortalAuth.schoolId(req);
-        Optional<TeacherTest> t = repo.findBySchoolIdAndId(school, id);
-        if (t.isEmpty()) return ResponseEntity.ok(Map.of("ok", true));        // already gone: deleting twice is fine
-        if (TeacherPortalAuth.isTeacher(req) && !t.get().staffId.equals(TeacherPortalAuth.staffId(req)))
-            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "This test belongs to another teacher");
-        repo.deleteBySchoolIdAndId(school, id);
-        return ResponseEntity.ok(Map.of("ok", true));
+    public ResponseEntity<?> delete(@PathVariable String testId, @RequestParam String schoolId, HttpServletRequest req) {
+        SchoolSessionService.Principal p = principal(req);
+        if (p == null) return error(HttpStatus.UNAUTHORIZED, "Please log in again.");
+        if (!TeacherAccessGuard.isTeacher(p)) return error(HttpStatus.FORBIDDEN, "Teacher accounts only.");
+        testRepository.deleteBySchoolIdAndStaffIdAndTestId(p.getSchoolId(), staffIdOf(p), testId);
+        return ResponseEntity.noContent().build();
     }
 
-    private static String text(JsonNode n, String f) { JsonNode v = n.get(f); return v == null || v.isNull() ? null : v.asText(); }
-    private static String clip(String s, int n) { return s == null ? null : (s.length() > n ? s.substring(0, n) : s); }
-    private static ResponseStatusException bad(String m) { return new ResponseStatusException(HttpStatus.BAD_REQUEST, m); }
+    // ── helpers ──
+    private SchoolSessionService.Principal principal(HttpServletRequest req) {
+        String h = req.getHeader("Authorization");
+        return sessionService.verifyToken(h != null && h.startsWith("Bearer ") ? h.substring(7).trim() : null);
+    }
+    private String staffIdOf(SchoolSessionService.Principal p) { return p.getUsername().substring(TeacherAccessGuard.PREFIX.length()); }
+    private String clip(String s, int max) { return s == null ? "" : (s.length() > max ? s.substring(0, max) : s); }
+    private ResponseEntity<?> error(HttpStatus status, String message) {
+        return ResponseEntity.status(status).body(Collections.singletonMap("error", message));
+    }
 }

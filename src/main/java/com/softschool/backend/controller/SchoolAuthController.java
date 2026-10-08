@@ -5,6 +5,8 @@ import com.softschool.backend.model.Staff;
 import com.softschool.backend.repository.StaffRepository;
 import com.softschool.backend.service.TeacherPasswordService;
 import com.softschool.backend.repository.SchoolRepository;
+import com.softschool.backend.repository.SchoolSettingsRepository;
+import com.softschool.backend.model.SchoolSettings;
 import com.softschool.backend.service.LoginAttemptService;
 import com.softschool.backend.security.SchoolSessionService;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -50,6 +52,9 @@ public class SchoolAuthController {
 
     @Autowired
     private SchoolRepository schoolRepository;
+
+    @Autowired
+    private SchoolSettingsRepository schoolSettingsRepository;
 
     @Autowired
     private SchoolSessionService schoolSessionService;
@@ -263,6 +268,16 @@ public class SchoolAuthController {
             out.put("schoolId", staff.getSchoolId());
             out.put("staff", staff);
             out.put("passwordChanged", passwordChanged);
+            // School identity for the portal header and the back of the teacher ID card.
+            SchoolSettings ss = schoolSettingsRepository.findBySchoolId(staff.getSchoolId()).orElse(null);
+            Map<String, Object> sc = new HashMap<>();
+            String settingsName = ss == null ? null : ss.getSchoolName();
+            sc.put("name", settingsName != null && !settingsName.isBlank() ? settingsName : school.getName());
+            sc.put("logo", school.getLogo());
+            sc.put("prefix", school.getPrefix());
+            sc.put("address", ss == null ? null : ss.getSchoolAddress());
+            sc.put("phone", ss == null ? null : ss.getSchoolPhone());
+            out.put("school", sc);
             return ResponseEntity.ok(out);
         }
         return handleFailedLogin(lockKey);
