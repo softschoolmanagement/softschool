@@ -19,6 +19,8 @@ import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.ZoneId;
 import java.time.YearMonth;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -548,7 +550,12 @@ public class FinanceController {
         // arrears, or paying late) — the underlying cause of "the graph
         // doesn't show real revenue". Stamp it on every payment so the
         // charts (and anything else reading it) reflect the true payment date.
-        master.setLastTransactionDate(new Date());
+        // FEATURE — admin-selectable payment date. The Pay Bill dialog now
+        // sends `paymentDate` (yyyy-MM-dd). When present it becomes the date
+        // this payment is recorded under (shown on the PAID voucher and used
+        // by Reports); when absent/invalid we fall back to "now", exactly the
+        // old behaviour, so older clients keep working unchanged.
+        applyPaymentDate(master, str(payload, "paymentDate"));
         master.calculateNetPayable();
 
         // Auto-settle individual fines covered by this payment and remove
@@ -588,6 +595,11 @@ public class FinanceController {
             Finance master = masterOpt.get();
             removeFineFromMaster(master, fine);
             master.calculateNetPayable();
+            // Keep the voucher's "paid on" date in step when settling this
+            // fine is what completes the monthly bill.
+            if (nz(master.getRemainingBalance()) <= 0.01) {
+                applyPaymentDate(master, null);
+            }
             financeRepository.save(master);
         }
 
@@ -1254,6 +1266,34 @@ public class FinanceController {
         if (student == null) return false;
         String status = student.getStatus();
         return isBlank(status) || "active".equalsIgnoreCase(status.trim());
+    }
+
+    /**
+     * Stamps a student-fee master row with the date its latest payment was
+     * made: payDate/payTime (display strings, same style as FINE rows) and
+     * lastTransactionDate (what Reports reads). `isoDate` is yyyy-MM-dd as
+     * chosen by the admin; blank or unparseable falls back to today. Today's
+     * date keeps the real current time; any other date is recorded at noon so
+     * a timezone offset can never push it onto a neighbouring day.
+     */
+    private void applyPaymentDate(Finance master, String isoDate) {
+        LocalDate day = null;
+        if (!isBlank(isoDate)) {
+            try {
+                day = LocalDate.parse(isoDate.trim());
+            } catch (Exception ignored) {
+                // fall through to "today"
+            }
+        }
+        LocalDateTime when;
+        if (day == null || day.equals(LocalDate.now())) {
+            when = LocalDateTime.now();
+        } else {
+            when = day.atTime(LocalTime.NOON);
+        }
+        master.setLastTransactionDate(Date.from(when.atZone(ZoneId.systemDefault()).toInstant()));
+        master.setPayDate(when.format(DateTimeFormatter.ofPattern("dd MMM yyyy", Locale.ENGLISH)));
+        master.setPayTime(when.format(DateTimeFormatter.ofPattern("hh:mm a", Locale.ENGLISH)));
     }
 
     private boolean isBlank(String s) {
