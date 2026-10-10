@@ -87,4 +87,11 @@ public class Message {
 
     private boolean readByTeacher;
     private boolean readByAdmin;
+
+    /** Set when the sender edits the text after sending (shown as "edited"). */
+    private Instant editedAt;
+
+    /** Same value on every copy of one group send ("all teachers", selected parents ...). */
+    @Column(length = 40)
+    private String broadcastId;
 }
