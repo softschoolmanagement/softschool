@@ -82,6 +82,9 @@ public class DiaryController {
         if (cls.isEmpty() || sub.isEmpty()) return error(HttpStatus.BAD_REQUEST, "Choose the class and the subject.");
         if (!teachesClass(teacher, cls)) return error(HttpStatus.FORBIDDEN, "You can only send diary for classes you teach.");
         if (!teachesSubject(teacher, sub)) return error(HttpStatus.FORBIDDEN, "That subject is not assigned to you.");
+        if (!com.softschool.backend.service.SubjectAssignments.teachesSubjectInClass(teacher, sub, cls)) {
+            return error(HttpStatus.FORBIDDEN, "You are not assigned to teach " + sub + " in " + cls + ".");
+        }
 
         List<MultipartFile> files = new ArrayList<>();
         for (MultipartFile f : images) if (f != null && !f.isEmpty()) files.add(f);

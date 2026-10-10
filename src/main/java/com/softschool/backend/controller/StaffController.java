@@ -70,6 +70,12 @@ public class StaffController {
             return badRequest("staffId is required.");
         }
 
+        // A teacher's subject must always come with the class it is taught in.
+        String assignmentError = com.softschool.backend.service.SubjectAssignments.validate(staff.getSubjectAssignments());
+        if (assignmentError != null) {
+            return badRequest(assignmentError);
+        }
+
         // Handle Update logic: if staffId exists FOR THIS SCHOOL, reuse the
         // internal primary key so this is an update, not a duplicate insert —
         // scoped by schoolId too, so School A can never overwrite School B's

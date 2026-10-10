@@ -116,6 +116,13 @@ public class TeacherTestController {
         if (payload.length() > MAX_PAYLOAD_CHARS) return error(HttpStatus.PAYLOAD_TOO_LARGE, "This test is too large to save.");
 
         TeacherTest t = testRepository.findBySchoolIdAndStaffIdAndTestId(p.getSchoolId(), staffId, testId).orElse(null);
+        // New tests (or a changed class/subject) must be for a subject the teacher teaches in that class.
+        // Saving marks on an existing test is left alone, even if the admin changed assignments since.
+        String newCls = clip(body.path("cls").asText(""), 100), newSubject = clip(body.path("subject").asText(""), 100);
+        boolean sameTarget = t != null && newCls.equals(t.getClassName()) && newSubject.equals(t.getSubject());
+        if (!sameTarget && !com.softschool.backend.service.SubjectAssignments.teachesSubjectInClass(teacher, newSubject, newCls)) {
+            return error(HttpStatus.FORBIDDEN, "You are not assigned to teach " + newSubject + " in " + newCls + ".");
+        }
         if (t == null) {
             if (testRepository.countBySchoolIdAndStaffId(p.getSchoolId(), staffId) >= MAX_TESTS_PER_TEACHER) {
                 return error(HttpStatus.CONFLICT, "Test limit reached. Delete old tests first.");
