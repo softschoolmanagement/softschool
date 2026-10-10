@@ -8,9 +8,11 @@ import java.time.Instant;
 /**
  * One chat message in a teacher conversation.
  *
- * A conversation ("thread") belongs to one teacher (staffId) and one channel:
- *   channel "admin" -> teacher <-> school admin / principal
- *   channel "class" -> teacher <-> the parents of className
+ * Channels (who is talking to whom):
+ *   "admin"           teacher        <-> school admin            key: staffId
+ *   "class"           teacher         -> all parents of a class  key: staffId + className
+ *   "parent_teacher"  teacher        <-> one student's parent    key: staffId + studentRegNo
+ *   "parent_admin"    school admin   <-> one student's parent    key: studentRegNo   (staffId = "")
  *
  * senderType: TEACHER | ADMIN | PARENT. PARENT is reserved for the parent
  * portal that will be linked later: it will post into the same "class"
@@ -23,11 +25,16 @@ import java.time.Instant;
 @Data
 @Table(name = "teacher_message",
        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "staffId", "clientId"}),
-       indexes = @Index(name = "idx_tmsg_thread", columnList = "schoolId,staffId,createdAt"))
+       indexes = {
+           @Index(name = "idx_tmsg_thread", columnList = "schoolId,staffId,createdAt"),
+           @Index(name = "idx_tmsg_student", columnList = "schoolId,studentRegNo,createdAt")
+       })
 public class Message {
 
     public static final String CH_ADMIN = "admin";
     public static final String CH_CLASS = "class";
+    public static final String CH_PARENT_TEACHER = "parent_teacher";
+    public static final String CH_PARENT_ADMIN = "parent_admin";
     public static final String FROM_TEACHER = "TEACHER";
     public static final String FROM_ADMIN = "ADMIN";
     public static final String FROM_PARENT = "PARENT";
@@ -43,7 +50,7 @@ public class Message {
     @Column(nullable = false, length = 64)
     private String staffId;
 
-    @Column(nullable = false, length = 10)
+    @Column(nullable = false, length = 20)
     private String channel;
 
     @Column(length = 100)
@@ -54,6 +61,20 @@ public class Message {
 
     @Column(length = 120)
     private String senderName;
+
+    /** Parent threads: the student the conversation is about (resolved on the server, never trusted from the client). */
+    @Column(length = 64)
+    private String studentRegNo;
+
+    @Column(length = 120)
+    private String studentName;
+
+    /** Father / guardian name as stored on the student record. */
+    @Column(length = 120)
+    private String guardianName;
+
+    @Column(length = 40)
+    private String guardianRole;
 
     @Column(nullable = false, length = 1000)
     private String body;
