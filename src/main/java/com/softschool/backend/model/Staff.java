@@ -87,6 +87,13 @@ public class Staff {
     @Column(columnDefinition = "TEXT")
     private String inchargeAssignments;
 
+    // JSON array of { subject, cls, section }: which subject this teacher teaches in which class.
+    // `subjects`, `classes` and `classAssignments` above are derived from it by the frontend.
+    // Null on records saved before this field existed (treated as "every subject in every class").
+    @Lob
+    @Column(columnDefinition = "TEXT")
+    private String subjectAssignments;
+
     // Non-Teaching-only
     private String job;
     private String startTime;
