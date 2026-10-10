@@ -33,6 +33,15 @@ public interface MessageRepository extends JpaRepository<Message, Long> {
            "and m.senderType <> 'ADMIN' and m.readByAdmin = false")
     long unreadForAdmin(@Param("schoolId") String schoolId);
 
+    /** Pulse extras so the live view also notices edits and deletions. */
+    @Query("select count(m) from Message m where m.schoolId = :schoolId and m.channel in ('admin', 'parent_admin')")
+    long countAdminVisible(@Param("schoolId") String schoolId);
+
+    @Query("select max(m.editedAt) from Message m where m.schoolId = :schoolId and m.channel in ('admin', 'parent_admin')")
+    Instant maxAdminEditedAt(@Param("schoolId") String schoolId);
+
+    Optional<Message> findByIdAndSchoolId(Long id, String schoolId);
+
     Optional<Message> findBySchoolIdAndStaffIdAndClientId(String schoolId, String staffId, String clientId);
 
     long countBySchoolIdAndStaffIdAndSenderTypeAndCreatedAtAfter(String schoolId, String staffId, String senderType, Instant after);
