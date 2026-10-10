@@ -58,6 +58,7 @@ public class MessageController {
 
     private static final int MAX_LIST = 500;
     private static final int MAX_THREAD_SCAN = 3000;
+    private static final int MAX_BROADCAST = 1000;
     private static final int TEACHER_DAILY_LIMIT = 120;
     private static final Pattern CLIENT_ID = Pattern.compile("^[A-Za-z0-9_-]{1,40}$");
     private static final List<String> ADMIN_CHANNELS = Arrays.asList(Message.CH_ADMIN, Message.CH_PARENT_ADMIN);
@@ -167,7 +168,100 @@ public class MessageController {
         Map<String, Object> o = new LinkedHashMap<>();
         o.put("lastId", messageRepository.maxAdminVisibleId(p.getSchoolId()));
         o.put("unread", messageRepository.unreadForAdmin(p.getSchoolId()));
+        o.put("count", messageRepository.countAdminVisible(p.getSchoolId()));          // changes when a message is deleted
+        Instant ed = messageRepository.maxAdminEditedAt(p.getSchoolId());
+        o.put("edited", ed == null ? "" : ed.toString());                              // changes when a message is edited
         return ResponseEntity.ok(o);
+    }
+
+    // ───────────── EDIT / DELETE (admin, own messages only) ─────────────
+    @PutMapping("/{id}")
+    @Transactional
+    public ResponseEntity<?> edit(@PathVariable Long id, @RequestBody JsonNode body, HttpServletRequest req) {
+        SchoolSessionService.Principal p = principal(req);
+        if (p == null) return error(HttpStatus.UNAUTHORIZED, "Please log in again.");
+        if (TeacherAccessGuard.isTeacher(p)) return error(HttpStatus.FORBIDDEN, "Admin only.");
+        String text = text(body, "body", 1000);
+        if (text.isEmpty()) return error(HttpStatus.BAD_REQUEST, "Write a message first.");
+        Message m = messageRepository.findByIdAndSchoolId(id, p.getSchoolId()).orElse(null);
+        if (m == null || !ADMIN_CHANNELS.contains(m.getChannel())) return error(HttpStatus.NOT_FOUND, "Message not found.");
+        if (!Message.FROM_ADMIN.equals(m.getSenderType())) return error(HttpStatus.FORBIDDEN, "You can only edit your own messages.");
+        if (!text.equals(m.getBody())) { m.setBody(text); m.setEditedAt(Instant.now()); messageRepository.save(m); }
+        Map<String, Object> o = new LinkedHashMap<>();
+        o.put("ok", true); o.put("id", m.getId()); o.put("editedAt", m.getEditedAt() == null ? null : m.getEditedAt().toString());
+        return ResponseEntity.ok(o);
+    }
+
+    @DeleteMapping("/{id}")
+    @Transactional
+    public ResponseEntity<?> remove(@PathVariable Long id, HttpServletRequest req) {
+        SchoolSessionService.Principal p = principal(req);
+        if (p == null) return error(HttpStatus.UNAUTHORIZED, "Please log in again.");
+        if (TeacherAccessGuard.isTeacher(p)) return error(HttpStatus.FORBIDDEN, "Admin only.");
+        Message m = messageRepository.findByIdAndSchoolId(id, p.getSchoolId()).orElse(null);
+        if (m == null || !ADMIN_CHANNELS.contains(m.getChannel())) return error(HttpStatus.NOT_FOUND, "Message not found.");
+        if (!Message.FROM_ADMIN.equals(m.getSenderType())) return error(HttpStatus.FORBIDDEN, "You can only delete your own messages.");
+        messageRepository.delete(m);
+        return ResponseEntity.noContent().build();
+    }
+
+    // ───────────── GROUP SEND (admin) ─────────────
+    /**
+     * POST /api/messages/broadcast
+     *   { audience: "teachers" | "parents", all: true }                         every active teacher / every active student's parent
+     *   { audience: "teachers", staffIds: ["T-1","T-2"] }                       selected teachers
+     *   { audience: "parents",  regNos: ["R-1","R-2"] }                         selected parents
+     *   { audience: "parents",  className: "Class 5 - A" }                      every parent of one class
+     * plus { body, senderName }. One message is stored per recipient (so each shows in that person's own chat).
+     */
+    @PostMapping("/broadcast")
+    @Transactional
+    public ResponseEntity<?> broadcast(@RequestBody JsonNode body, HttpServletRequest req) {
+        SchoolSessionService.Principal p = principal(req);
+        if (p == null) return error(HttpStatus.UNAUTHORIZED, "Please log in again.");
+        if (TeacherAccessGuard.isTeacher(p)) return error(HttpStatus.FORBIDDEN, "Admin only.");
+        String text = text(body, "body", 1000);
+        if (text.isEmpty()) return error(HttpStatus.BAD_REQUEST, "Write a message first.");
+        String audience = text(body, "audience", 10).toLowerCase();
+        boolean all = body.path("all").asBoolean(false);
+        String name = text(body, "senderName", 80);
+        String groupId = UUID.randomUUID().toString().replace("-", "").substring(0, 32);
+        List<Message> out = new ArrayList<>();
+
+        if ("teachers".equals(audience)) {
+            Set<String> wanted = new LinkedHashSet<>();
+            if (body.path("staffIds").isArray()) for (JsonNode n : body.get("staffIds")) wanted.add(n.asText("").trim());
+            for (Staff t : staffRepository.findBySchoolId(p.getSchoolId())) {
+                if (!"Teaching".equalsIgnoreCase(t.getType())) continue;
+                if (!all && !wanted.contains(t.getStaffId())) continue;
+                Message m = base(p, text, name, groupId);
+                m.setStaffId(t.getStaffId());
+                m.setChannel(Message.CH_ADMIN);
+                out.add(m);
+            }
+        } else if ("parents".equals(audience)) {
+            Set<String> wanted = new LinkedHashSet<>();
+            if (body.path("regNos").isArray()) for (JsonNode n : body.get("regNos")) wanted.add(n.asText("").trim());
+            String cls = text(body, "className", 100);
+            for (Student st : studentRepository.findBySchoolId(p.getSchoolId())) {
+                if (st.getStatus() != null && !"active".equalsIgnoreCase(st.getStatus())) continue;
+                if (!all && !wanted.contains(st.getRegNo()) && (cls.isEmpty() || !cls.equalsIgnoreCase(classLabel(st)))) continue;
+                Message m = base(p, text, name, groupId);
+                applyStudent(m, st);
+                m.setClassName(classLabel(st));
+                m.setStaffId("");
+                m.setChannel(Message.CH_PARENT_ADMIN);
+                out.add(m);
+            }
+        } else {
+            return error(HttpStatus.BAD_REQUEST, "audience must be teachers or parents.");
+        }
+        if (out.isEmpty()) return error(HttpStatus.BAD_REQUEST, "No recipients matched.");
+        if (out.size() > MAX_BROADCAST) return error(HttpStatus.BAD_REQUEST, "Too many recipients (max " + MAX_BROADCAST + ").");
+        messageRepository.saveAll(out);
+        Map<String, Object> o = new LinkedHashMap<>();
+        o.put("ok", true); o.put("sent", out.size()); o.put("broadcastId", groupId);
+        return ResponseEntity.status(HttpStatus.CREATED).body(o);
     }
 
     // ───────────── SEND ─────────────
@@ -294,7 +388,19 @@ public class MessageController {
         o.put("createdAt", m.getCreatedAt().toString());   // ISO-8601 UTC
         o.put("readByTeacher", m.isReadByTeacher());
         o.put("readByAdmin", m.isReadByAdmin());
+        o.put("editedAt", m.getEditedAt() == null ? null : m.getEditedAt().toString());
+        o.put("broadcastId", m.getBroadcastId());
         return o;
+    }
+    private Message base(SchoolSessionService.Principal p, String text, String senderName, String groupId) {
+        Message m = new Message();
+        m.setSchoolId(p.getSchoolId());
+        m.setBody(text);
+        m.setSenderType(Message.FROM_ADMIN);
+        m.setSenderName(senderName.isEmpty() ? "Admin" : senderName);
+        m.setReadByAdmin(true);
+        m.setBroadcastId(groupId);
+        return m;
     }
     private Map<String, Object> ack(Message m) {
         Map<String, Object> o = new LinkedHashMap<>();
