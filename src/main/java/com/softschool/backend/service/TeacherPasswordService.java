@@ -3,6 +3,7 @@ package com.softschool.backend.service;
 import com.softschool.backend.model.SchoolSettings;
 import com.softschool.backend.model.Staff;
 import com.softschool.backend.repository.SchoolSettingsRepository;
+import com.softschool.backend.repository.StaffRepository;
 import com.softschool.backend.security.PasswordHashUtil;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -23,6 +24,9 @@ public class TeacherPasswordService {
     @Autowired
     private SchoolSettingsRepository settingsRepository;
 
+    @Autowired
+    private StaffRepository staffRepository;
+
     /** True once the teacher has used her one-time password change. */
     public boolean hasChanged(Staff staff) {
         return staff.getPasswordHash() != null && !staff.getPasswordHash().isEmpty();
@@ -38,6 +42,24 @@ public class TeacherPasswordService {
 
     public boolean verify(Staff staff, String password) {
         String hash = effectiveHash(staff);
-        return hash != null && PasswordHashUtil.verify(password, hash);
+        boolean ok = hash != null && PasswordHashUtil.verify(password, hash);
+        if (ok && PasswordHashUtil.needsRehash(hash)) {
+            upgradeHash(staff, password);
+        }
+        return ok;
+    }
+
+    /** Re-hashes a legacy SHA-256 value with PBKDF2 after a successful login. */
+    private void upgradeHash(Staff staff, String password) {
+        String upgraded = PasswordHashUtil.hash(password);
+        if (hasChanged(staff)) {
+            staff.setPasswordHash(upgraded);
+            staffRepository.save(staff);
+        } else {
+            settingsRepository.findBySchoolId(staff.getSchoolId()).ifPresent(settings -> {
+                settings.setTeacherPasswordHash(upgraded);
+                settingsRepository.save(settings);
+            });
+        }
     }
 }

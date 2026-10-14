@@ -10,7 +10,6 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/auth")
-@CrossOrigin(origins = "*") // Allows your frontend to connect
 public class AuthController {
 
     @PostMapping("/login")

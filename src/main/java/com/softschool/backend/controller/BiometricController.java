@@ -14,7 +14,6 @@ import java.security.MessageDigest;
 
 @RestController
 @RequestMapping("/api/biometric")
-@CrossOrigin(origins = "*") // This allows the frontend to talk to the backend
 public class BiometricController {
 
     @Autowired
@@ -52,7 +51,11 @@ public class BiometricController {
         planEnforcementService.requireFeature(request.getSchoolId(), PlanEnforcementService.FEATURE_BIOMETRIC);
 
         // Pass both the path and the school to our service
-        zktecoService.updateMdbPath(request.getPath(), request.getSchoolId());
+        try {
+            zktecoService.updateMdbPath(request.getPath(), request.getSchoolId());
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body("Invalid biometric database path.");
+        }
 
         return ResponseEntity.ok("Path updated successfully");
     }
@@ -71,9 +74,9 @@ public class BiometricController {
             @RequestHeader(value = "X-Biometric-Key", required = false) String providedKey,
             @RequestBody BiometricSyncRequest request) {
 
-        if (syncKey == null || syncKey.isBlank()) {
+        if (!com.softschool.backend.security.SecretStrength.isStrong(syncKey)) {
             return ResponseEntity.status(503)
-                    .body("Biometric sync is not configured on the server (set BIOMETRIC_SYNC_KEY).");
+                    .body("Biometric sync is not configured on the server (set a strong BIOMETRIC_SYNC_KEY, 32+ characters).");
         }
         if (!constantTimeEquals(providedKey, syncKey)) {
             return ResponseEntity.status(401).body("Invalid or missing X-Biometric-Key header");

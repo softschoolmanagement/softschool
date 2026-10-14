@@ -104,6 +104,9 @@ public class RateLimitFilter extends OncePerRequestFilter {
     /** JSON body fields (checked in this order) that identify "which account" for the sensitive paths above. */
     private static final String[] IDENTITY_FIELDS = {"phone", "username", "schoolId"};
 
+    @Value("${app.trusted-proxy-hops:1}")
+    private int trustedProxyHops;
+
     @Autowired
     public RateLimitFilter(RateLimiter rateLimiter) {
         this.rateLimiter = rateLimiter;
@@ -203,9 +206,19 @@ public class RateLimitFilter extends OncePerRequestFilter {
      * its own rate limit.
      */
     private String resolveClientIp(HttpServletRequest request) {
+        // trustedProxyHops = how many reverse proxies in front of us append to
+        // X-Forwarded-For (Railway/Render/nginx = 1). We count from the RIGHT,
+        // because each trusted proxy appends the address it saw; anything to
+        // the left of that was supplied by the client and can be forged.
+        // Set app.trusted-proxy-hops=0 if the app is exposed directly.
         String forwarded = request.getHeader("X-Forwarded-For");
-        if (forwarded != null && !forwarded.isBlank()) {
-            return forwarded.split(",")[0].trim();
+        if (trustedProxyHops > 0 && forwarded != null && !forwarded.isBlank()) {
+            String[] hops = forwarded.split(",");
+            int idx = hops.length - trustedProxyHops;
+            String candidate = hops[Math.max(0, idx)].trim();
+            if (!candidate.isEmpty() && candidate.length() <= 45) {
+                return candidate;
+            }
         }
         return request.getRemoteAddr();
     }

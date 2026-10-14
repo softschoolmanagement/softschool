@@ -44,3 +44,6 @@ out/
 *.hprof
 
 *.class
+app.log
+uploads/
+.env

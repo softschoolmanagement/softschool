@@ -7,6 +7,7 @@ import com.softschool.backend.service.TeacherPasswordService;
 import com.softschool.backend.repository.SchoolRepository;
 import com.softschool.backend.repository.SchoolSettingsRepository;
 import com.softschool.backend.model.SchoolSettings;
+import com.softschool.backend.security.PasswordHashUtil;
 import com.softschool.backend.service.LoginAttemptService;
 import com.softschool.backend.security.SchoolSessionService;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -47,7 +48,6 @@ import java.util.Optional;
  */
 @RestController
 @RequestMapping("/api/school")
-@CrossOrigin(origins = "*")
 public class SchoolAuthController {
 
     @Autowired
@@ -100,7 +100,7 @@ public class SchoolAuthController {
         }
         School school = found.get();
 
-        if (school.getPassword() == null || !school.getPassword().equalsIgnoreCase(code)) {
+        if (!codeMatches(school.getPassword(), code)) {
             return badRequest("School ID or security code is not valid.");
         }
         if (school.getUsername() != null && !school.getUsername().isEmpty()) {
@@ -155,7 +155,7 @@ public class SchoolAuthController {
         }
         School school = found.get();
 
-        if (school.getPassword() == null || !school.getPassword().equalsIgnoreCase(code)) {
+        if (!codeMatches(school.getPassword(), code)) {
             return badRequest("School ID or security code is not valid.");
         }
         if (school.getUsername() == null || school.getUsername().isEmpty()) {
@@ -209,6 +209,12 @@ public class SchoolAuthController {
 
         // Correct credentials, account in good standing - clear any failure history.
         loginAttemptService.recordSuccess(username);
+
+        // Transparently upgrade an old single-round SHA-256 hash to PBKDF2 now
+        // that we hold the verified plaintext. (Saved by the save() below.)
+        if (PasswordHashUtil.needsRehash(school.getLoginPasswordHash())) {
+            school.setLoginPasswordHash(PasswordHashUtil.hash(password));
+        }
 
         String rememberToken = null;
         if (req.isRemember()) {
@@ -413,34 +419,20 @@ public class SchoolAuthController {
         return Collections.singletonMap("error", message);
     }
 
+    /** Constant-time, case-insensitive compare of the one-time school security code. */
+    private boolean codeMatches(String stored, String supplied) {
+        if (stored == null || supplied == null) return false;
+        return java.security.MessageDigest.isEqual(
+                stored.toLowerCase().getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                supplied.toLowerCase().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
     private String hashPassword(String password) {
-        byte[] salt = new byte[16];
-        RANDOM.nextBytes(salt);
-        byte[] hash = sha256(salt, password);
-        return Base64.getEncoder().encodeToString(salt) + ":" + Base64.getEncoder().encodeToString(hash);
+        return PasswordHashUtil.hash(password);
     }
 
     private boolean verifyPassword(String password, String stored) {
-        try {
-            String[] parts = stored.split(":", 2);
-            if (parts.length != 2) return false;
-            byte[] salt = Base64.getDecoder().decode(parts[0]);
-            byte[] expected = Base64.getDecoder().decode(parts[1]);
-            byte[] actual = sha256(salt, password);
-            return MessageDigest.isEqual(expected, actual);
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    private byte[] sha256(byte[] salt, String password) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            digest.update(salt);
-            return digest.digest(password.getBytes("UTF-8"));
-        } catch (NoSuchAlgorithmException | UnsupportedEncodingException e) {
-            throw new RuntimeException(e);
-        }
+        return PasswordHashUtil.verify(password, stored);
     }
 
     /**

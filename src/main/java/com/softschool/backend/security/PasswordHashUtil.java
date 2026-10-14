@@ -1,15 +1,21 @@
 package com.softschool.backend.security;
 
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.Base64;
 
 /**
- * Shared salted-hash helper (SHA-256 + 16-byte random salt), extracted from
- * the scheme SchoolAuthController already used for school logins, so every
- * place in the app that needs to store/verify a secret does it the same
- * secure way instead of inventing a new (or hardcoded) one.
+ * Shared password-hash helper. New hashes use PBKDF2-HMAC-SHA256 with a
+ * random 16-byte salt and 600,000 iterations (OWASP 2023 minimum), which is
+ * deliberately slow so a stolen database cannot be brute-forced quickly.
+ * Legacy single-round "salt:hash" SHA-256 values are still ACCEPTED by
+ * verify() so existing accounts keep working, and needsRehash() tells callers
+ * to upgrade them on the next successful login.
  *
  * ── Why this exists ─────────────────────────────────────────────────────
  * A previous version of this codebase had a live, unauthenticated backdoor:
@@ -22,7 +28,8 @@ import java.util.Base64;
  * as a salted hash.
  *
  * ── Format ──────────────────────────────────────────────────────────────
- * A hash produced by hash(...) looks like: "<base64 salt>:<base64 hash>"
+ * A hash produced by hash(...) looks like: "pbkdf2$<iterations>$<base64 salt>$<base64 hash>"
+ * (legacy format, verify-only: "<base64 salt>:<base64 sha256>")
  * That whole string is what you put in an environment variable such as
  * SUPERADMIN_PASSWORD_HASH — never the plaintext password itself.
  *
@@ -36,40 +43,77 @@ import java.util.Base64;
  */
 public final class PasswordHashUtil {
 
+    private static final String PREFIX = "pbkdf2";
+    private static final int ITERATIONS = 600_000;
+    private static final int SALT_BYTES = 16;
+    private static final int KEY_BITS = 256;
+    /** Upper bound so a hostile stored value can't make verify() burn CPU. */
+    private static final int MAX_ITERATIONS = 5_000_000;
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private PasswordHashUtil() {}
 
     public static String hash(String plaintext) {
-        byte[] salt = new byte[16];
+        byte[] salt = new byte[SALT_BYTES];
         RANDOM.nextBytes(salt);
-        byte[] digest = sha256(salt, plaintext);
-        return Base64.getEncoder().encodeToString(salt) + ":" + Base64.getEncoder().encodeToString(digest);
+        byte[] dk = pbkdf2(plaintext, salt, ITERATIONS);
+        return PREFIX + "$" + ITERATIONS + "$"
+                + Base64.getEncoder().encodeToString(salt) + "$"
+                + Base64.getEncoder().encodeToString(dk);
     }
 
-    /** Constant-time compare against a "salt:hash" string produced by hash(). */
+    /** Constant-time compare against a stored hash (PBKDF2 or legacy SHA-256). */
     public static boolean verify(String plaintext, String stored) {
         if (plaintext == null || stored == null) return false;
         try {
+            if (stored.startsWith(PREFIX + "$")) {
+                String[] p = stored.split("\\$");
+                if (p.length != 4) return false;
+                int iterations = Integer.parseInt(p[1]);
+                if (iterations < 1 || iterations > MAX_ITERATIONS) return false;
+                byte[] salt = Base64.getDecoder().decode(p[2]);
+                byte[] expected = Base64.getDecoder().decode(p[3]);
+                return MessageDigest.isEqual(expected, pbkdf2(plaintext, salt, iterations));
+            }
+            // Legacy format: "<base64 salt>:<base64 sha256(salt + password)>"
             String[] parts = stored.split(":", 2);
             if (parts.length != 2) return false;
             byte[] salt = Base64.getDecoder().decode(parts[0]);
             byte[] expected = Base64.getDecoder().decode(parts[1]);
-            byte[] actual = sha256(salt, plaintext);
-            return MessageDigest.isEqual(expected, actual);
+            return MessageDigest.isEqual(expected, legacySha256(salt, plaintext));
         } catch (Exception e) {
             return false;
         }
     }
 
-    private static byte[] sha256(byte[] salt, String plaintext) {
+    /** True when the stored value is in the old weak format (or has fewer iterations than today's default). */
+    public static boolean needsRehash(String stored) {
+        if (stored == null || stored.isBlank()) return false;
+        if (!stored.startsWith(PREFIX + "$")) return true;
         try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            digest.update(salt);
-            return digest.digest(plaintext.getBytes("UTF-8"));
-        } catch (NoSuchAlgorithmException | java.io.UnsupportedEncodingException e) {
-            throw new RuntimeException(e);
+            return Integer.parseInt(stored.split("\\$")[1]) < ITERATIONS;
+        } catch (Exception e) {
+            return true;
         }
+    }
+
+    private static byte[] pbkdf2(String plaintext, byte[] salt, int iterations) {
+        try {
+            PBEKeySpec spec = new PBEKeySpec(plaintext.toCharArray(), salt, iterations, KEY_BITS);
+            try {
+                return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
+            } finally {
+                spec.clearPassword();
+            }
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("PBKDF2 unavailable", e);
+        }
+    }
+
+    private static byte[] legacySha256(byte[] salt, String plaintext) throws NoSuchAlgorithmException {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        digest.update(salt);
+        return digest.digest(plaintext.getBytes(StandardCharsets.UTF_8));
     }
 
     /** Offline CLI helper — never wire this up as a live HTTP endpoint. */

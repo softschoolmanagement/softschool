@@ -18,7 +18,6 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/students")
-@CrossOrigin(origins = "*")
 public class StudentController {
 
     @Autowired
@@ -400,7 +399,7 @@ public class StudentController {
             return badRequest(e.getMessage());
         } catch (IOException e) {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(errorBody("Could not store photo: " + e.getMessage()));
+                    .body(errorBody("Could not store photo."));
         }
     }
 
@@ -422,7 +421,7 @@ public class StudentController {
             return badRequest(e.getMessage());
         } catch (IOException e) {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(errorBody("Could not store B-Form file: " + e.getMessage()));
+                    .body(errorBody("Could not store B-Form file."));
         }
     }
 
@@ -508,9 +507,13 @@ public class StudentController {
                 bytes = Files.readAllBytes(path);
             } catch (IOException e) {
                 return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                        .body(errorBody("Could not read file: " + e.getMessage()));
+                        .body(errorBody("Could not read file."));
             }
-            String mediaType = guessMediaType(path.toString());
+            // Trust the bytes, not the filename: only real image/PDF content is served.
+            String mediaType = FileStorageService.detectMediaType(bytes);
+            if (mediaType == null) {
+                return ResponseEntity.notFound().build();
+            }
             return ResponseEntity.ok()
                     .header("Content-Type", mediaType)
                     // Do not cache this URL for a day: the URL is based on the
@@ -522,14 +525,12 @@ public class StudentController {
                     .body(bytes);
         }
 
-        // Legacy path: value is (or should be) inline base64.
-        String mediaType = "image/jpeg";
+        // Legacy path: value is (or should be) inline base64. The "data:<type>;"
+        // header is client-controlled and is IGNORED - the Content-Type is
+        // derived from the decoded bytes, so a stored "data:text/html;..." value
+        // can never be served back as an executable page.
         int comma = raw.indexOf(',');
         if (raw.startsWith("data:") && comma > 0) {
-            String header = raw.substring(5, comma);          // e.g. "image/png;base64"
-            int semi = header.indexOf(';');
-            String declared = (semi > 0) ? header.substring(0, semi) : header;
-            if (!declared.isBlank()) mediaType = declared;
             raw = raw.substring(comma + 1);
         }
         raw = raw.replaceAll("\\s", "");
@@ -538,9 +539,13 @@ public class StudentController {
         try {
             bytes = java.util.Base64.getDecoder().decode(raw);
         } catch (IllegalArgumentException e) {
-            // Not decodable base64 either — treat it as "nothing usable"
+            // Not decodable base64 either - treat it as "nothing usable"
             // rather than throwing a 500, so the frontend just falls back
             // to its generated initials avatar / "no document" state.
+            return ResponseEntity.notFound().build();
+        }
+        String mediaType = FileStorageService.detectMediaType(bytes);
+        if (mediaType == null) {
             return ResponseEntity.notFound().build();
         }
 

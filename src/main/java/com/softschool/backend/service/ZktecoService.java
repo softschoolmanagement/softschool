@@ -32,10 +32,31 @@ public class ZktecoService {
     // device from ever matching School B's staff.
     private volatile String schoolId = "";
 
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(ZktecoService.class);
+
+    /**
+     * The path is placed inside a JDBC URL ("jdbc:ucanaccess://" + path), so it
+     * must be a plain file path: no ';' (which would let a caller inject driver
+     * options such as a custom class opener), no "..", no URL schemes, and it
+     * must point at an Access database file.
+     */
+    static boolean isSafeMdbPath(String path) {
+        if (path == null) return false;
+        String p = path.trim();
+        if (p.isEmpty() || p.length() > 260) return false;
+        if (p.indexOf(';') >= 0 || p.indexOf('\0') >= 0 || p.contains("..")) return false;
+        if (p.contains("://") || p.startsWith("\\\\") || p.startsWith("//")) return false;
+        String lower = p.toLowerCase(java.util.Locale.ROOT);
+        return lower.endsWith(".mdb") || lower.endsWith(".accdb");
+    }
+
     public void updateMdbPath(String newPath, String schoolId) {
-        this.mdbPath = newPath;
+        if (!isSafeMdbPath(newPath)) {
+            throw new IllegalArgumentException("Invalid biometric database path.");
+        }
+        this.mdbPath = newPath.trim();
         this.schoolId = schoolId;
-        System.out.println("✅ Biometric Path Updated to: " + newPath + " (school: " + schoolId + ")");
+        log.info("Biometric path updated for school {}", schoolId);
     }
 
     @Scheduled(fixedRate = 15000)
@@ -76,8 +97,9 @@ public class ZktecoService {
             }
         } catch (Exception e) {
             // We ignore common Access "File Busy" warnings to keep terminal clean
-            if (!e.getMessage().contains("user lacks privilege")) {
-                System.err.println("⚠️ Biometric Bridge: " + e.getMessage());
+            String msg = e.getMessage();
+            if (msg == null || !msg.contains("user lacks privilege")) {
+                log.warn("Biometric bridge read failed: {}", e.getClass().getSimpleName());
             }
         }
     }
@@ -88,7 +110,7 @@ public class ZktecoService {
      */
     public void markAttendance(String badgeNumber, String staffName, LocalTime scanTime) {
         if (schoolId == null || schoolId.isEmpty()) {
-            System.out.println("❌ Test Failed: No school linked to this biometric device yet.");
+            log.warn("Biometric test failed: no school linked to device");
             return;
         }
 
@@ -115,7 +137,7 @@ public class ZktecoService {
                 att.setCheckIn(scanTime);
                 att.setReason("Manual/Test Punch");
                 attendanceRepository.save(att);
-                System.out.println("☀️ Manual Check-In: " + s.getName() + " at " + scanTime);
+                log.info("Manual check-in recorded (school {})", schoolId);
             } else {
                 // Test Check-Out
                 Attendance att = existingAtt.get();
@@ -123,11 +145,11 @@ public class ZktecoService {
                     att.setCheckOut(scanTime);
                     att.setReason("Manual/Test Punch Out");
                     attendanceRepository.save(att);
-                    System.out.println("🌙 Manual Check-Out: " + s.getName() + " at " + scanTime);
+                    log.info("Manual check-out recorded (school {})", schoolId);
                 }
             }
         } else {
-            System.out.println("❌ Test Failed: No staff found with staffId " + badgeNumber + " in school " + schoolId);
+            log.warn("Biometric test failed: badge not matched (school {})", schoolId);
         }
     }
 
@@ -168,8 +190,7 @@ public class ZktecoService {
                 processPunchesForSchool(schoolId, badge.trim(), p.getName(), Timestamp.valueOf(first), Timestamp.valueOf(last));
                 processed++;
             } catch (Exception e) {
-                System.err.println("⚠️ Biometric Sync: skipping malformed punch for badge "
-                        + badge + " (" + e.getMessage() + ")");
+                log.warn("Biometric sync: skipping malformed punch ({})", e.getClass().getSimpleName());
             }
         }
         return processed;
@@ -206,7 +227,7 @@ public class ZktecoService {
             att.setCheckIn(checkInTime);
             att.setReason("Biometric Check-In");
             attendanceRepository.save(att);
-            System.out.println("☀️ Biometric Sync: " + s.getName() + " marked Present.");
+            log.debug("Biometric sync: check-in recorded");
         } else {
             Attendance att = existingAtt.get();
 
@@ -223,7 +244,7 @@ public class ZktecoService {
                 att.setCheckOut(checkOutTime);
                 att.setReason("Biometric Check-Out");
                 attendanceRepository.save(att);
-                System.out.println("🌙 Biometric Sync: " + s.getName() + " Check-Out updated.");
+                log.debug("Biometric sync: check-out updated");
             }
         }
     }
