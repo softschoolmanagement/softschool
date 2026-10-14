@@ -43,7 +43,6 @@ import java.util.stream.Collectors;
  */
 @RestController
 @RequestMapping("/api/finance")
-@CrossOrigin(origins = "*")
 public class FinanceController {
 
     @Autowired private StudentRepository studentRepository;
@@ -867,8 +866,13 @@ public class FinanceController {
             record.calculateSalaryDue();
 
             return ResponseEntity.ok(financeRepository.save(record));
+        } catch (com.softschool.backend.exception.PlanEnforcementException e) {
+            throw e; // handled by PlanEnforcementExceptionHandler with its own user-facing message
+        } catch (IllegalArgumentException e) {
+            return badRequest("Invalid request data.");
         } catch (Exception e) {
-            return badRequest(e.getMessage());
+            org.slf4j.LoggerFactory.getLogger(FinanceController.class).error("Finance request failed", e);
+            return badRequest("Could not process this request.");
         }
     }
 
@@ -930,8 +934,13 @@ public class FinanceController {
             advance.stampApplyNow();
 
             return ResponseEntity.ok(financeRepository.save(advance));
+        } catch (com.softschool.backend.exception.PlanEnforcementException e) {
+            throw e; // handled by PlanEnforcementExceptionHandler with its own user-facing message
+        } catch (IllegalArgumentException e) {
+            return badRequest("Invalid request data.");
         } catch (Exception e) {
-            return badRequest(e.getMessage());
+            org.slf4j.LoggerFactory.getLogger(FinanceController.class).error("Finance request failed", e);
+            return badRequest("Could not process this request.");
         }
     }
 
@@ -1238,7 +1247,7 @@ public class FinanceController {
     // Helpers
     // =========================================================
     private Student findStudentInSchool(String regNoOrId, String schoolId) {
-        Optional<Student> studentOpt = studentRepository.findByRegNo(regNoOrId);
+        Optional<Student> studentOpt = studentRepository.findByRegNoAndSchoolId(regNoOrId, schoolId);
         if (studentOpt.isEmpty()) {
             try {
                 Long numericId = Long.parseLong(regNoOrId);

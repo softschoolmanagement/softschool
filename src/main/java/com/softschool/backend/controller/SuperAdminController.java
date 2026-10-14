@@ -25,7 +25,6 @@ import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/admin")
-@CrossOrigin(origins = "*")
 public class SuperAdminController {
 
     @Autowired
@@ -150,11 +149,11 @@ public class SuperAdminController {
                     new SchoolCredentialsResponse(school, plainPassword));
 
         } catch (Exception e) {
-            // THIS WILL PRINT THE ACTUAL ERROR IN YOUR TERMINAL
-            System.err.println("CRITICAL ERROR DURING SCHOOL CREATION:");
-            e.printStackTrace(); 
+            // Full detail goes to the server log only - never to the client.
+            org.slf4j.LoggerFactory.getLogger(SuperAdminController.class)
+                    .error("School creation failed", e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(errorBody("Internal Error: " + e.getMessage()));
+                    .body(errorBody("Could not create the school. Check the server log."));
         }
     }
 

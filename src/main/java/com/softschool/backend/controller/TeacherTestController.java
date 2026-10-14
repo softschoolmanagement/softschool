@@ -32,7 +32,6 @@ import java.util.regex.Pattern;
  */
 @RestController
 @RequestMapping("/api/teacher-tests")
-@CrossOrigin(origins = "*")
 public class TeacherTestController {
 
     private static final int MAX_PAYLOAD_CHARS = 600_000;

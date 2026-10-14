@@ -40,7 +40,7 @@ public class SchoolSessionService {
     private String previousSecret;
 
     public boolean isConfigured() {
-        return currentSecret != null && !currentSecret.isBlank();
+        return SecretStrength.isStrong(currentSecret);
     }
 
     /** Mints a token containing the authenticated school and username. */
@@ -63,7 +63,7 @@ public class SchoolSessionService {
         String signature = token.substring(dot + 1);
 
         boolean valid = matches(signature, payloadB64, currentSecret)
-                || (previousSecret != null && !previousSecret.isBlank()
+                || (SecretStrength.isStrong(previousSecret)
                     && matches(signature, payloadB64, previousSecret));
         if (!valid) return null;
 

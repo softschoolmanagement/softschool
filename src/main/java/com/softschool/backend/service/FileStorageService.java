@@ -3,7 +3,6 @@ package com.softschool.backend.service;
 import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
@@ -88,34 +87,39 @@ public class FileStorageService {
         return store(file, "diary", ALLOWED_IMAGE_EXT);
     }
 
+    /** Hard cap per file, independent of the global multipart limit. */
+    private static final long MAX_FILE_BYTES = 10L * 1024 * 1024;
+
+    /** Only filenames this service itself generates are ever treated as managed. */
+    private static final java.util.regex.Pattern MANAGED_PATH = java.util.regex.Pattern.compile(
+            "^(photos|bforms|diary)/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+                    + "\\.(jpg|png|gif|webp|pdf)$");
+
     private String store(MultipartFile file, String subfolder, Set<String> allowedExt) throws IOException {
         if (file == null || file.isEmpty()) {
             throw new IllegalArgumentException("File is empty.");
         }
-
-        String original = StringUtils.cleanPath(
-                file.getOriginalFilename() == null ? "" : file.getOriginalFilename());
-        String ext = "";
-        int dot = original.lastIndexOf('.');
-        if (dot >= 0) {
-            ext = original.substring(dot).toLowerCase();
-        }
-        if (!allowedExt.contains(ext)) {
-            // Filename had no/odd extension (common for pasted/camera uploads
-            // or canvas-compressed blobs) — fall back to the declared content type.
-            ext = extensionFromContentType(file.getContentType(), allowedExt);
-        }
-        if (!allowedExt.contains(ext)) {
-            throw new IllegalArgumentException("Unsupported file type: " + original);
+        if (file.getSize() > MAX_FILE_BYTES) {
+            throw new IllegalArgumentException("File is too large (max 10 MB).");
         }
 
-        // Random filename: never trust/reuse the client-supplied name, and
-        // this is also what makes concurrent uploads collision-free.
+        // The client-supplied filename and Content-Type are NOT trusted. The
+        // type is decided from the file's own leading bytes, and the stored
+        // extension is derived from that - so "evil.html" renamed to ".png",
+        // or a script labelled image/png, is rejected.
+        byte[] head = new byte[16];
+        int read;
+        try (InputStream in = file.getInputStream()) {
+            read = in.readNBytes(head, 0, head.length);
+        }
+        String ext = detectExtension(head, read);
+        if (ext == null || !allowedExt.contains(ext)) {
+            throw new IllegalArgumentException("Unsupported or invalid file type.");
+        }
+
         String filename = UUID.randomUUID() + ext;
         Path target = root.resolve(subfolder).resolve(filename).normalize();
         if (!target.startsWith(root)) {
-            // Defensive — should be unreachable since filename is our own UUID,
-            // but never allow writing outside the upload root.
             throw new SecurityException("Invalid upload path.");
         }
 
@@ -126,32 +130,38 @@ public class FileStorageService {
         return subfolder + "/" + filename;
     }
 
-    private String extensionFromContentType(String contentType, Set<String> allowedExt) {
-        if (contentType == null) return "";
-        switch (contentType) {
-            case "image/jpeg": return allowedExt.contains(".jpg") ? ".jpg" : "";
-            case "image/png":  return allowedExt.contains(".png") ? ".png" : "";
-            case "image/gif":  return allowedExt.contains(".gif") ? ".gif" : "";
-            case "image/webp": return allowedExt.contains(".webp") ? ".webp" : "";
-            case "application/pdf": return allowedExt.contains(".pdf") ? ".pdf" : "";
-            default: return "";
+    /** Maps leading bytes to a canonical extension, or null if not an allowed image/PDF. */
+    public static String detectExtension(byte[] b, int len) {
+        if (b == null) return null;
+        if (len >= 3 && (b[0] & 0xFF) == 0xFF && (b[1] & 0xFF) == 0xD8 && (b[2] & 0xFF) == 0xFF) return ".jpg";
+        if (len >= 8 && (b[0] & 0xFF) == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G'
+                && b[4] == 0x0D && b[5] == 0x0A && b[6] == 0x1A && b[7] == 0x0A) return ".png";
+        if (len >= 6 && b[0] == 'G' && b[1] == 'I' && b[2] == 'F' && b[3] == '8'
+                && (b[4] == '7' || b[4] == '9') && b[5] == 'a') return ".gif";
+        if (len >= 12 && b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F'
+                && b[8] == 'W' && b[9] == 'E' && b[10] == 'B' && b[11] == 'P') return ".webp";
+        if (len >= 5 && b[0] == '%' && b[1] == 'P' && b[2] == 'D' && b[3] == 'F' && b[4] == '-') return ".pdf";
+        return null;
+    }
+
+    /** Safe Content-Type for the bytes, or null if they are not an allowed image/PDF. */
+    public static String detectMediaType(byte[] bytes) {
+        String ext = detectExtension(bytes, bytes == null ? 0 : Math.min(bytes.length, 16));
+        if (ext == null) return null;
+        switch (ext) {
+            case ".jpg":  return "image/jpeg";
+            case ".png":  return "image/png";
+            case ".gif":  return "image/gif";
+            case ".webp": return "image/webp";
+            case ".pdf":  return "application/pdf";
+            default:      return null;
         }
     }
 
-    /**
-     * True when a Student.photo / Student.certData value looks like one of
-     * OUR relative file paths ("photos/xxx.ext" or "bforms/xxx.ext") rather
-     * than a legacy inline base64/data-URI value saved before this feature
-     * existed. Lets the controller serve both old and new rows correctly
-     * during the transition, with no data migration required.
-     */
     public boolean isManagedPath(String stored) {
-        return stored != null
-                && !stored.startsWith("data:")
-                && (stored.startsWith("photos/") || stored.startsWith("bforms/") || stored.startsWith("diary/"));
+        return stored != null && MANAGED_PATH.matcher(stored.trim()).matches();
     }
 
-    /** Resolves a stored relative path to an absolute filesystem Path. */
     public Path resolve(String relativePath) {
         if (relativePath == null || relativePath.isBlank()) {
             throw new IllegalArgumentException("File path is empty.");

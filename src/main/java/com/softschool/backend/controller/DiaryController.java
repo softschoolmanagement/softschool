@@ -41,7 +41,6 @@ import java.util.*;
  */
 @RestController
 @RequestMapping("/api/diary")
-@CrossOrigin(origins = "*")
 public class DiaryController {
 
     private static final int MAX_IMAGES = 6;
@@ -102,9 +101,13 @@ public class DiaryController {
         List<String> stored = new ArrayList<>();
         try {
             for (MultipartFile f : files) stored.add(fileStorageService.storeDiaryImage(f));
-        } catch (IllegalArgumentException | IOException | SecurityException e) {
+        } catch (IllegalArgumentException e) {
             for (String s : stored) fileStorageService.deleteQuietly(s);          // all or nothing
+            // Messages from FileStorageService validation are written for end users.
             return error(HttpStatus.BAD_REQUEST, "Could not save a picture: " + e.getMessage());
+        } catch (IOException | SecurityException e) {
+            for (String s : stored) fileStorageService.deleteQuietly(s);          // all or nothing
+            return error(HttpStatus.BAD_REQUEST, "Could not save a picture.");
         }
 
         DiaryEntry d = new DiaryEntry();

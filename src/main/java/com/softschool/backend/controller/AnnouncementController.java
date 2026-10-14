@@ -35,7 +35,6 @@ import java.util.stream.Collectors;
  */
 @RestController
 @RequestMapping("/api/announcements")
-@CrossOrigin(origins = "*")
 public class AnnouncementController {
 
     private static final int MAX_LIST = 100;

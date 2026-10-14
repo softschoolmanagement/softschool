@@ -56,7 +56,7 @@ public class AdminSessionService {
     private static final String ALGO = "HmacSHA256";
 
     public boolean isConfigured() {
-        return currentSecret != null && !currentSecret.isBlank();
+        return SecretStrength.isStrong(currentSecret);
     }
 
     /** Mints "<base64 payload>.<base64 signature>" for the given admin username. */

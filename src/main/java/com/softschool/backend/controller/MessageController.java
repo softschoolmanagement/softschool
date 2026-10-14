@@ -53,7 +53,6 @@ import java.util.regex.Pattern;
  */
 @RestController
 @RequestMapping("/api/messages")
-@CrossOrigin(origins = "*")
 public class MessageController {
 
     private static final int MAX_LIST = 500;
