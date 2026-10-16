@@ -48,6 +48,9 @@ public class Student {
     private String orphanStatus;   // Stores "Orphan" or "Not Orphan"
     private String previousSchool; // Name of the last school
     private String previousClass;  // Last class attended
+    // Class the student was FIRST admitted in. Set once at admission/import and
+    // never changed by promotion (only studentClass changes on promotion).
+    private String admissionClass;
     // ------------------------------
 
     // Guardian Info
