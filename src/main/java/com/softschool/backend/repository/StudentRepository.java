@@ -63,7 +63,7 @@ public interface StudentRepository extends JpaRepository<Student, Long> {
     @Query("select new com.softschool.backend.dto.StudentListDTO(" +
             "s.id, s.regNo, s.fullName, s.rollNo, s.studentClass, s.section, " +
             "s.admissionDate, s.gender, s.dob, s.age, s.studentBform, s.medicalIssues, " +
-            "s.orphanStatus, s.previousSchool, s.previousClass, s.guardianName, " +
+            "s.orphanStatus, s.previousSchool, s.previousClass, s.admissionClass, s.guardianName, " +
             "s.guardianRole, s.guardianCnic, s.phone1, s.phone2, s.permanentAddress, " +
             "s.mailingAddress, s.standardFee, s.admissionFee, s.tuitionDiscount, " +
             "s.transportDiscount, s.siblingDiscount, s.transportMode, s.transportType, " +
