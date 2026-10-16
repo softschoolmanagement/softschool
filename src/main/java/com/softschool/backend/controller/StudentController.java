@@ -122,6 +122,12 @@ public class StudentController {
         existing.setOrphanStatus(in.getOrphanStatus());
         existing.setPreviousSchool(in.getPreviousSchool());
         existing.setPreviousClass(in.getPreviousClass());
+        // Admission Class is set once (when the student is admitted) and never
+        // changes on promotion — only overwrite it with a real value, so an
+        // older client that doesn't send the field can't wipe it.
+        if (in.getAdmissionClass() != null && !in.getAdmissionClass().trim().isEmpty()) {
+            existing.setAdmissionClass(in.getAdmissionClass());
+        }
         existing.setGuardianName(in.getGuardianName());
         existing.setGuardianRole(in.getGuardianRole());
         existing.setGuardianCnic(in.getGuardianCnic());
