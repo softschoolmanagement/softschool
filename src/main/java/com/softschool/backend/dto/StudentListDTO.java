@@ -55,6 +55,7 @@ public class StudentListDTO {
     private String orphanStatus;
     private String previousSchool;
     private String previousClass;
+    private String admissionClass;
 
     private String guardianName;
     private String guardianRole;
@@ -115,7 +116,7 @@ public class StudentListDTO {
             Long id, String regNo, String fullName, String rollNo, String studentClass,
             String section, Date admissionDate, String gender, Date dob, String age,
             String studentBform, String medicalIssues, String orphanStatus,
-            String previousSchool, String previousClass, String guardianName,
+            String previousSchool, String previousClass, String admissionClass, String guardianName,
             String guardianRole, String guardianCnic, String phone1, String phone2,
             String permanentAddress, String mailingAddress, Double standardFee,
             Double admissionFee, Double tuitionDiscount, Double transportDiscount,
@@ -143,6 +144,7 @@ public class StudentListDTO {
         this.orphanStatus = orphanStatus;
         this.previousSchool = previousSchool;
         this.previousClass = previousClass;
+        this.admissionClass = admissionClass;
         this.guardianName = guardianName;
         this.guardianRole = guardianRole;
         this.guardianCnic = guardianCnic;
