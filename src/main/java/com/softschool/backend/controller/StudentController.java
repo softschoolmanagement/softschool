@@ -131,6 +131,12 @@ public class StudentController {
         existing.setGuardianName(in.getGuardianName());
         existing.setGuardianRole(in.getGuardianRole());
         existing.setGuardianCnic(in.getGuardianCnic());
+        // Father details: only overwrite when the request actually carries the
+        // field (null = "not sent"). Full-object PUTs from other pages (e.g. the
+        // finance cache) may predate these fields and must not wipe them; the
+        // admission/edit form always sends a string (possibly "") so clearing works.
+        if (in.getFatherFullName() != null) existing.setFatherFullName(in.getFatherFullName());
+        if (in.getFatherCnic() != null)     existing.setFatherCnic(in.getFatherCnic());
         existing.setPhone1(in.getPhone1());
         existing.setPhone2(in.getPhone2());
         existing.setPermanentAddress(in.getPermanentAddress());
