@@ -58,6 +58,12 @@ public class Student {
     private String guardianRole;
     private String guardianCnic;
 
+    // Father Details — captured separately from the guardian block because the
+    // guardian may be someone other than the father (mother, uncle, etc.).
+    // Both are optional so records saved before this feature keep loading/saving.
+    private String fatherFullName;
+    private String fatherCnic;
+
     // Contact Info
     private String phone1;
     private String phone2;
