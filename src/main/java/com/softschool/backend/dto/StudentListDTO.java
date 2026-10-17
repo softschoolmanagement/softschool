@@ -61,6 +61,9 @@ public class StudentListDTO {
     private String guardianRole;
     private String guardianCnic;
 
+    private String fatherFullName;
+    private String fatherCnic;
+
     private String phone1;
     private String phone2;
     private String permanentAddress;
@@ -117,7 +120,8 @@ public class StudentListDTO {
             String section, Date admissionDate, String gender, Date dob, String age,
             String studentBform, String medicalIssues, String orphanStatus,
             String previousSchool, String previousClass, String admissionClass, String guardianName,
-            String guardianRole, String guardianCnic, String phone1, String phone2,
+            String guardianRole, String guardianCnic, String fatherFullName, String fatherCnic,
+            String phone1, String phone2,
             String permanentAddress, String mailingAddress, Double standardFee,
             Double admissionFee, Double tuitionDiscount, Double transportDiscount,
             Double siblingDiscount, String transportMode, String transportType,
@@ -148,6 +152,8 @@ public class StudentListDTO {
         this.guardianName = guardianName;
         this.guardianRole = guardianRole;
         this.guardianCnic = guardianCnic;
+        this.fatherFullName = fatherFullName;
+        this.fatherCnic = fatherCnic;
         this.phone1 = phone1;
         this.phone2 = phone2;
         this.permanentAddress = permanentAddress;
