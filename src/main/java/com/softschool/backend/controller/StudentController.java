@@ -4,6 +4,10 @@ import com.softschool.backend.model.Student;
 import com.softschool.backend.repository.StudentRepository;
 import com.softschool.backend.service.FileStorageService;
 import com.softschool.backend.service.PlanEnforcementService;
+import com.softschool.backend.service.StudentCacheService;
+import com.softschool.backend.service.StudentCacheService.CachedFile;
+import com.softschool.backend.service.StudentCacheService.Kind;
+import java.io.UncheckedIOException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -28,6 +32,13 @@ public class StudentController {
 
     @Autowired
     private FileStorageService fileStorageService;
+
+    // Server-side cache of the finished /students, /list, /sync and /summary
+    // JSON and of decoded photo / B-Form bytes. It is cleared automatically
+    // on every Student insert/update/delete (StudentCacheInvalidationListener),
+    // so the write paths in this controller do not need to touch it.
+    @Autowired
+    private StudentCacheService studentCache;
 
     @PostMapping({"", "/"})
     public ResponseEntity<?> saveStudent(@RequestBody(required = false) Student incoming) {
@@ -297,12 +308,23 @@ public class StudentController {
         return ResponseEntity.ok(Collections.singletonMap("saved", saved));
     }
 
+    /**
+     * SERVER CACHE — this is the heaviest read in the app (every column of
+     * every student, photo/certData LONGTEXT included) and Manage Students
+     * calls it once per page load to backfill photos/B-Forms. The finished,
+     * gzipped JSON is now kept in memory per school and rebuilt only after a
+     * student row actually changes (see StudentCacheService).
+     */
     @GetMapping
-    public ResponseEntity<?> getAllStudents(@RequestParam(required = false) String schoolId) {
+    public ResponseEntity<?> getAllStudents(
+            @RequestParam(required = false) String schoolId,
+            @RequestHeader(value = "Accept-Encoding", required = false) String acceptEncoding) {
         if (isBlank(schoolId)) {
             return badRequest("schoolId query parameter is required.");
         }
-        return ResponseEntity.ok(studentRepository.findBySchoolId(schoolId));
+        return studentCache.toResponse(
+                studentCache.getJson(Kind.FULL, schoolId, () -> studentRepository.findBySchoolId(schoolId)),
+                acceptEncoding);
     }
 
     /**
@@ -326,11 +348,15 @@ public class StudentController {
      * served as before by GET /api/students, for Manage Students.
      */
     @GetMapping("/summary")
-    public ResponseEntity<?> getStudentsSummary(@RequestParam(required = false) String schoolId) {
+    public ResponseEntity<?> getStudentsSummary(
+            @RequestParam(required = false) String schoolId,
+            @RequestHeader(value = "Accept-Encoding", required = false) String acceptEncoding) {
         if (isBlank(schoolId)) {
             return badRequest("schoolId query parameter is required.");
         }
-        return ResponseEntity.ok(studentRepository.findSummaryBySchoolId(schoolId));
+        return studentCache.toResponse(
+                studentCache.getJson(Kind.SUMMARY, schoolId, () -> studentRepository.findSummaryBySchoolId(schoolId)),
+                acceptEncoding);
     }
 
     /**
@@ -351,11 +377,17 @@ public class StudentController {
      * re-reads those LONGTEXT blobs off disk or back over the wire.
      */
     @GetMapping("/sync")
-    public ResponseEntity<?> getStudentsSync(@RequestParam(required = false) String schoolId) {
+    public ResponseEntity<?> getStudentsSync(
+            @RequestParam(required = false) String schoolId,
+            @RequestHeader(value = "Accept-Encoding", required = false) String acceptEncoding) {
         if (isBlank(schoolId)) {
             return badRequest("schoolId query parameter is required.");
         }
-        return ResponseEntity.ok(studentRepository.findSyncBySchoolId(schoolId));
+        // SERVER CACHE — this is the 6-10 second background poll, so on an
+        // idle roster nearly every call is now answered from memory.
+        return studentCache.toResponse(
+                studentCache.getJson(Kind.SYNC, schoolId, () -> studentRepository.findSyncBySchoolId(schoolId)),
+                acceptEncoding);
     }
 
     /**
@@ -378,11 +410,15 @@ public class StudentController {
      * genuinely needs the blobs inline (e.g. an export).
      */
     @GetMapping("/list")
-    public ResponseEntity<?> getStudentsList(@RequestParam(required = false) String schoolId) {
+    public ResponseEntity<?> getStudentsList(
+            @RequestParam(required = false) String schoolId,
+            @RequestHeader(value = "Accept-Encoding", required = false) String acceptEncoding) {
         if (isBlank(schoolId)) {
             return badRequest("schoolId query parameter is required.");
         }
-        return ResponseEntity.ok(studentRepository.findListBySchoolId(schoolId));
+        return studentCache.toResponse(
+                studentCache.getJson(Kind.LIST, schoolId, () -> studentRepository.findListBySchoolId(schoolId)),
+                acceptEncoding);
     }
 
     /**
@@ -460,11 +496,7 @@ public class StudentController {
         if (isBlank(schoolId)) {
             return badRequest("schoolId query parameter is required.");
         }
-        Student student = studentRepository.findByRegNoAndSchoolId(regNo, schoolId).orElse(null);
-        if (student == null) {
-            return ResponseEntity.notFound().build();
-        }
-        return serveStoredFile(student.getPhoto());
+        return serveCachedFile(schoolId, "photo", regNo, Student::getPhoto);
     }
 
     /**
@@ -481,30 +513,70 @@ public class StudentController {
         if (isBlank(schoolId)) {
             return badRequest("schoolId query parameter is required.");
         }
-        Student student = studentRepository.findByRegNoAndSchoolId(regNo, schoolId).orElse(null);
-        if (student == null) {
-            return ResponseEntity.notFound().build();
-        }
-        return serveStoredFile(student.getCertData());
+        return serveCachedFile(schoolId, "bform", regNo, Student::getCertData);
     }
 
     /**
-     * Shared by getStudentPhoto/getStudentBform. Serves the given
-     * Student.photo / Student.certData value as real bytes.
+     * Shared by getStudentPhoto/getStudentBform. Looks the file up in the
+     * server cache first; only on a miss does it load the student row,
+     * read/decode the file and remember the resulting bytes.
+     *
+     * SERVER CACHE — previously every one of the browser's per-student image
+     * requests loaded that student's WHOLE row (all LONGTEXT columns) from
+     * MySQL and, for legacy rows, base64-decoded it again. With 500+
+     * students that was 500+ row loads on every page open. The decoded bytes
+     * are now kept in memory (bounded by app.cache.students.files-max-mb) and
+     * dropped automatically when that student's row changes.
+     *
+     * The response headers are unchanged: "no-store" is still sent, so the
+     * BROWSER never keeps the file — only this server's memory does.
+     */
+    private ResponseEntity<?> serveCachedFile(String schoolId, String type, String regNo,
+                                              java.util.function.Function<Student, String> column) {
+        CachedFile file;
+        try {
+            file = studentCache.getFile(schoolId, type, regNo, () -> {
+                Student student = studentRepository.findByRegNoAndSchoolId(regNo, schoolId).orElse(null);
+                return student == null ? null : loadStoredFile(column.apply(student));
+            });
+        } catch (UncheckedIOException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(errorBody("Could not read file."));
+        }
+        if (file == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok()
+                .header("Content-Type", file.mediaType())
+                // Do not cache this URL in the browser: the URL is based on
+                // the student's regNo, so a replacement photo uses the same
+                // URL. A long browser cache lifetime made a newly saved photo
+                // appear missing/stale until the browser cache expired.
+                .header("Cache-Control", "no-store, private, max-age=0")
+                .header("Content-Length", String.valueOf(file.bytes().length))
+                .body(file.bytes());
+    }
+
+    /**
+     * Turns the given Student.photo / Student.certData value into real bytes.
+     * Returns null when there is nothing usable (the endpoint then answers
+     * 404, exactly as before). Throws UncheckedIOException only when a file
+     * that should exist on disk cannot be read.
      *
      * Handles BOTH shapes that can exist in the table:
      *   - NEW rows: a relative path into the uploads/ folder written by
      *     FileStorageService (e.g. "photos/uuid.jpg") — read straight off
      *     disk.
-     *   - OLD rows saved before this migration: the file's full base64
-     *     content, either bare or as a "data:image/...;base64,...." URI —
-     *     decoded exactly as this endpoint always used to.
-     * This means existing students with a photo/B-Form uploaded before the
-     * migration keep working with no backfill/migration script required.
+     *   - OLD rows saved before the file-storage migration: the file's full
+     *     base64 content, either bare or as a "data:image/...;base64,...."
+     *     URI. The "data:<type>;" header is client-controlled and is
+     *     IGNORED — the Content-Type is derived from the decoded bytes, so
+     *     a stored "data:text/html;..." value can never be served back as an
+     *     executable page.
      */
-    private ResponseEntity<?> serveStoredFile(String stored) {
+    private CachedFile loadStoredFile(String stored) {
         if (isBlank(stored)) {
-            return ResponseEntity.notFound().build();
+            return null;
         }
         String raw = stored.trim();
 
@@ -512,35 +584,19 @@ public class StudentController {
             Path path = fileStorageService.resolve(raw);
             if (!Files.exists(path)) {
                 // DB points at a file that no longer exists on disk.
-                return ResponseEntity.notFound().build();
+                return null;
             }
             byte[] bytes;
             try {
                 bytes = Files.readAllBytes(path);
             } catch (IOException e) {
-                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                        .body(errorBody("Could not read file."));
+                throw new UncheckedIOException(e);
             }
             // Trust the bytes, not the filename: only real image/PDF content is served.
             String mediaType = FileStorageService.detectMediaType(bytes);
-            if (mediaType == null) {
-                return ResponseEntity.notFound().build();
-            }
-            return ResponseEntity.ok()
-                    .header("Content-Type", mediaType)
-                    // Do not cache this URL for a day: the URL is based on the
-                    // student's regNo, so a replacement photo uses the same
-                    // URL.  A long cache lifetime made a newly saved photo
-                    // appear missing/stale until the browser cache expired.
-                    .header("Cache-Control", "no-store, private, max-age=0")
-                    .header("Content-Length", String.valueOf(bytes.length))
-                    .body(bytes);
+            return mediaType == null ? null : new CachedFile(bytes, mediaType);
         }
 
-        // Legacy path: value is (or should be) inline base64. The "data:<type>;"
-        // header is client-controlled and is IGNORED - the Content-Type is
-        // derived from the decoded bytes, so a stored "data:text/html;..." value
-        // can never be served back as an executable page.
         int comma = raw.indexOf(',');
         if (raw.startsWith("data:") && comma > 0) {
             raw = raw.substring(comma + 1);
@@ -554,18 +610,10 @@ public class StudentController {
             // Not decodable base64 either - treat it as "nothing usable"
             // rather than throwing a 500, so the frontend just falls back
             // to its generated initials avatar / "no document" state.
-            return ResponseEntity.notFound().build();
+            return null;
         }
         String mediaType = FileStorageService.detectMediaType(bytes);
-        if (mediaType == null) {
-            return ResponseEntity.notFound().build();
-        }
-
-        return ResponseEntity.ok()
-                .header("Content-Type", mediaType)
-                .header("Cache-Control", "no-store, private, max-age=0")
-                .header("Content-Length", String.valueOf(bytes.length))
-                .body(bytes);
+        return mediaType == null ? null : new CachedFile(bytes, mediaType);
     }
 
     private String guessMediaType(String filename) {
