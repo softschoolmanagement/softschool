@@ -8,6 +8,9 @@ import java.util.Date;
 @Entity
 @Table(name = "students",
        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "regNo"}))
+// Clears the server-side student cache on every insert/update/delete of a row,
+// whichever controller caused it. See StudentCacheService.
+@EntityListeners(com.softschool.backend.service.StudentCacheInvalidationListener.class)
 @Data
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class Student {
