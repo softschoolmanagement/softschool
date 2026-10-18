@@ -33,6 +33,11 @@ public class SuperAdminController {
     @Autowired
     private StudentRepository studentRepository;
 
+    // Cleared school-wide after the registration-prefix cascade below, because
+    // that rename changes regNos (the cache's photo/B-Form keys).
+    @Autowired
+    private com.softschool.backend.service.StudentCacheService studentCache;
+
     @Autowired
     private FinanceRepository financeRepository;
 
@@ -427,6 +432,7 @@ public ResponseEntity<?> updatePlan(@PathVariable String id, @RequestBody Plan p
             attendanceRepository.saveAll(attendanceRows);
         }
         studentRepository.saveAll(students);
+        studentCache.evictSchool(schoolId);
 
         List<com.softschool.backend.model.Staff> staffMembers = staffRepository.findBySchoolId(schoolId);
         for (com.softschool.backend.model.Staff st : staffMembers) {
