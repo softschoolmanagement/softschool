@@ -55,6 +55,11 @@ public interface ParentChildRepository extends Repository<Student, Long> {
            "and (s.status is null or lower(s.status) = 'active')")
     List<String> findActiveRegNosBySiblingGroup(@Param("schoolId") String schoolId, @Param("groupId") String groupId);
 
+    /** Sibling-group IDs for already-authorized students; used to discover siblings linked after signup. */
+    @Query("select s.siblingGroupId from Student s where s.schoolId = :schoolId and s.regNo in :regNos")
+    List<String> findSiblingGroupIdsInSchool(@Param("schoolId") String schoolId,
+                                             @Param("regNos") Collection<String> regNos);
+
     /** The JSON [{name, regNo}, ...] the school's "Mark as Sibling" flow stores on the student. */
     @Query("select s.hasSiblings from Student s where s.schoolId = :schoolId and s.regNo = :regNo")
     List<String> findHasSiblingsJson(@Param("schoolId") String schoolId, @Param("regNo") String regNo);
