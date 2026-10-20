@@ -98,7 +98,11 @@ public class RateLimitFilter extends OncePerRequestFilter {
             "/api/school/register",
             "/api/school/login",
             "/api/school/login-token",
-            "/api/school/reset-password"
+            "/api/school/reset-password",
+            // parent portal: login, sign-up (guessing a CNIC) and change-password
+            "/api/parent/login",
+            "/api/parent/signup",
+            "/api/parent/change-password"
     );
 
     /** JSON body fields (checked in this order) that identify "which account" for the sensitive paths above. */
