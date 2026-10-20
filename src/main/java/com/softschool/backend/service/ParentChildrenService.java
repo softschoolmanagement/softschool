@@ -1,5 +1,7 @@
 package com.softschool.backend.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.softschool.backend.dto.ParentChildDTO;
 import com.softschool.backend.model.ParentLinkedChild;
 import com.softschool.backend.repository.ParentChildRepository;
@@ -8,17 +10,22 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Who are this parent's children? A parent is just a phone number, and the children are every active
  * student whose phone1 or phone2 ends with those 10 digits. Computed on every request, so if the
- * school edits a phone number or archives a student the parent's access follows immediately.
+ * school edits a phone number, links a sibling, or archives a student the parent's access follows
+ * immediately.
  */
 @Service
 public class ParentChildrenService {
+
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     @Autowired
     private ParentChildRepository childRepository;
@@ -33,19 +40,66 @@ public class ParentChildrenService {
 
     /**
      * Children inside one school (every request after login): the students that carry this phone number
-     * UNION the children attached at sign-up (the signed-up student and the siblings the school links to it).
+     * UNION children attached at sign-up and siblings linked in the school's current student records.
      */
     public List<ParentChildDTO> childrenOf(String schoolId, String tail10) {
         List<ParentChildDTO> out = verified(childRepository.findActiveByPhoneInSchool(schoolId, "%" + tail10), tail10);
-        java.util.Set<String> have = new java.util.HashSet<>();
+        Set<String> have = new LinkedHashSet<>();
         for (ParentChildDTO c : out) have.add(c.getRegNo());
 
         List<String> extra = new ArrayList<>();
         for (ParentLinkedChild l : linkedChildRepository.findBySchoolIdAndPhone(schoolId, tail10)) {
             if (!have.contains(l.getRegNo())) extra.add(l.getRegNo());
         }
-        if (!extra.isEmpty()) out.addAll(childRepository.findActiveByRegNosInSchool(schoolId, extra));
+        if (!extra.isEmpty()) {
+            for (ParentChildDTO c : childRepository.findActiveByRegNosInSchool(schoolId, extra)) {
+                if (have.add(c.getRegNo())) out.add(c);
+            }
+        }
+
+        // ParentLinkedChild is a snapshot made at signup. A school may mark a student as a sibling
+        // much later, so resolve the family metadata for the parent's already-authorized children
+        // on every request instead of requiring another signup or a parent-account migration.
+        if (!have.isEmpty()) {
+            List<String> authorizedRegNos = new ArrayList<>(have);
+            Set<String> relatedRegNos = new LinkedHashSet<>();
+
+            for (String groupId : childRepository.findSiblingGroupIdsInSchool(schoolId, authorizedRegNos)) {
+                if (groupId == null || groupId.isBlank()) continue;
+                relatedRegNos.addAll(childRepository.findActiveRegNosBySiblingGroup(schoolId, groupId.trim()));
+            }
+
+            for (String regNo : authorizedRegNos) {
+                for (String siblingsJson : childRepository.findHasSiblingsJson(schoolId, regNo)) {
+                    relatedRegNos.addAll(siblingRegNos(siblingsJson));
+                }
+            }
+
+            relatedRegNos.removeAll(have);
+            if (!relatedRegNos.isEmpty()) {
+                for (ParentChildDTO c : childRepository.findActiveByRegNosInSchool(schoolId, relatedRegNos)) {
+                    if (have.add(c.getRegNo())) out.add(c);
+                }
+            }
+        }
         return out;
+    }
+
+    /** Parse the school's stored [{name, regNo}, ...] sibling list; malformed data adds no access. */
+    private Set<String> siblingRegNos(String siblingsJson) {
+        Set<String> regNos = new LinkedHashSet<>();
+        if (siblingsJson == null || siblingsJson.isBlank()) return regNos;
+        try {
+            JsonNode siblings = JSON.readTree(siblingsJson);
+            if (!siblings.isArray()) return regNos;
+            for (JsonNode sibling : siblings) {
+                String regNo = sibling.path("regNo").asText("").trim();
+                if (!regNo.isEmpty()) regNos.add(regNo);
+            }
+        } catch (Exception ignored) {
+            // A malformed sibling list must not block the parent portal or grant extra access.
+        }
+        return regNos;
     }
 
     /** SQL narrowed the list; this re-checks it in Java so a formatting oddity can never add a stranger's child. */
