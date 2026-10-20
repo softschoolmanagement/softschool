@@ -53,6 +53,7 @@ public class ParentPortalController {
     private static final int MAX_LIST = 200;
 
     @Autowired private ParentContext parentContext;
+    @Autowired private SchoolRepository schoolRepository;
     @Autowired private StudentRepository studentRepository;
     @Autowired private AttendanceRepository attendanceRepository;
     @Autowired private FinanceRepository financeRepository;
@@ -66,6 +67,33 @@ public class ParentPortalController {
     @Autowired private FileStorageService fileStorageService;
 
     private final ObjectMapper mapper = new ObjectMapper();
+
+    // ───────────── SCHOOL BRANDING ─────────────
+    /**
+     * Public-facing identity for the school attached to this signed parent session.
+     * This also works for a first-time parent who must change the activation password:
+     * only the school name and logo are returned, never account or student data.
+     */
+    @GetMapping("/school")
+    public ResponseEntity<?> school(HttpServletRequest req) {
+        ParentContext.Ctx ctx = parentContext.resolveForPasswordChange(req);
+        if (ctx == null) return ParentUtil.error(HttpStatus.UNAUTHORIZED, "Please log in again.");
+
+        School school = schoolRepository.findBySchoolId(ctx.schoolId).orElse(null);
+        if (school == null) return ParentUtil.error(HttpStatus.NOT_FOUND, "School not found.");
+
+        SchoolSettings settings = settingsRepository.findBySchoolId(ctx.schoolId).orElse(null);
+        String settingsName = settings == null ? null : settings.getSchoolName();
+        String name = settingsName != null && !settingsName.isBlank()
+                ? settingsName.trim()
+                : school.getName();
+
+        Map<String, Object> branding = new LinkedHashMap<>();
+        branding.put("schoolId", ctx.schoolId);
+        branding.put("name", name);
+        branding.put("logo", school.getLogo());
+        return ResponseEntity.ok(branding);
+    }
 
     // ───────────── CHILDREN ─────────────
     @GetMapping("/children")
