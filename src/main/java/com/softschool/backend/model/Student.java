@@ -119,7 +119,9 @@ public class Student {
     private Boolean isLifetime;      // true = discount never expires
     private String discountExpiry;   // "yyyy-MM-dd"; ignored when isLifetime is true
 
-    private String status; // active, graduated, dropped
+    // active, graduated, dropped, promoted (historical source row replaced by
+    // a new-session copy; excluded from the live roster but retained for reports)
+    private String status;
 
     // Graduation snapshot — set once by the "Promote All" flow when a
     // student is promoted out of the school's last configured class (see
