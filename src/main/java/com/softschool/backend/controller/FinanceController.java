@@ -112,19 +112,7 @@ public class FinanceController {
             return null;
         }
 
-        double previousArrears = 0.0;
-        try {
-            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM");
-            LocalDate currentMonthDate = LocalDate.parse(monthKey + "-01");
-            String prevMonthKey = currentMonthDate.minusMonths(1).format(formatter);
-            Optional<Finance> prevFinance = financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolId(
-                    regNoOrId, prevMonthKey, Finance.TYPE_STUDENT_FEE, schoolId);
-            if (prevFinance.isPresent()) {
-                previousArrears = nz(prevFinance.get().getRemainingBalance());
-            }
-        } catch (Exception e) {
-            // malformed monthKey — just skip roll-over
-        }
+        double previousArrears = previousOutstandingBalance(student, monthKey, schoolId);
 
         Finance f = new Finance();
         f.setSchoolId(schoolId);
@@ -172,19 +160,7 @@ public class FinanceController {
             return existing.get();
         }
 
-        double previousArrears = 0.0;
-        try {
-            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM");
-            LocalDate currentMonthDate = LocalDate.parse(monthKey + "-01");
-            String prevMonthKey = currentMonthDate.minusMonths(1).format(formatter);
-            Optional<Finance> prevFinance = financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolId(
-                    regNoOrId, prevMonthKey, Finance.TYPE_STUDENT_FEE, schoolId);
-            if (prevFinance.isPresent()) {
-                previousArrears = nz(prevFinance.get().getRemainingBalance());
-            }
-        } catch (Exception e) {
-            // malformed monthKey — just skip roll-over
-        }
+        double previousArrears = previousOutstandingBalance(student, monthKey, schoolId);
 
         Finance f = new Finance();
         f.setSchoolId(schoolId);
@@ -215,6 +191,42 @@ public class FinanceController {
 
         f.calculateNetPayable();
         return financeRepository.save(f);
+    }
+
+    /**
+     * Carries the latest earlier unpaid ledger balance forward even when the
+     * school skips a billing month between academic sessions. If there is no
+     * persisted fee ledger yet, the student's saved opening arrears are used.
+     */
+    private double previousOutstandingBalance(Student student, String monthKey, String schoolId) {
+        if (student == null || isBlank(student.getRegNo()) || isBlank(monthKey)) {
+            return student != null ? nz(student.getArrears()) : 0.0;
+        }
+        try {
+            YearMonth.parse(monthKey, DateTimeFormatter.ofPattern("yyyy-MM"));
+        } catch (Exception e) {
+            return nz(student.getArrears());
+        }
+
+        Finance latestLedger = null;
+        double pendingFineAmount = 0.0;
+        for (Finance record : financeRepository.findBySchoolIdAndRegNo(schoolId, student.getRegNo())) {
+            String recordMonth = record.getMonthKey();
+            if (isBlank(recordMonth) || recordMonth.compareTo(monthKey) >= 0) continue;
+
+            if (Finance.TYPE_STUDENT_FEE.equals(record.getRecordType())
+                    && (latestLedger == null
+                        || recordMonth.compareTo(latestLedger.getMonthKey()) > 0)) {
+                latestLedger = record;
+            } else if (Finance.TYPE_FINE.equals(record.getRecordType()) && !isFinePaid(record)) {
+                pendingFineAmount += nz(record.getAmount());
+            }
+        }
+
+        double ledgerBalance = latestLedger != null
+                ? nz(latestLedger.getRemainingBalance())
+                : nz(student.getArrears());
+        return Math.max(ledgerBalance, pendingFineAmount);
     }
 
     /**
@@ -423,6 +435,256 @@ public class FinanceController {
     }
 
     // =========================================================
+    // 2d. TRANSFER STUDENT FINANCE HISTORY DURING PROMOTION
+    // =========================================================
+    @PostMapping("/promote-student-finances")
+    @Transactional
+    public ResponseEntity<?> transferPromotedStudentFinances(@RequestBody Map<String, Object> payload) {
+        String schoolId = str(payload, "schoolId");
+        String sourceRegNo = str(payload, "sourceRegNo");
+        String targetRegNo = str(payload, "targetRegNo");
+        String nextSessionMonth = str(payload, "nextSessionMonth");
+
+        if (isBlank(schoolId)) return badRequest("schoolId is required.");
+        if (isBlank(sourceRegNo) || isBlank(targetRegNo) || isBlank(nextSessionMonth)) {
+            return badRequest("sourceRegNo, targetRegNo and nextSessionMonth are required.");
+        }
+        if (sourceRegNo.equals(targetRegNo)) {
+            return badRequest("Source and destination registration numbers must be different.");
+        }
+        try {
+            YearMonth.parse(nextSessionMonth, DateTimeFormatter.ofPattern("yyyy-MM"));
+        } catch (Exception e) {
+            return badRequest("nextSessionMonth must use yyyy-MM format.");
+        }
+
+        // A response may be lost after the transaction commits. Return the
+        // original result on retry instead of recalculating or moving data a
+        // second time.
+        for (Finance completed : financeRepository.findByRecordTypeAndSchoolIdOrderByCreatedAtAsc(
+                Finance.TYPE_PROMOTION_TRANSFER, schoolId)) {
+            try {
+                JsonNode marker = objectMapper.readTree(completed.getPayloadJson());
+                if (sourceRegNo.equals(marker.path("sourceRegNo").asText())
+                        && targetRegNo.equals(marker.path("targetRegNo").asText())) {
+                    Map<String, Object> result = new LinkedHashMap<>();
+                    result.put("success", true);
+                    result.put("sourceRegNo", sourceRegNo);
+                    result.put("targetRegNo", targetRegNo);
+                    result.put("carryForwardAmount", marker.path("carryForwardAmount").asDouble(0));
+                    result.put("alreadyTransferred", true);
+                    return ResponseEntity.ok(result);
+                }
+            } catch (Exception ignored) {
+                // Ignore malformed markers and continue looking.
+            }
+        }
+
+        planEnforcementService.requireFeature(schoolId, PlanEnforcementService.FEATURE_FINANCE);
+        Optional<Student> sourceOpt = studentRepository.findByRegNoAndSchoolId(sourceRegNo, schoolId);
+        Optional<Student> targetOpt = studentRepository.findByRegNoAndSchoolId(targetRegNo, schoolId);
+        if (sourceOpt.isEmpty() || targetOpt.isEmpty()) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(errorBody("Source or promoted student was not found."));
+        }
+        Student source = sourceOpt.get();
+        Student target = targetOpt.get();
+        if (!"promoted".equalsIgnoreCase(source.getStatus())) {
+            return badRequest("The source student must be marked promoted before finance can be transferred.");
+        }
+        if (target.getStatus() != null && !"active".equalsIgnoreCase(target.getStatus())) {
+            return badRequest("The destination student must be active.");
+        }
+
+        List<Finance> sourceRecords = financeRepository.findBySchoolIdAndRegNo(schoolId, sourceRegNo);
+        Finance latestPriorLedger = null;
+        Finance latestLedgerOverall = null;
+        double pendingFineBeforeSession = 0.0;
+        double pendingFineOverall = 0.0;
+        for (Finance record : sourceRecords) {
+            String recordMonth = record.getMonthKey();
+            if (isBlank(recordMonth)) continue;
+
+            if (Finance.TYPE_STUDENT_FEE.equals(record.getRecordType())) {
+                if (latestLedgerOverall == null
+                        || recordMonth.compareTo(latestLedgerOverall.getMonthKey()) > 0) {
+                    latestLedgerOverall = record;
+                }
+                if (recordMonth.compareTo(nextSessionMonth) < 0
+                        && (latestPriorLedger == null
+                            || recordMonth.compareTo(latestPriorLedger.getMonthKey()) > 0)) {
+                    latestPriorLedger = record;
+                }
+            } else if (Finance.TYPE_FINE.equals(record.getRecordType()) && !isFinePaid(record)) {
+                pendingFineOverall += nz(record.getAmount());
+                if (recordMonth.compareTo(nextSessionMonth) < 0) {
+                    pendingFineBeforeSession += nz(record.getAmount());
+                }
+            }
+        }
+        double carryForwardAmount = latestPriorLedger != null
+                ? nz(latestPriorLedger.getRemainingBalance())
+                : nz(source.getArrears());
+        carryForwardAmount = Math.max(carryForwardAmount, pendingFineBeforeSession);
+        double promotionCarryTrackingAmount = latestLedgerOverall != null
+                ? nz(latestLedgerOverall.getRemainingBalance())
+                : carryForwardAmount;
+        promotionCarryTrackingAmount = Math.max(promotionCarryTrackingAmount, pendingFineOverall);
+
+        List<Finance> ledgerRowsToMove = new ArrayList<>();
+        for (Finance record : sourceRecords) {
+            if (Finance.TYPE_STUDENT_FEE.equals(record.getRecordType())
+                    || Finance.TYPE_FINE.equals(record.getRecordType())) {
+                record.setRegNo(targetRegNo);
+                ledgerRowsToMove.add(record);
+            }
+        }
+        if (!ledgerRowsToMove.isEmpty()) {
+            financeRepository.saveAll(ledgerRowsToMove);
+        }
+
+        int movedVouchers = transferBulkStudentReferences(
+                Finance.TYPE_VOUCHER, schoolId, sourceRegNo, targetRegNo,
+                promotionCarryTrackingAmount, target);
+        int movedCustomFees = transferBulkStudentReferences(
+                Finance.TYPE_CUSTOM_FEE, schoolId, sourceRegNo, targetRegNo,
+                promotionCarryTrackingAmount, target);
+
+        target.setArrears(carryForwardAmount);
+        studentRepository.save(target);
+
+        Finance marker = new Finance();
+        marker.setSchoolId(schoolId);
+        marker.setRecordType(Finance.TYPE_PROMOTION_TRANSFER);
+        marker.setRegNo(targetRegNo);
+        marker.setStudentName(target.getFullName());
+        marker.setStudentClass(target.getStudentClass());
+        marker.setMonthKey(nextSessionMonth);
+        try {
+            Map<String, Object> markerPayload = new LinkedHashMap<>();
+            markerPayload.put("sourceRegNo", sourceRegNo);
+            markerPayload.put("targetRegNo", targetRegNo);
+            markerPayload.put("nextSessionMonth", nextSessionMonth);
+            markerPayload.put("carryForwardAmount", carryForwardAmount);
+            marker.setPayloadJson(objectMapper.writeValueAsString(markerPayload));
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not record promotion transfer marker.", e);
+        }
+        financeRepository.save(marker);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("success", true);
+        result.put("sourceRegNo", sourceRegNo);
+        result.put("targetRegNo", targetRegNo);
+        result.put("carryForwardAmount", carryForwardAmount);
+        result.put("movedLedgerRecords", ledgerRowsToMove.size());
+        result.put("movedVoucherRecords", movedVouchers);
+        result.put("movedCustomFeeRecords", movedCustomFees);
+        result.put("alreadyTransferred", false);
+        return ResponseEntity.ok(result);
+    }
+
+    private int transferBulkStudentReferences(String recordType,
+                                              String schoolId,
+                                              String sourceRegNo,
+                                              String targetRegNo,
+                                              double promotionCarryTrackingAmount,
+                                              Student promotedStudent) {
+        List<Finance> rows = financeRepository.findByRecordTypeAndSchoolIdOrderByCreatedAtAsc(
+                recordType, schoolId);
+        List<Finance> changedRows = new ArrayList<>();
+        Finance latestVoucherRow = null;
+        com.fasterxml.jackson.databind.node.ObjectNode latestVoucher = null;
+        String latestVoucherMonth = "";
+        String latestVoucherGeneratedAt = "";
+        int movedItems = 0;
+
+        for (Finance row : rows) {
+            if (isBlank(row.getPayloadJson())) continue;
+            try {
+                JsonNode parsed = objectMapper.readTree(row.getPayloadJson());
+                if (!parsed.isObject()) continue;
+                com.fasterxml.jackson.databind.node.ObjectNode item =
+                        (com.fasterxml.jackson.databind.node.ObjectNode) parsed;
+                boolean changed = false;
+
+                if (Finance.TYPE_VOUCHER.equals(recordType)
+                        && sourceRegNo.equals(item.path("studentId").asText())) {
+                    item.put("studentId", targetRegNo);
+                    String key = item.path("key").asText("");
+                    if (key.startsWith(sourceRegNo + "::")) {
+                        item.put("key", targetRegNo + key.substring(sourceRegNo.length()));
+                    }
+                    changed = true;
+                    movedItems++;
+
+                    String itemMonth = item.path("monthKey").asText("");
+                    String generatedAt = item.path("generatedAt").asText("");
+                    if (!isBlank(itemMonth)
+                            && (latestVoucher == null
+                                || itemMonth.compareTo(latestVoucherMonth) > 0
+                                || (itemMonth.equals(latestVoucherMonth)
+                                    && generatedAt.compareTo(latestVoucherGeneratedAt) > 0))) {
+                        latestVoucher = item;
+                        latestVoucherRow = row;
+                        latestVoucherMonth = itemMonth;
+                        latestVoucherGeneratedAt = generatedAt;
+                    }
+                } else if (Finance.TYPE_CUSTOM_FEE.equals(recordType)) {
+                    JsonNode records = item.get("records");
+                    if (records != null && records.isArray()) {
+                        for (JsonNode rawRecord : records) {
+                            if (rawRecord.isObject()
+                                    && sourceRegNo.equals(rawRecord.path("studentId").asText())) {
+                                com.fasterxml.jackson.databind.node.ObjectNode customFeeRecord =
+                                        (com.fasterxml.jackson.databind.node.ObjectNode) rawRecord;
+                                customFeeRecord.put("studentId", targetRegNo);
+                                if (!customFeeRecord.path("paid").asBoolean(false)) {
+                                    customFeeRecord.put("studentName", promotedStudent.getFullName());
+                                    customFeeRecord.put("studentClass", promotedStudent.getStudentClass());
+                                    customFeeRecord.put("section", promotedStudent.getSection());
+                                    customFeeRecord.put("guardianName", promotedStudent.getGuardianName());
+                                }
+                                changed = true;
+                                movedItems++;
+                            }
+                        }
+                    }
+                }
+
+                if (changed) {
+                    row.setPayloadJson(objectMapper.writeValueAsString(item));
+                    changedRows.add(row);
+                }
+            } catch (Exception ignored) {
+                // Keep unrelated or malformed legacy JSON untouched.
+            }
+        }
+
+        if (latestVoucher != null && latestVoucherRow != null) {
+            JsonNode rawSnapshot = latestVoucher.get("snapshot");
+            com.fasterxml.jackson.databind.node.ObjectNode snapshot;
+            if (rawSnapshot != null && rawSnapshot.isObject()) {
+                snapshot = (com.fasterxml.jackson.databind.node.ObjectNode) rawSnapshot;
+            } else {
+                snapshot = objectMapper.createObjectNode();
+                latestVoucher.set("snapshot", snapshot);
+            }
+            snapshot.put("promotionCarryTracking", true);
+            snapshot.put("promotionCarryAmount", promotionCarryTrackingAmount);
+            snapshot.put("promotionCarryAt", LocalDateTime.now().toString());
+            try {
+                latestVoucherRow.setPayloadJson(objectMapper.writeValueAsString(latestVoucher));
+            } catch (Exception e) {
+                throw new IllegalStateException("Could not update the promoted student's voucher history.", e);
+            }
+            if (!changedRows.contains(latestVoucherRow)) changedRows.add(latestVoucherRow);
+        }
+
+        if (!changedRows.isEmpty()) financeRepository.saveAll(changedRows);
+        return movedItems;
+    }
+
+    // =========================================================
     // 3. ADD FINE (to a student)
     // =========================================================
     @PostMapping("/add-fine")
@@ -561,7 +823,9 @@ public class FinanceController {
         // them from the monthly master's running fine total as well.
         settleCoveredFineRecords(master, schoolId);
 
-        return ResponseEntity.ok(financeRepository.save(master));
+        Finance savedMaster = financeRepository.save(master);
+        refreshPromotionCarrySnapshot(schoolId, regNo, monthKey, nz(savedMaster.getRemainingBalance()));
+        return ResponseEntity.ok(savedMaster);
     }
 
     // =========================================================
@@ -599,7 +863,9 @@ public class FinanceController {
             if (nz(master.getRemainingBalance()) <= 0.01) {
                 applyPaymentDate(master, null);
             }
-            financeRepository.save(master);
+            Finance savedMaster = financeRepository.save(master);
+            refreshPromotionCarrySnapshot(
+                    schoolId, fine.getRegNo(), fine.getMonthKey(), nz(savedMaster.getRemainingBalance()));
         }
 
         return ResponseEntity.ok(fine);
@@ -609,6 +875,41 @@ public class FinanceController {
         fr.setPaymentStatus("Paid");
         fr.stampPayNow();
         financeRepository.save(fr);
+    }
+
+    /**
+     * Keeps the promotion carry marker aligned with backend payments so a
+     * later voucher generation remains correct after a browser refresh.
+     */
+    private void refreshPromotionCarrySnapshot(String schoolId,
+                                               String regNo,
+                                               String monthKey,
+                                               double remainingBalance) {
+        for (Finance row : financeRepository.findByRecordTypeAndSchoolIdOrderByCreatedAtAsc(
+                Finance.TYPE_VOUCHER, schoolId)) {
+            if (isBlank(row.getPayloadJson())) continue;
+            try {
+                JsonNode parsed = objectMapper.readTree(row.getPayloadJson());
+                if (!parsed.isObject()
+                        || !regNo.equals(parsed.path("studentId").asText())
+                        || !monthKey.equals(parsed.path("monthKey").asText())) {
+                    continue;
+                }
+                JsonNode rawSnapshot = parsed.get("snapshot");
+                if (rawSnapshot == null || !rawSnapshot.isObject()
+                        || !rawSnapshot.path("promotionCarryTracking").asBoolean(false)) {
+                    continue;
+                }
+                com.fasterxml.jackson.databind.node.ObjectNode snapshot =
+                        (com.fasterxml.jackson.databind.node.ObjectNode) rawSnapshot;
+                snapshot.put("promotionCarryAmount", remainingBalance);
+                snapshot.put("promotionCarryAt", LocalDateTime.now().toString());
+                row.setPayloadJson(objectMapper.writeValueAsString(parsed));
+                financeRepository.save(row);
+            } catch (Exception ignored) {
+                // A legacy voucher payload should never block a payment.
+            }
+        }
     }
 
     private boolean isFinePaid(Finance fine) {
