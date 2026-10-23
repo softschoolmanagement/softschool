@@ -69,6 +69,8 @@ public class Finance {
     public static final String TYPE_FINE        = "FINE";
     public static final String TYPE_SALARY      = "SALARY";
     public static final String TYPE_ADVANCE     = "ADVANCE";
+    // Internal idempotency marker for a student-promotion finance transfer.
+    public static final String TYPE_PROMOTION_TRANSFER = "PROMOTION_TRANSFER";
 
     // ---- "Bulk list" record types (manage-finance.js's /custom-fees,
     // /staff-bonus, /staff-fines, /expenses, /vouchers endpoints) ----
