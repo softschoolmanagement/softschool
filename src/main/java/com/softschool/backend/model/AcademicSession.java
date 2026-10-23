@@ -42,4 +42,12 @@ public class AcademicSession {
 
     @Column(nullable = false)
     private boolean firstSession;
+
+    /**
+     * True for the one session the school has chosen as its current session.
+     * At most one session per school has this set (enforced by the controller).
+     * The default keeps rows that existed before this column was added valid.
+     */
+    @Column(nullable = false, columnDefinition = "boolean default false")
+    private boolean currentSession;
 }
