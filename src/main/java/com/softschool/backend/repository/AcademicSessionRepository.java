@@ -13,4 +13,9 @@ public interface AcademicSessionRepository extends JpaRepository<AcademicSession
             String schoolId,
             String startMonth,
             String endMonth);
+
+    /** Looks a session up by id, but only inside the given school. */
+    Optional<AcademicSession> findByIdAndSchoolId(Long id, String schoolId);
+
+    Optional<AcademicSession> findFirstBySchoolIdAndCurrentSessionTrue(String schoolId);
 }
