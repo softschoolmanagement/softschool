@@ -19,7 +19,11 @@ public interface StaffRepository extends JpaRepository<Staff, Long> {
 
     // Live staff count for a school, used by the super admin panel to show
     // "X / staffLimit" usage and trigger the near-limit alert.
-    long countBySchoolId(String schoolId);
+    // Archived (deactivated) staff do NOT count toward the plan's staffLimit,
+    // so only active rows are counted. NULL (old rows) counts as active.
+    @Query("select count(s) from Staff s where s.schoolId = :schoolId " +
+            "and coalesce(s.archived, false) = false")
+    long countBySchoolId(@Param("schoolId") String schoolId);
 
     // PERFORMANCE FIX (slow Staff dashboard card AND slow Attendance page
     // roster cards) — see StaffSummaryDTO: selects only the plain columns
@@ -29,6 +33,7 @@ public interface StaffRepository extends JpaRepository<Staff, Long> {
     // headcount + fines total, or render a staff member's name/role.
     @Query("select new com.softschool.backend.dto.StaffSummaryDTO(" +
             "s.staffId, s.salary, s.type, s.name, s.role, s.subjects, s.job) " +
-            "from Staff s where s.schoolId = :schoolId")
+            "from Staff s where s.schoolId = :schoolId " +
+            "and coalesce(s.archived, false) = false")
     List<StaffSummaryDTO> findSummaryBySchoolId(@Param("schoolId") String schoolId);
 }
