@@ -88,6 +88,14 @@ public class Message {
     private boolean readByTeacher;
     private boolean readByAdmin;
 
+    /**
+     * Set when a parent opens the conversation that holds this admin / teacher message
+     * (drives the double tick on the admin page and in the Teacher Portal).
+     * The column default keeps rows that existed before this field was added valid.
+     */
+    @Column(nullable = false, columnDefinition = "boolean default false")
+    private boolean readByParent;
+
     /** Set when the sender edits the text after sending (shown as "edited"). */
     private Instant editedAt;
 
