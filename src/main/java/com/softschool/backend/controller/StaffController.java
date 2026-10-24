@@ -80,10 +80,15 @@ public class StaffController {
         // scoped by schoolId too, so School A can never overwrite School B's
         // staff member just because they happen to share a staffId (e.g. same
         // prefix producing "PSC_S_1" for both).
+        // Reactivating an archived staff member puts them back on the active
+        // roster, so it must respect staffLimit exactly like a new hire does.
+        boolean[] reactivating = { false };
         boolean isNew = staffRepository.findByStaffIdAndSchoolId(staff.getStaffId(), staff.getSchoolId())
                 .map(existing -> {
                     staff.setId(existing.getId());
                     staff.setPasswordHash(existing.getPasswordHash()); // not part of the JSON; keep it
+                    reactivating[0] = Boolean.TRUE.equals(existing.getArchived())
+                            && !Boolean.TRUE.equals(staff.getArchived());
                     return false;
                 })
                 .orElse(true);
@@ -91,7 +96,7 @@ public class StaffController {
         // New hires count against staffLimit + the "staff" feature lock;
         // edits to an existing staff row don't change headcount, so they
         // only need the feature-lock check (Security Audit #2).
-        if (isNew) {
+        if (isNew || reactivating[0]) {
             planEnforcementService.requireCapacityForNewStaff(staff.getSchoolId());
         } else {
             planEnforcementService.requireFeature(staff.getSchoolId(), PlanEnforcementService.FEATURE_STAFF);
