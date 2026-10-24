@@ -78,6 +78,32 @@ public interface MessageRepository extends JpaRepository<Message, Long> {
            "and m.channel = 'admin' and m.senderType = 'TEACHER' and m.readByAdmin = false")
     int markAdminChannelReadByAdmin(@Param("schoolId") String schoolId, @Param("staffId") String staffId);
 
+    /** Parent opened the "School Office" chat: the admin's messages to this student's parent are now read. */
+    @Modifying
+    @Query("update Message m set m.readByParent = true where m.schoolId = :schoolId and m.channel = 'parent_admin' " +
+           "and m.studentRegNo = :regNo and m.senderType = 'ADMIN' and m.readByParent = false")
+    int markParentAdminReadByParent(@Param("schoolId") String schoolId, @Param("regNo") String regNo);
+
+    /** Parent opened the chat with one teacher: that teacher's private messages to this student's parent. */
+    @Modifying
+    @Query("update Message m set m.readByParent = true where m.schoolId = :schoolId and m.channel = 'parent_teacher' " +
+           "and m.studentRegNo = :regNo and m.staffId = :staffId and m.senderType = 'TEACHER' and m.readByParent = false")
+    int markParentTeacherReadByParent(@Param("schoolId") String schoolId, @Param("regNo") String regNo,
+                                      @Param("staffId") String staffId);
+
+    /** ... and that teacher's broadcasts to the class (one shared row, so it counts as read once any parent opened it). */
+    @Modifying
+    @Query("update Message m set m.readByParent = true where m.schoolId = :schoolId and m.channel = 'class' " +
+           "and m.staffId = :staffId and m.senderType = 'TEACHER' and m.readByParent = false " +
+           "and (lower(m.className) = lower(:label) or lower(m.className) = lower(:cls))")
+    int markClassReadByParent(@Param("schoolId") String schoolId, @Param("staffId") String staffId,
+                              @Param("label") String label, @Param("cls") String cls);
+
+    /** Pulse extra so the admin's live view notices when its messages get read (double tick). */
+    @Query("select count(m) from Message m where m.schoolId = :schoolId and m.channel in ('admin', 'parent_admin') " +
+           "and m.senderType = 'ADMIN' and (m.readByTeacher = true or m.readByParent = true)")
+    long countAdminSentRead(@Param("schoolId") String schoolId);
+
     // Used ONLY when a school is permanently deleted, and when a staff member is removed.
     long deleteBySchoolId(String schoolId);
     long deleteBySchoolIdAndStaffId(String schoolId, String staffId);
