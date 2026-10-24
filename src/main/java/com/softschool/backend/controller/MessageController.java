@@ -60,6 +60,7 @@ public class MessageController {
     private static final int MAX_BROADCAST = 1000;
     private static final int TEACHER_DAILY_LIMIT = 120;
     private static final Pattern CLIENT_ID = Pattern.compile("^[A-Za-z0-9_-]{1,40}$");
+    private static final String READ_LOCK = "This message has been read, so it can't be edited or deleted.";
     private static final List<String> ADMIN_CHANNELS = Arrays.asList(Message.CH_ADMIN, Message.CH_PARENT_ADMIN);
 
     @Autowired private MessageRepository messageRepository;
@@ -170,21 +171,21 @@ public class MessageController {
         o.put("count", messageRepository.countAdminVisible(p.getSchoolId()));          // changes when a message is deleted
         Instant ed = messageRepository.maxAdminEditedAt(p.getSchoolId());
         o.put("edited", ed == null ? "" : ed.toString());                              // changes when a message is edited
+        o.put("reads", messageRepository.countAdminSentRead(p.getSchoolId()));         // changes when one of the admin's messages is read
         return ResponseEntity.ok(o);
     }
 
-    // ───────────── EDIT / DELETE (admin, own messages only) ─────────────
+    // ───────────── EDIT / DELETE (admin and teacher, own messages only, until they are read) ─────────────
     @PutMapping("/{id}")
     @Transactional
     public ResponseEntity<?> edit(@PathVariable Long id, @RequestBody JsonNode body, HttpServletRequest req) {
         SchoolSessionService.Principal p = principal(req);
         if (p == null) return error(HttpStatus.UNAUTHORIZED, "Please log in again.");
-        if (TeacherAccessGuard.isTeacher(p)) return error(HttpStatus.FORBIDDEN, "Admin only.");
         String text = text(body, "body", 1000);
         if (text.isEmpty()) return error(HttpStatus.BAD_REQUEST, "Write a message first.");
-        Message m = messageRepository.findByIdAndSchoolId(id, p.getSchoolId()).orElse(null);
-        if (m == null || !ADMIN_CHANNELS.contains(m.getChannel())) return error(HttpStatus.NOT_FOUND, "Message not found.");
-        if (!Message.FROM_ADMIN.equals(m.getSenderType())) return error(HttpStatus.FORBIDDEN, "You can only edit your own messages.");
+        Message m = ownMessage(p, id);
+        if (m == null) return error(HttpStatus.NOT_FOUND, "Message not found.");
+        if (readByRecipient(m)) return error(HttpStatus.CONFLICT, READ_LOCK);
         if (!text.equals(m.getBody())) { m.setBody(text); m.setEditedAt(Instant.now()); messageRepository.save(m); }
         Map<String, Object> o = new LinkedHashMap<>();
         o.put("ok", true); o.put("id", m.getId()); o.put("editedAt", m.getEditedAt() == null ? null : m.getEditedAt().toString());
@@ -196,10 +197,9 @@ public class MessageController {
     public ResponseEntity<?> remove(@PathVariable Long id, HttpServletRequest req) {
         SchoolSessionService.Principal p = principal(req);
         if (p == null) return error(HttpStatus.UNAUTHORIZED, "Please log in again.");
-        if (TeacherAccessGuard.isTeacher(p)) return error(HttpStatus.FORBIDDEN, "Admin only.");
-        Message m = messageRepository.findByIdAndSchoolId(id, p.getSchoolId()).orElse(null);
-        if (m == null || !ADMIN_CHANNELS.contains(m.getChannel())) return error(HttpStatus.NOT_FOUND, "Message not found.");
-        if (!Message.FROM_ADMIN.equals(m.getSenderType())) return error(HttpStatus.FORBIDDEN, "You can only delete your own messages.");
+        Message m = ownMessage(p, id);
+        if (m == null) return error(HttpStatus.NOT_FOUND, "Message not found.");
+        if (readByRecipient(m)) return error(HttpStatus.CONFLICT, READ_LOCK);
         messageRepository.delete(m);
         return ResponseEntity.noContent().build();
     }
@@ -387,10 +387,29 @@ public class MessageController {
         o.put("createdAt", m.getCreatedAt().toString());   // ISO-8601 UTC
         o.put("readByTeacher", m.isReadByTeacher());
         o.put("readByAdmin", m.isReadByAdmin());
+        o.put("readByParent", m.isReadByParent());
         o.put("editedAt", m.getEditedAt() == null ? null : m.getEditedAt().toString());
         o.put("broadcastId", m.getBroadcastId());
         return o;
     }
+    /** The message with this id, but ONLY if the caller wrote it (admin: admin / parent_admin channels; teacher: her own). */
+    private Message ownMessage(SchoolSessionService.Principal p, Long id) {
+        Message m = messageRepository.findByIdAndSchoolId(id, p.getSchoolId()).orElse(null);
+        if (m == null) return null;
+        if (TeacherAccessGuard.isTeacher(p)) {
+            boolean mine = Message.FROM_TEACHER.equals(m.getSenderType()) && staffIdOf(p).equals(m.getStaffId());
+            return mine ? m : null;
+        }
+        return ADMIN_CHANNELS.contains(m.getChannel()) && Message.FROM_ADMIN.equals(m.getSenderType()) ? m : null;
+    }
+
+    /** Has the person this message was sent to opened it? (same rule the double tick uses) */
+    private static boolean readByRecipient(Message m) {
+        if (Message.FROM_ADMIN.equals(m.getSenderType())) return Message.CH_ADMIN.equals(m.getChannel()) ? m.isReadByTeacher() : m.isReadByParent();
+        if (Message.FROM_TEACHER.equals(m.getSenderType())) return Message.CH_ADMIN.equals(m.getChannel()) ? m.isReadByAdmin() : m.isReadByParent();
+        return Message.CH_PARENT_ADMIN.equals(m.getChannel()) ? m.isReadByAdmin() : m.isReadByTeacher();
+    }
+
     private Message base(SchoolSessionService.Principal p, String text, String senderName, String groupId) {
         Message m = new Message();
         m.setSchoolId(p.getSchoolId());

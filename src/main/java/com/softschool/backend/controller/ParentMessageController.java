@@ -52,6 +52,7 @@ public class ParentMessageController {
 
     private static final int MAX_LIST = 500;
     private static final int PARENT_DAILY_LIMIT = 60;
+    private static final String READ_LOCK = "This message has been read, so it can't be edited or deleted.";
     private static final List<String> PRIVATE_CHANNELS = Arrays.asList(Message.CH_PARENT_ADMIN, Message.CH_PARENT_TEACHER);
 
     @Autowired private ParentContext parentContext;
@@ -215,6 +216,7 @@ public class ParentMessageController {
         if (text.isEmpty()) return ParentUtil.error(HttpStatus.BAD_REQUEST, "Write a message first.");
         Message m = ownMessage(ctx, id);
         if (m == null) return ParentUtil.error(HttpStatus.NOT_FOUND, "Message not found.");
+        if (readByRecipient(m)) return ParentUtil.error(HttpStatus.CONFLICT, READ_LOCK);
         if (!text.equals(m.getBody())) {
             m.setBody(text);
             m.setEditedAt(Instant.now());
@@ -234,6 +236,7 @@ public class ParentMessageController {
         if (ctx == null) return ParentUtil.error(HttpStatus.UNAUTHORIZED, "Please log in again.");
         Message m = ownMessage(ctx, id);
         if (m == null) return ParentUtil.error(HttpStatus.NOT_FOUND, "Message not found.");
+        if (readByRecipient(m)) return ParentUtil.error(HttpStatus.CONFLICT, READ_LOCK);
         messageRepository.delete(m);
         return ResponseEntity.noContent().build();
     }
@@ -260,6 +263,16 @@ public class ParentMessageController {
         });
         mark.setReadAt(Instant.now());
         readMarkRepository.save(mark);
+
+        // Double tick on the admin page / Teacher Portal: the parent has now opened this conversation.
+        if ("admin".equals(thread)) {
+            messageRepository.markParentAdminReadByParent(ctx.schoolId, child.getRegNo());
+        } else {
+            String staffId = thread.substring(2);
+            messageRepository.markParentTeacherReadByParent(ctx.schoolId, child.getRegNo(), staffId);
+            String cls = child.getStudentClass() == null ? "" : child.getStudentClass().trim();
+            messageRepository.markClassReadByParent(ctx.schoolId, staffId, ParentUtil.classLabel(child), cls.isEmpty() ? ParentUtil.classLabel(child) : cls);
+        }
 
         return ResponseEntity.ok(Collections.singletonMap("ok", true));
     }
@@ -297,6 +310,11 @@ public class ParentMessageController {
         if (m == null || !Message.FROM_PARENT.equals(m.getSenderType())) return null;
         if (!PRIVATE_CHANNELS.contains(m.getChannel())) return null;
         return ctx.child(m.getStudentRegNo()) == null ? null : m;
+    }
+
+    /** Has the admin / teacher this parent message was sent to opened it? */
+    private static boolean readByRecipient(Message m) {
+        return Message.CH_PARENT_ADMIN.equals(m.getChannel()) ? m.isReadByAdmin() : m.isReadByTeacher();
     }
 
     private static String threadOf(Message m) {
