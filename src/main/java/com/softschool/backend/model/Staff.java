@@ -104,6 +104,13 @@ public class Staff {
     private double securityCollected;
     private double securityMonthly;
 
+    // ARCHIVE CENTER — a staff member is "deactivated" (moved to the Archive
+    // Center) when archived = true; leavingDate is the "yyyy-MM-dd" date they
+    // left. Both are sent/read as-is by manage-staff.js. Rows saved before
+    // this feature existed have archived = NULL, which counts as active.
+    private Boolean archived;
+    private String leavingDate;
+
     private double fines;
 
     // FEATURE — absence-fine wiring: derived, read-only, "right now" figure
