@@ -1086,6 +1086,10 @@ public class FinanceController {
 
             Staff staff = staffRepository.findByStaffIdAndSchoolId(staffId, schoolId).orElse(null);
             if (staff == null) return badRequest("Staff not found.");
+            // Deactivated (archived) staff are removed from payroll entirely.
+            if (Boolean.TRUE.equals(staff.getArchived())) {
+                return badRequest("This staff member is deactivated and cannot be paid or given an advance.");
+            }
 
             Optional<Finance> existingSalary =
                     financeRepository.findByStaffIdAndMonthKeyAndRecordTypeAndSchoolId(
@@ -1224,6 +1228,10 @@ public class FinanceController {
 
             Staff staff = staffRepository.findByStaffIdAndSchoolId(staffId, schoolId).orElse(null);
             if (staff == null) return badRequest("Staff not found.");
+            // Deactivated (archived) staff are removed from payroll entirely.
+            if (Boolean.TRUE.equals(staff.getArchived())) {
+                return badRequest("This staff member is deactivated and cannot be paid or given an advance.");
+            }
 
             Finance advance = new Finance();
             advance.setSchoolId(schoolId);
