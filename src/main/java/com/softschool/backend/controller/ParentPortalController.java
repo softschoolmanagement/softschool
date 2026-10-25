@@ -427,7 +427,7 @@ public class ParentPortalController {
         if (ctx.child(regNo) == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
 
         ObjectNode out = mapper.createObjectNode();
-        for (ExamResult r : resultRepository.findBySchoolIdAndRegNo(ctx.schoolId, regNo)) {
+        for (ExamResult r : resultRepository.findBySchoolIdAndRegNoAndVisibleTrue(ctx.schoolId, regNo)) {
             try {
                 ObjectNode session = out.has(r.getSession()) ? (ObjectNode) out.get(r.getSession()) : out.putObject(r.getSession());
                 session.set(r.getTerm(), mapper.readTree(r.getPayloadJson()));

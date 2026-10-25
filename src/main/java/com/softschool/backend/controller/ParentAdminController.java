@@ -37,7 +37,10 @@ import java.util.*;
  *   GET    /api/parent-admin/submissions/{id}/image/{n}
  *   PUT    /api/parent-admin/timetable/{className}         body = the timetable JSON (see ClassTimetable)
  *   DELETE /api/parent-admin/timetable/{className}
- *   PUT    /api/parent-admin/results                       { session, term, results:[{regNo, subjects:[{name,total,obtained}]}] }
+ *   GET    /api/parent-admin/results?session=&term=         send / hold status of every student for that session + term
+ *   PUT    /api/parent-admin/results                       SEND: { session, term, notify?, results:[{regNo, subjects:[{name,total,obtained,absent?}]}] }
+ *   POST   /api/parent-admin/results/hold                  HOLD BACK: { session, term, regNos:[...] }
+ *   POST   /api/parent-admin/results/withdraw              WITHDRAW:  { session, term, regNos:[...] }
  */
 @RestController
 @RequestMapping("/api/parent-admin")
@@ -53,6 +56,7 @@ public class ParentAdminController {
     @Autowired private ClassTimetableRepository timetableRepository;
     @Autowired private ExamResultRepository resultRepository;
     @Autowired private StudentRepository studentRepository;
+    @Autowired private MessageRepository messageRepository;
     @Autowired private FileStorageService fileStorageService;
 
     private final ObjectMapper mapper = new ObjectMapper();
@@ -193,6 +197,38 @@ public class ParentAdminController {
     }
 
     // ───────────── RESULTS ─────────────
+    //
+    // Nothing the admin uploads in the Examination module reaches a parent by itself. A parent sees a
+    // result only after the admin SENDS it (this endpoint). Per student + session + term there are three states:
+    //   not sent  - no row
+    //   sent      - row, visible = true            (the parent sees it)
+    //   held      - row, visible = false           (kept away from parents; "send to whole class" skips it)
+
+    /** Status of one session + term: [{regNo, state:"sent"|"held", updatedAt, subjects:[{name,total,obtained,absent}]}]. */
+    @GetMapping("/results")
+    public ResponseEntity<?> resultStatus(@RequestParam String session, @RequestParam String term, HttpServletRequest req) {
+        SchoolSessionService.Principal p = admin(req);
+        if (p == null) return denied(req);
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (ExamResult e : resultRepository.findBySchoolIdAndSessionAndTerm(p.getSchoolId(), session.trim(), term.trim())) {
+            Map<String, Object> o = new LinkedHashMap<>();
+            o.put("regNo", e.getRegNo());
+            o.put("state", e.isVisible() ? "sent" : "held");
+            o.put("updatedAt", e.getUpdatedAt().toString());
+            try { o.put("subjects", mapper.readTree(e.getPayloadJson()).path("subjects")); }
+            catch (Exception ex) { o.put("subjects", mapper.createArrayNode()); }
+            out.add(o);
+        }
+        return ResponseEntity.ok(out);
+    }
+
+    /**
+     * SEND results to parents.
+     *   { session, term, notify?: true, senderName?, results:[{regNo, subjects:[{name,total,obtained,absent?}]}] }
+     * Sending replaces what that parent saw before for the same session + term, and clears a "held" mark.
+     * With notify, a parent who had NOT been able to see this result yet also gets a short message in the
+     * School Office chat (so the portal shows an unread badge).
+     */
     @PutMapping("/results")
     @Transactional
     public ResponseEntity<?> putResults(@RequestBody JsonNode body, HttpServletRequest req) {
@@ -206,11 +242,16 @@ public class ParentAdminController {
         JsonNode rows = body.path("results");
         if (!rows.isArray() || rows.size() == 0) return ParentUtil.error(HttpStatus.BAD_REQUEST, "results must be a non-empty list.");
         if (rows.size() > MAX_RESULT_ROWS) return ParentUtil.error(HttpStatus.BAD_REQUEST, "Too many results in one request (max " + MAX_RESULT_ROWS + ").");
+        boolean notify = body.path("notify").asBoolean(false);
 
+        List<Message> notices = new ArrayList<>();
+        String groupId = UUID.randomUUID().toString().replace("-", "").substring(0, 32);
+        String senderName = ParentUtil.clip(body.path("senderName").asText("").trim(), 80);
         int saved = 0;
         for (JsonNode r : rows) {
             String regNo = r.path("regNo").asText("").trim();
-            if (regNo.isEmpty() || studentRepository.findByRegNoAndSchoolId(regNo, p.getSchoolId()).isEmpty()) {
+            Student st = regNo.isEmpty() ? null : studentRepository.findByRegNoAndSchoolId(regNo, p.getSchoolId()).orElse(null);
+            if (st == null) {
                 return ParentUtil.error(HttpStatus.BAD_REQUEST, "Student \"" + ParentUtil.clip(regNo, 40) + "\" was not found in this school.");
             }
             JsonNode subjects = r.path("subjects");
@@ -221,7 +262,8 @@ public class ParentAdminController {
             var arr = payload.putArray("subjects");
             for (JsonNode s : subjects) {
                 String name = ParentUtil.clip(s.path("name").asText(""), 60);
-                double total = s.path("total").asDouble(0), obtained = s.path("obtained").asDouble(-1);
+                boolean absent = s.path("absent").asBoolean(false);
+                double total = s.path("total").asDouble(0), obtained = absent ? 0 : s.path("obtained").asDouble(-1);
                 if (name.isEmpty() || total <= 0 || obtained < 0 || obtained > total) {
                     return ParentUtil.error(HttpStatus.BAD_REQUEST, "A mark is outside 0 - total (" + regNo + ", " + name + ").");
                 }
@@ -229,6 +271,7 @@ public class ParentAdminController {
                 o.put("name", name);
                 o.put("total", total);
                 o.put("obtained", obtained);
+                if (absent) o.put("absent", true);
             }
             ExamResult e = resultRepository.findBySchoolIdAndRegNoAndSessionAndTerm(p.getSchoolId(), regNo, session, term).orElseGet(() -> {
                 ExamResult fresh = new ExamResult();
@@ -238,12 +281,120 @@ public class ParentAdminController {
                 fresh.setTerm(term);
                 return fresh;
             });
+            boolean alreadyVisible = e.getId() != null && e.isVisible();
             try { e.setPayloadJson(mapper.writeValueAsString(payload)); } catch (Exception ex) { return ParentUtil.error(HttpStatus.BAD_REQUEST, "Invalid result data."); }
+            e.setVisible(true);
             e.setUpdatedAt(Instant.now());
             resultRepository.save(e);
             saved++;
+
+            if (notify && !alreadyVisible) {
+                Message m = new Message();
+                m.setSchoolId(p.getSchoolId());
+                m.setStaffId("");
+                m.setChannel(Message.CH_PARENT_ADMIN);
+                m.setSenderType(Message.FROM_ADMIN);
+                m.setSenderName(senderName.isEmpty() ? "Admin" : senderName);
+                m.setReadByAdmin(true);
+                m.setBroadcastId(groupId);
+                m.setStudentRegNo(st.getRegNo());
+                m.setStudentName(st.getFullName());
+                m.setGuardianName(st.getGuardianName());
+                m.setGuardianRole(st.getGuardianRole());
+                String cls = st.getStudentClass() == null ? "" : st.getStudentClass().trim();
+                String sec = st.getSection() == null ? "" : st.getSection().trim();
+                m.setClassName(sec.isEmpty() ? cls : cls + " - " + sec);
+                m.setBody(ParentUtil.clip(prettyTerm(term) + " (" + session + ") result of " + (st.getFullName() == null ? regNo : st.getFullName())
+                        + " is now available. Open Result in the portal to view it.", 1000));
+                notices.add(m);
+            }
         }
-        return ResponseEntity.ok(Collections.singletonMap("saved", saved));
+        if (!notices.isEmpty()) messageRepository.saveAll(notices);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("saved", saved);
+        out.put("notified", notices.size());
+        return ResponseEntity.ok(out);
+    }
+
+    /** HOLD BACK: { session, term, regNos:[...] } - hides the result from parents (also if it was sent) and keeps it out of "send to whole class". */
+    @PostMapping("/results/hold")
+    @Transactional
+    public ResponseEntity<?> holdResults(@RequestBody JsonNode body, HttpServletRequest req) {
+        SchoolSessionService.Principal p = admin(req);
+        if (p == null) return denied(req);
+        ResponseEntity<?> bad = checkKeys(body);
+        if (bad != null) return bad;
+        String session = body.path("session").asText("").trim(), term = body.path("term").asText("").trim();
+        List<String> regNos = regNosOf(body);
+        if (regNos.isEmpty()) return ParentUtil.error(HttpStatus.BAD_REQUEST, "Choose at least one student.");
+        int held = 0;
+        for (String regNo : regNos) {
+            if (studentRepository.findByRegNoAndSchoolId(regNo, p.getSchoolId()).isEmpty()) continue;
+            ExamResult e = resultRepository.findBySchoolIdAndRegNoAndSessionAndTerm(p.getSchoolId(), regNo, session, term).orElseGet(() -> {
+                ExamResult fresh = new ExamResult();
+                fresh.setSchoolId(p.getSchoolId());
+                fresh.setRegNo(regNo);
+                fresh.setSession(session);
+                fresh.setTerm(term);
+                fresh.setPayloadJson("{\"subjects\":[]}");
+                return fresh;
+            });
+            e.setVisible(false);
+            e.setUpdatedAt(Instant.now());
+            resultRepository.save(e);
+            held++;
+        }
+        return ResponseEntity.ok(Collections.singletonMap("held", held));
+    }
+
+    /** WITHDRAW: { session, term, regNos:[...] } - removes the send / hold status completely (back to "not sent"). */
+    @PostMapping("/results/withdraw")
+    @Transactional
+    public ResponseEntity<?> withdrawResults(@RequestBody JsonNode body, HttpServletRequest req) {
+        SchoolSessionService.Principal p = admin(req);
+        if (p == null) return denied(req);
+        ResponseEntity<?> bad = checkKeys(body);
+        if (bad != null) return bad;
+        String session = body.path("session").asText("").trim(), term = body.path("term").asText("").trim();
+        List<String> regNos = regNosOf(body);
+        if (regNos.isEmpty()) return ParentUtil.error(HttpStatus.BAD_REQUEST, "Choose at least one student.");
+        int removed = 0;
+        for (String regNo : regNos) {
+            var e = resultRepository.findBySchoolIdAndRegNoAndSessionAndTerm(p.getSchoolId(), regNo, session, term);
+            if (e.isPresent()) { resultRepository.delete(e.get()); removed++; }
+        }
+        return ResponseEntity.ok(Collections.singletonMap("removed", removed));
+    }
+
+    private ResponseEntity<?> checkKeys(JsonNode body) {
+        String session = body.path("session").asText("").trim(), term = body.path("term").asText("").trim();
+        if (!session.matches("[0-9A-Za-z_\\-]{1,20}") || !term.matches("[0-9A-Za-z_\\-]{1,40}")) {
+            return ParentUtil.error(HttpStatus.BAD_REQUEST, "session (e.g. 2025-2026) and term (e.g. first-term) are required.");
+        }
+        return null;
+    }
+
+    private List<String> regNosOf(JsonNode body) {
+        List<String> out = new ArrayList<>();
+        JsonNode arr = body.path("regNos");
+        if (arr.isArray()) {
+            for (JsonNode n : arr) {
+                String v = n.asText("").trim();
+                if (!v.isEmpty() && out.size() < MAX_RESULT_ROWS) out.add(v);
+            }
+        }
+        return out;
+    }
+
+    /** "first-term" -> "First Term" */
+    private static String prettyTerm(String key) {
+        StringBuilder b = new StringBuilder();
+        for (String w : key.replace('_', '-').split("-")) {
+            if (w.isEmpty()) continue;
+            if (b.length() > 0) b.append(' ');
+            b.append(Character.toUpperCase(w.charAt(0))).append(w.substring(1));
+        }
+        return b.length() == 0 ? key : b.toString();
     }
 
     // ───────────── helpers ─────────────
