@@ -3,8 +3,10 @@ package com.softschool.backend.controller;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.softschool.backend.dto.ParentChildDTO;
 import com.softschool.backend.dto.ParentTeacherDTO;
+import com.softschool.backend.model.Announcement;
 import com.softschool.backend.model.Message;
 import com.softschool.backend.model.ParentReadMark;
+import com.softschool.backend.repository.AnnouncementRepository;
 import com.softschool.backend.repository.MessageRepository;
 import com.softschool.backend.repository.ParentMessageRepository;
 import com.softschool.backend.repository.ParentReadMarkRepository;
@@ -41,7 +43,9 @@ import java.util.*;
  *   PUT    /api/parent/messages/{id}                   { body }   edit one of your own messages
  *   DELETE /api/parent/messages/{id}                   delete one of your own messages
  *   POST   /api/parent/messages/read                   { regNo, thread }   thread = "admin" | "t:<staffId>"
- *   GET    /api/parent/pulse                           { unread, byChild, lastId }  cheap probe: poll every few seconds
+ *   GET    /api/parent/pulse                           { unread, byChild, lastId, inByChild, annByChild }  cheap probe: poll every few seconds
+ *       inByChild  = newest message id the school/teacher sent to each child (detects a NEW incoming message)
+ *       annByChild = newest class-announcement id for each child (detects a NEW announcement)
  *
  * There is no real push channel in this backend (no push-service credentials), so "notify the parent"
  * is the pulse endpoint: the portal polls it and shows the notification itself.
@@ -60,6 +64,7 @@ public class ParentMessageController {
     @Autowired private ParentMessageRepository parentMessageRepository;
     @Autowired private ParentReadMarkRepository readMarkRepository;
     @Autowired private ParentStaffRepository staffRepository;
+    @Autowired private AnnouncementRepository announcementRepository;
 
     // ───────────── READ ─────────────
     @GetMapping("/messages")
@@ -127,20 +132,41 @@ public class ParentMessageController {
         long lastId = 0;
         int total = 0;
         Map<String, Integer> byChild = new LinkedHashMap<>();
+        Map<String, Long> inByChild = new LinkedHashMap<>();
+        Map<String, Long> annByChild = new LinkedHashMap<>();
+
+        // Class announcements are read ONCE for the whole parent, then matched to each child.
+        List<Announcement> announcements = announcementRepository.findBySchoolIdAndAudienceOrderByCreatedAtDesc(
+                ctx.schoolId, Announcement.AUD_CLASS, PageRequest.of(0, 200));
+
         for (ParentChildDTO child : ctx.kids) {
             int unread = 0;
+            long lastIncoming = 0;
             for (Message m : loadAll(ctx, child)) {
                 if (m.getId() != null && m.getId() > lastId) lastId = m.getId();
+                boolean fromParent = Message.FROM_PARENT.equals(m.getSenderType());
+                if (!fromParent && m.getId() != null && m.getId() > lastIncoming) lastIncoming = m.getId();
                 Instant read = marks.get(child.getRegNo() + "|" + threadOf(m));
-                if (!Message.FROM_PARENT.equals(m.getSenderType()) && (read == null || m.getCreatedAt().isAfter(read))) unread++;
+                if (!fromParent && (read == null || m.getCreatedAt().isAfter(read))) unread++;
             }
             byChild.put(child.getRegNo(), unread);
+            inByChild.put(child.getRegNo(), lastIncoming);
             total += unread;
+
+            long newestAnnouncement = 0;
+            for (Announcement a : announcements) {
+                if (a.getId() != null && a.getId() > newestAnnouncement && ParentUtil.classMatches(a.getClassName(), child)) {
+                    newestAnnouncement = a.getId();
+                }
+            }
+            annByChild.put(child.getRegNo(), newestAnnouncement);
         }
         Map<String, Object> o = new LinkedHashMap<>();
         o.put("unread", total);
         o.put("byChild", byChild);
         o.put("lastId", lastId);
+        o.put("inByChild", inByChild);
+        o.put("annByChild", annByChild);
         return ResponseEntity.ok(o);
     }
 
