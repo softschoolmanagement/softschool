@@ -85,6 +85,62 @@ public class SchoolSessionService {
         }
     }
 
+    // ── MEDIA TOKENS ─────────────────────────────────────────────────────
+    // A plain <img src> / <iframe> / window.open request cannot send an
+    // "Authorization: Bearer" header, so GET /api/students/{regNo}/photo and
+    // /bform answered 401 to every image tag on the page (the reason photos
+    // "did not load" after moving them out of the database). The page now asks
+    // for a media token once (GET /api/students/media-token, normal Bearer
+    // auth) and appends it as ?mt=... to those two image URLs.
+    //
+    // The token is deliberately weak-by-design so a leaked URL does little:
+    //   - it only works for GET .../photo and GET .../bform (SchoolAuthFilter),
+    //   - it is bound to ONE school (the schoolId query param must match),
+    //   - it expires after MEDIA_TOKEN_TTL_SECONDS,
+    //   - it is signed in its own domain ("media:" prefix), so it can never be
+    //     used as a school session token and a session token is never a media token.
+    private static final long MEDIA_TOKEN_TTL_SECONDS = 60L * 60L;
+
+    public static long getMediaTokenTtlSeconds() {
+        return MEDIA_TOKEN_TTL_SECONDS;
+    }
+
+    public String issueMediaToken(String schoolId) {
+        if (!isConfigured()) {
+            throw new IllegalStateException("SCHOOL_SESSION_SECRET is not configured.");
+        }
+        long expiresAt = (System.currentTimeMillis() / 1000L) + MEDIA_TOKEN_TTL_SECONDS;
+        String payloadB64 = encode("media." + encode(schoolId) + "." + expiresAt);
+        return payloadB64 + "." + sign("media:" + payloadB64, currentSecret);
+    }
+
+    /** Returns the schoolId the media token was issued for, or null when invalid/expired. */
+    public String verifyMediaToken(String token) {
+        if (token == null || token.isBlank() || !isConfigured()) return null;
+        int dot = token.lastIndexOf('.');
+        if (dot <= 0 || dot == token.length() - 1) return null;
+        String payloadB64 = token.substring(0, dot);
+        String signature = token.substring(dot + 1);
+        String signed = "media:" + payloadB64;
+
+        boolean valid = matches(signature, signed, currentSecret)
+                || (SecretStrength.isStrong(previousSecret)
+                    && matches(signature, signed, previousSecret));
+        if (!valid) return null;
+
+        try {
+            String[] parts = new String(Base64.getUrlDecoder().decode(payloadB64), StandardCharsets.UTF_8)
+                    .split("\\.", 3);
+            if (parts.length != 3 || !"media".equals(parts[0])) return null;
+            long expiresAt = Long.parseLong(parts[2]);
+            if (expiresAt < System.currentTimeMillis() / 1000L) return null;
+            String schoolId = decode(parts[1]);
+            return schoolId.isBlank() ? null : schoolId;
+        } catch (RuntimeException ex) {
+            return null;
+        }
+    }
+
     private boolean matches(String supplied, String payload, String secret) {
         if (secret == null || secret.isBlank()) return false;
         return MessageDigest.isEqual(

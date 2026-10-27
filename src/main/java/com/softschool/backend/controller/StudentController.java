@@ -40,6 +40,9 @@ public class StudentController {
     @Autowired
     private StudentCacheService studentCache;
 
+    @Autowired
+    private com.softschool.backend.security.SchoolSessionService schoolSessionService;
+
     @PostMapping({"", "/"})
     public ResponseEntity<?> saveStudent(@RequestBody(required = false) Student incoming) {
         if (incoming == null) {
@@ -471,6 +474,29 @@ public class StudentController {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body(errorBody("Could not store B-Form file."));
         }
+    }
+
+    /**
+     * MEDIA TOKEN — hands the page a short-lived token it appends to
+     * /{regNo}/photo and /{regNo}/bform image URLs as ?mt=... . Needed because
+     * an <img src> request cannot carry the Authorization header (that was the
+     * cause of photos not loading when they were moved out of the database).
+     * This call itself is normally authenticated (Bearer), and the token is
+     * scoped to the authenticated school only. See SchoolSessionService.
+     */
+    @GetMapping("/media-token")
+    public ResponseEntity<?> getMediaToken(jakarta.servlet.http.HttpServletRequest request) {
+        Object schoolId = request.getAttribute(com.softschool.backend.security.SchoolSessionService.SCHOOL_ID_ATTRIBUTE);
+        if (schoolId == null || schoolId.toString().isBlank()) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(errorBody("Missing school session."));
+        }
+        java.util.Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("token", schoolSessionService.issueMediaToken(schoolId.toString()));
+        body.put("expiresInSeconds", com.softschool.backend.security.SchoolSessionService.getMediaTokenTtlSeconds());
+        return ResponseEntity.ok()
+                .header("Cache-Control", "no-store, private, max-age=0")
+                .body(body);
     }
 
     /**

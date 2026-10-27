@@ -36,7 +36,7 @@ public class SchoolAuthFilter extends OncePerRequestFilter {
     private static final long MAX_INSPECTED_BODY_BYTES = 16L * 1024L * 1024L;
     private static final Set<String> PROTECTED_PREFIXES = Set.of(
             "/api/students", "/api/staff", "/api/finance", "/api/attendance",
-            "/api/biometric", "/api/settings");
+            "/api/biometric", "/api/settings", "/api/exams");
 
     @Autowired
     private SchoolSessionService sessionService;
@@ -53,6 +53,32 @@ public class SchoolAuthFilter extends OncePerRequestFilter {
         if (!isProtectedPath(request.getRequestURI()) || "OPTIONS".equalsIgnoreCase(request.getMethod())) {
             filterChain.doFilter(request, response);
             return;
+        }
+
+        // MEDIA TOKEN — <img src> tags cannot send the Authorization header, so
+        // GET /api/students/{regNo}/photo|bform also accepts a short-lived,
+        // school-bound ?mt= token (see SchoolSessionService#issueMediaToken).
+        // Anything else, or a request without ?mt=, goes through the normal
+        // Bearer check below exactly as before.
+        if ("GET".equalsIgnoreCase(request.getMethod()) && isMediaPath(request.getRequestURI())) {
+            String mediaToken = request.getParameter("mt");
+            if (mediaToken != null && !mediaToken.isBlank()) {
+                String mediaSchoolId = sessionService.verifyMediaToken(mediaToken.trim());
+                if (mediaSchoolId == null) {
+                    writeError(response, HttpServletResponse.SC_UNAUTHORIZED,
+                            "Media link expired. Please refresh the page.");
+                    return;
+                }
+                String requested = request.getParameter("schoolId");
+                if (requested != null && !mediaSchoolId.equals(requested.trim())) {
+                    writeError(response, HttpServletResponse.SC_FORBIDDEN,
+                            "This file belongs to a different school.");
+                    return;
+                }
+                request.setAttribute(SchoolSessionService.SCHOOL_ID_ATTRIBUTE, mediaSchoolId);
+                filterChain.doFilter(request, response);
+                return;
+            }
         }
 
         String authorization = request.getHeader("Authorization");
@@ -118,6 +144,13 @@ public class SchoolAuthFilter extends OncePerRequestFilter {
 
         downstreamRequest.setAttribute(SchoolSessionService.SCHOOL_ID_ATTRIBUTE, schoolId);
         filterChain.doFilter(downstreamRequest, response);
+    }
+
+    private static final java.util.regex.Pattern MEDIA_PATH =
+            java.util.regex.Pattern.compile("^/api/students/[^/]+/(photo|bform)$");
+
+    private boolean isMediaPath(String uri) {
+        return uri != null && MEDIA_PATH.matcher(uri).matches();
     }
 
     private boolean isProtectedPath(String uri) {

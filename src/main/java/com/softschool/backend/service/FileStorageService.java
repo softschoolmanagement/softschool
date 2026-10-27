@@ -87,6 +87,40 @@ public class FileStorageService {
         return store(file, "diary", ALLOWED_IMAGE_EXT);
     }
 
+    /** Absolute upload root (used by the one-time migration for its log files). */
+    public Path getRoot() {
+        return root;
+    }
+
+    /**
+     * Writes already-decoded bytes (from the one-time base64 migration) into
+     * photos/ or bforms/ and returns the relative path. The bytes are written
+     * to a ".part" file first and moved into place, so a crash can never leave
+     * a half-written file under a real name. {@code ext} must come from
+     * {@link #detectExtension}.
+     */
+    public String storeBytes(byte[] bytes, String subfolder, String ext) throws IOException {
+        if (bytes == null || bytes.length == 0) {
+            throw new IllegalArgumentException("No data to store.");
+        }
+        if (!"photos".equals(subfolder) && !"bforms".equals(subfolder)) {
+            throw new IllegalArgumentException("Invalid folder.");
+        }
+        if (ext == null || !ALLOWED_BFORM_EXT.contains(ext)) {
+            throw new IllegalArgumentException("Invalid file type.");
+        }
+        String filename = UUID.randomUUID() + ext;
+        Path dir = root.resolve(subfolder);
+        Path target = dir.resolve(filename).normalize();
+        if (!target.startsWith(root)) {
+            throw new SecurityException("Invalid upload path.");
+        }
+        Path part = dir.resolve(filename + ".part");
+        Files.write(part, bytes);
+        Files.move(part, target, StandardCopyOption.REPLACE_EXISTING);
+        return subfolder + "/" + filename;
+    }
+
     /** Hard cap per file, independent of the global multipart limit. */
     private static final long MAX_FILE_BYTES = 10L * 1024 * 1024;
 

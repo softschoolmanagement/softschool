@@ -1,0 +1,1634 @@
+diff --git a/db/performance_indexes.sql b/db/performance_indexes.sql
+new file mode 100644
+index 0000000..5e0fc7b
+--- /dev/null
++++ b/db/performance_indexes.sql
+@@ -0,0 +1,37 @@
++-- Soft School: performance indexes (safe to run more than once on MySQL 8+).
++-- The same indexes are declared on the entities, so Hibernate (ddl-auto=update) creates them on the next
++-- start. Run this script instead if you want them NOW, or on a large production table without a restart.
++-- Tip: run it in a quiet period; building an index on a big table takes a moment.
++
++DELIMITER $$
++DROP PROCEDURE IF EXISTS add_idx$$
++CREATE PROCEDURE add_idx(t VARCHAR(64), i VARCHAR(64), cols VARCHAR(255))
++BEGIN
++  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = t)
++     AND NOT EXISTS (SELECT 1 FROM information_schema.statistics
++                     WHERE table_schema = DATABASE() AND table_name = t AND index_name = i) THEN
++    SET @s = CONCAT('CREATE INDEX ', i, ' ON ', t, ' (', cols, ')');
++    PREPARE st FROM @s; EXECUTE st; DEALLOCATE PREPARE st;
++  END IF;
++END$$
++DELIMITER ;
++
++-- attendance (had NO index at all; every read scanned the table)
++CALL add_idx('attendance', 'idx_att_member',          'school_id, member_id, attendance_date');
++CALL add_idx('attendance', 'idx_att_school_date',     'school_id, attendance_date');
++CALL add_idx('attendance', 'idx_att_school_type_date','school_id, member_type, attendance_date');
++
++-- students (parent login / children lookup, dashboards)
++CALL add_idx('students', 'idx_students_school_status',  'school_id, status');
++CALL add_idx('students', 'idx_students_school_sibling', 'school_id, sibling_group_id');
++CALL add_idx('students', 'idx_students_school_class',   'school_id, student_class');
++
++-- staff
++CALL add_idx('staff', 'idx_staff_school_type', 'school_id, type');
++
++-- announcements, tests, chat
++CALL add_idx('announcement',    'idx_ann_school_aud_created', 'school_id, audience, created_at');
++CALL add_idx('teacher_test',    'idx_tt_school_class',        'school_id, class_name, updated_at');
++CALL add_idx('teacher_message', 'idx_tmsg_channel_class',     'school_id, channel, class_name, created_at');
++
++DROP PROCEDURE add_idx;
+diff --git a/src/main/java/com/softschool/backend/controller/AttendanceController.java b/src/main/java/com/softschool/backend/controller/AttendanceController.java
+index 222dcc2..3f5fa0a 100644
+--- a/src/main/java/com/softschool/backend/controller/AttendanceController.java
++++ b/src/main/java/com/softschool/backend/controller/AttendanceController.java
+@@ -2,7 +2,10 @@ package com.softschool.backend.controller;
+ 
+ import com.softschool.backend.model.Attendance;
+ import com.softschool.backend.repository.AttendanceRepository;
++import com.softschool.backend.service.DataCacheService;
++import com.softschool.backend.service.DataCacheService.Dep;
+ import com.softschool.backend.service.PlanEnforcementService;
++import com.softschool.backend.service.StudentCacheService;
+ import com.softschool.backend.service.ZktecoService;
+ 
+ import org.springframework.beans.factory.annotation.Autowired;
+@@ -29,6 +32,15 @@ public class AttendanceController {
+     @Autowired
+     private com.softschool.backend.service.ParentNoticeService parentNoticeService;
+ 
++    // PERFORMANCE: the read endpoints below are polled by the dashboard / attendance / reports pages.
++    // Their finished JSON is cached per school and rebuilt only after an attendance row of that school
++    // changes (DataCacheInvalidationListener), so repeated polls cost no MySQL query and no serialisation.
++    @Autowired
++    private DataCacheService dataCache;
++
++    @Autowired
++    private StudentCacheService studentCache;
++
+     @PostMapping("/save")
+     public ResponseEntity<String> saveAttendance(@RequestBody List<Attendance> attendanceList) {
+         if (attendanceList == null || attendanceList.isEmpty()) {
+@@ -131,11 +143,16 @@ public String testBiometric(@RequestParam String id) {
+ // returns every row for the school, across every date, so Reports can
+ // build its own per-month breakdown the same way the other trend charts do.
+ @GetMapping("/all")
+-public ResponseEntity<?> getAllAttendance(@RequestParam String schoolId) {
++public ResponseEntity<?> getAllAttendance(
++        @RequestParam String schoolId,
++        @RequestHeader(value = "Accept-Encoding", required = false) String acceptEncoding) {
+     if (schoolId == null || schoolId.trim().isEmpty()) {
+         return ResponseEntity.badRequest().body("schoolId is required");
+     }
+-    return ResponseEntity.ok(attendanceRepository.findBySchoolId(schoolId));
++    // Cached as finished, gzipped JSON (bounded by bytes): this is the whole year's rows for the school.
++    return studentCache.toResponse(
++            dataCache.getJson(schoolId, "att-all", () -> attendanceRepository.findBySchoolId(schoolId), Dep.ATTENDANCE),
++            acceptEncoding);
+ }
+ 
+ // Dashboard summary for one day: how many students/staff are marked
+@@ -149,7 +166,14 @@ public ResponseEntity<?> getAttendanceSummary(@RequestParam String date, @Reques
+     if (schoolId == null || schoolId.trim().isEmpty()) {
+         return ResponseEntity.badRequest().body("schoolId is required");
+     }
+-    List<Attendance> records = attendanceRepository.findByDateAndSchoolId(LocalDate.parse(date), schoolId);
++    final LocalDate day = LocalDate.parse(date);
++    Map<String, Object> summary = dataCache.get(schoolId, "att-summary|" + day, 30,
++            () -> buildAttendanceSummary(day, schoolId), Dep.ATTENDANCE);
++    return ResponseEntity.ok(summary);
++}
++
++private Map<String, Object> buildAttendanceSummary(LocalDate day, String schoolId) {
++    List<Attendance> records = attendanceRepository.findByDateAndSchoolId(day, schoolId);
+ 
+     long presentStudents = records.stream()
+             .filter(a -> "STUDENT".equalsIgnoreCase(a.getMemberType()))
+@@ -166,7 +190,7 @@ public ResponseEntity<?> getAttendanceSummary(@RequestParam String date, @Reques
+     summary.put("presentStudents", presentStudents);
+     summary.put("presentStaff", presentStaff);
+     summary.put("hasData", !records.isEmpty());
+-    return ResponseEntity.ok(summary);
++    return summary;
+ }
+ 
+ // Marked students for one school on one day — mirrors /staff below, but
+@@ -178,38 +202,56 @@ public ResponseEntity<?> getAttendanceSummary(@RequestParam String date, @Reques
+ public ResponseEntity<?> getStudentAttendance(
+         @RequestParam String date,
+         @RequestParam String schoolId,
+-        @RequestParam(required = false) String className) {
++        @RequestParam(required = false) String className,
++        @RequestHeader(value = "Accept-Encoding", required = false) String acceptEncoding) {
+     if (schoolId == null || schoolId.trim().isEmpty()) {
+         return ResponseEntity.badRequest().body("schoolId is required");
+     }
+-    LocalDate parsedDate = LocalDate.parse(date);
+-    if (className != null && !className.trim().isEmpty()) {
+-        return ResponseEntity.ok(attendanceRepository.findByMemberTypeAndDateAndSchoolIdAndClassName(
+-                "STUDENT", parsedDate, schoolId, className));
+-    }
+-    return ResponseEntity.ok(
+-            attendanceRepository.findByMemberTypeAndDateAndSchoolId("STUDENT", parsedDate, schoolId));
++    final LocalDate parsedDate = LocalDate.parse(date);
++    final boolean byClass = className != null && !className.trim().isEmpty();
++    return studentCache.toResponse(
++            dataCache.getJson(schoolId, "att-students|" + parsedDate + "|" + (byClass ? className : ""),
++                    () -> byClass
++                            ? attendanceRepository.findByMemberTypeAndDateAndSchoolIdAndClassName(
++                                    "STUDENT", parsedDate, schoolId, className)
++                            : attendanceRepository.findByMemberTypeAndDateAndSchoolId(
++                                    "STUDENT", parsedDate, schoolId),
++                    Dep.ATTENDANCE),
++            acceptEncoding);
+ }
+ 
+ @GetMapping("/staff")
+-public ResponseEntity<?> getStaffAttendance(@RequestParam String date, @RequestParam String schoolId) {
++public ResponseEntity<?> getStaffAttendance(
++        @RequestParam String date,
++        @RequestParam String schoolId,
++        @RequestHeader(value = "Accept-Encoding", required = false) String acceptEncoding) {
+     // This returns all marked staff for today (biometric or manual), for ONE school only.
+     if (schoolId == null || schoolId.trim().isEmpty()) {
+         return ResponseEntity.badRequest().body("schoolId is required");
+     }
+-    return ResponseEntity.ok(
+-            attendanceRepository.findByMemberTypeAndDateAndSchoolId("STAFF", LocalDate.parse(date), schoolId));
++    final LocalDate parsedDate = LocalDate.parse(date);
++    return studentCache.toResponse(
++            dataCache.getJson(schoolId, "att-staff|" + parsedDate,
++                    () -> attendanceRepository.findByMemberTypeAndDateAndSchoolId("STAFF", parsedDate, schoolId),
++                    Dep.ATTENDANCE),
++            acceptEncoding);
+ }
+ 
+ // Full attendance history for one member (staff or student), scoped to
+ // their school so the frontend's "History" view never shows another
+ // school's records even if the memberId string happens to match.
+ @GetMapping("/history/{memberId}")
+-public ResponseEntity<?> getMemberHistory(@PathVariable String memberId, @RequestParam String schoolId) {
++public ResponseEntity<?> getMemberHistory(
++        @PathVariable String memberId,
++        @RequestParam String schoolId,
++        @RequestHeader(value = "Accept-Encoding", required = false) String acceptEncoding) {
+     if (schoolId == null || schoolId.trim().isEmpty()) {
+         return ResponseEntity.badRequest().body("schoolId is required");
+     }
+-    return ResponseEntity.ok(
+-            attendanceRepository.findByMemberIdAndSchoolIdOrderByDateDesc(memberId, schoolId));
++    return studentCache.toResponse(
++            dataCache.getJson(schoolId, "att-history|" + memberId,
++                    () -> attendanceRepository.findByMemberIdAndSchoolIdOrderByDateDesc(memberId, schoolId),
++                    Dep.ATTENDANCE),
++            acceptEncoding);
+ }
+ }
+\ No newline at end of file
+diff --git a/src/main/java/com/softschool/backend/controller/FinanceController.java b/src/main/java/com/softschool/backend/controller/FinanceController.java
+index 7defd1b..b06f1d6 100644
+--- a/src/main/java/com/softschool/backend/controller/FinanceController.java
++++ b/src/main/java/com/softschool/backend/controller/FinanceController.java
+@@ -10,7 +10,11 @@ import com.softschool.backend.repository.DropoutStaffRecordRepository;
+ import com.softschool.backend.repository.FinanceRepository;
+ import com.softschool.backend.repository.StaffRepository;
+ import com.softschool.backend.repository.StudentRepository;
++import com.softschool.backend.service.DataCacheService;
++import com.softschool.backend.service.DataCacheService.Dep;
+ import com.softschool.backend.service.PlanEnforcementService;
++import com.softschool.backend.service.StudentCacheService;
++import jakarta.servlet.http.HttpServletRequest;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.http.ResponseEntity;
+@@ -50,6 +54,12 @@ public class FinanceController {
+     @Autowired private FinanceRepository financeRepository;
+     @Autowired private DropoutStaffRecordRepository dropoutStaffRecordRepository;
+     @Autowired private PlanEnforcementService planEnforcementService;
++    // PERFORMANCE: the dashboard and Manage Finance poll the read endpoints below. Their finished JSON is
++    // cached per school and rebuilt only after a finance row of that school changes (see
++    // DataCacheInvalidationListener). The request proxy is only used to read Accept-Encoding.
++    @Autowired private DataCacheService dataCache;
++    @Autowired private StudentCacheService studentCache;
++    @Autowired private HttpServletRequest currentRequest;
+     private final ObjectMapper objectMapper = new ObjectMapper();
+ 
+     // =========================================================
+@@ -319,9 +329,9 @@ public class FinanceController {
+         // separately re-filter to active students for anything actionable
+         // (Pay Bill, Generate Voucher, etc.), so this doesn't resurrect a
+         // dropped student anywhere they could actually be billed again.
+-        List<Finance> records = financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
+-                monthKey, Finance.TYPE_STUDENT_FEE, schoolId);
+-        return ResponseEntity.ok(records);
++        return cachedJson(schoolId, "fin-status-all|" + monthKey,
++                () -> financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
++                        monthKey, Finance.TYPE_STUDENT_FEE, schoolId));
+     }
+ 
+     // =========================================================
+@@ -1058,9 +1068,9 @@ public class FinanceController {
+         // of one-per-student. Same "never hide a dropped student's already-
+         // charged/paid fine history" rule applies here too, since this is
+         // the same underlying data.
+-        List<Finance> fines = financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
+-                monthKey, Finance.TYPE_FINE, schoolId);
+-        return ResponseEntity.ok(fines);
++        return cachedJson(schoolId, "fin-fine-details-all|" + monthKey,
++                () -> financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
++                        monthKey, Finance.TYPE_FINE, schoolId));
+     }
+ 
+     // =========================================================
+@@ -1278,8 +1288,8 @@ public class FinanceController {
+     @GetMapping("/salary/records")
+     public ResponseEntity<?> getSalaryRecords(@RequestParam String schoolId) {
+         if (isBlank(schoolId)) return badRequest("schoolId is required.");
+-        return ResponseEntity.ok(
+-                financeRepository.findByRecordTypeAndSchoolIdOrderByCreatedAtAsc(
++        return cachedJson(schoolId, "fin-salary-records",
++                () -> financeRepository.findByRecordTypeAndSchoolIdOrderByCreatedAtAsc(
+                         Finance.TYPE_SALARY, schoolId));
+     }
+ 
+@@ -1435,7 +1445,18 @@ public class FinanceController {
+ 
+     private ResponseEntity<?> bulkGet(String recordType, String schoolId) {
+         if (isBlank(schoolId)) return badRequest("schoolId is required.");
+-        return ResponseEntity.ok(bulkList(recordType, schoolId));
++        return cachedJson(schoolId, "fin-bulk|" + recordType, () -> bulkList(recordType, schoolId));
++    }
++
++    /**
++     * Serves the finished, gzipped JSON of a read-only finance list from the server cache. The cache key
++     * carries the school's current "finance version", so any insert/update/delete of a finance row in
++     * this school makes the next call rebuild it from MySQL.
++     */
++    private ResponseEntity<?> cachedJson(String schoolId, String subKey, java.util.function.Supplier<?> loader) {
++        return studentCache.toResponse(
++                dataCache.getJson(schoolId, subKey, loader, Dep.FINANCE),
++                currentRequest.getHeader("Accept-Encoding"));
+     }
+ 
+     /**
+diff --git a/src/main/java/com/softschool/backend/controller/ParentAuthController.java b/src/main/java/com/softschool/backend/controller/ParentAuthController.java
+index 758c0ce..7adf8d9 100644
+--- a/src/main/java/com/softschool/backend/controller/ParentAuthController.java
++++ b/src/main/java/com/softschool/backend/controller/ParentAuthController.java
+@@ -266,8 +266,10 @@ public class ParentAuthController {
+ 
+         String oldPassword = req == null ? null : req.get("oldPassword");
+         String newPassword = req == null ? null : req.get("newPassword");
+-        String tail = ParentUtil.tail10(req == null ? null : req.get("phone"));
+-        // The phone typed on the page must be the one this session belongs to.
++        // The Settings page sends no phone: the session already knows which parent this is. The older
++        // change-password page still sends one, and then it must be the one this session belongs to.
++        String sentPhone = req == null ? null : req.get("phone");
++        String tail = sentPhone == null || sentPhone.isBlank() ? ctx.phone : ParentUtil.tail10(sentPhone);
+         if (tail == null || !tail.equals(ctx.phone)) {
+             return ParentUtil.error(HttpStatus.FORBIDDEN, "That phone number does not match your account.");
+         }
+diff --git a/src/main/java/com/softschool/backend/controller/ParentMessageController.java b/src/main/java/com/softschool/backend/controller/ParentMessageController.java
+index f2ac102..bef598f 100644
+--- a/src/main/java/com/softschool/backend/controller/ParentMessageController.java
++++ b/src/main/java/com/softschool/backend/controller/ParentMessageController.java
+@@ -7,10 +7,15 @@ import com.softschool.backend.model.Announcement;
+ import com.softschool.backend.model.Message;
+ import com.softschool.backend.model.ParentReadMark;
+ import com.softschool.backend.repository.AnnouncementRepository;
++import com.softschool.backend.repository.AttendanceRepository;
++import com.softschool.backend.repository.DiaryEntryRepository;
++import com.softschool.backend.repository.ExamResultRepository;
+ import com.softschool.backend.repository.MessageRepository;
+ import com.softschool.backend.repository.ParentMessageRepository;
+ import com.softschool.backend.repository.ParentReadMarkRepository;
+ import com.softschool.backend.repository.ParentStaffRepository;
++import com.softschool.backend.service.DataCacheService;
++import com.softschool.backend.service.DataCacheService.Dep;
+ import com.softschool.backend.service.ParentContext;
+ import com.softschool.backend.service.ParentUtil;
+ import jakarta.servlet.http.HttpServletRequest;
+@@ -56,6 +61,10 @@ public class ParentMessageController {
+ 
+     private static final int MAX_LIST = 500;
+     private static final int PARENT_DAILY_LIMIT = 60;
++    /** /pulse is polled every few seconds by every open portal, so it is answered from memory in between. */
++    private static final long PULSE_TTL = 15;
++    /** Message lists change on every send; the entry is also dropped by the write itself (see DataCacheService). */
++    private static final long MESSAGES_TTL = 8;
+     private static final String READ_LOCK = "This message has been read, so it can't be edited or deleted.";
+     private static final List<String> PRIVATE_CHANNELS = Arrays.asList(Message.CH_PARENT_ADMIN, Message.CH_PARENT_TEACHER);
+ 
+@@ -65,6 +74,10 @@ public class ParentMessageController {
+     @Autowired private ParentReadMarkRepository readMarkRepository;
+     @Autowired private ParentStaffRepository staffRepository;
+     @Autowired private AnnouncementRepository announcementRepository;
++    @Autowired private DataCacheService cache;
++    @Autowired private DiaryEntryRepository diaryRepository;
++    @Autowired private ExamResultRepository resultRepository;
++    @Autowired private AttendanceRepository attendanceRepository;
+ 
+     // ───────────── READ ─────────────
+     @GetMapping("/messages")
+@@ -123,26 +136,48 @@ public class ParentMessageController {
+         return ResponseEntity.ok(out);
+     }
+ 
+-    /** Cheap probe for notifications: total unread across all children and the newest message id. */
++    /**
++     * Cheap probe for notifications: total unread across all children and the newest message id.
++     *
++     * PERFORMANCE: every open portal calls this every few seconds, and building it used to load up to
++     * ~900 full message rows per child plus 200 full announcements. The finished answer is now cached per
++     * parent. A new message, a read receipt, a new announcement or a change to the parent's children
++     * drops it immediately (DataCacheInvalidationListener), so a new item still shows on the very next
++     * poll; the 15 s lifetime only covers writes that bypass JPA.
++     */
+     @GetMapping("/pulse")
+     public ResponseEntity<?> pulse(HttpServletRequest req) {
+         ParentContext.Ctx ctx = parentContext.resolve(req);
+         if (ctx == null) return ParentUtil.error(HttpStatus.UNAUTHORIZED, "Please log in again.");
+-        Map<String, Instant> marks = readMarks(ctx);
++        Map<String, Object> o = cache.get(ctx.schoolId, "pulse|" + ctx.phone + "|" + java.time.LocalDate.now(), PULSE_TTL,
++                () -> buildPulse(ctx),
++                Dep.MESSAGES, Dep.READMARKS, Dep.ANNOUNCEMENTS, Dep.STUDENTS, Dep.LINKS,
++                Dep.DIARY, Dep.RESULTS, Dep.ATTENDANCE);
++        return ResponseEntity.ok(o);
++    }
++
++    /** Must read from the database directly: a cache loader may not call the cache again. */
++    private Map<String, Object> buildPulse(ParentContext.Ctx ctx) {
++        Map<String, Instant> marks = readMarksUncached(ctx);
+         long lastId = 0;
+         int total = 0;
+         Map<String, Integer> byChild = new LinkedHashMap<>();
+         Map<String, Long> inByChild = new LinkedHashMap<>();
+         Map<String, Long> annByChild = new LinkedHashMap<>();
+-
+-        // Class announcements are read ONCE for the whole parent, then matched to each child.
+-        List<Announcement> announcements = announcementRepository.findBySchoolIdAndAudienceOrderByCreatedAtDesc(
++        // Homework, results and today's attendance, so those can raise an alert too (not only chat + notices).
++        Map<String, Long> diaryByChild = new LinkedHashMap<>();
++        Map<String, Long> resultsByChild = new LinkedHashMap<>();
++        Map<String, String> attByChild = new LinkedHashMap<>();
++        final java.time.LocalDate today = java.time.LocalDate.now();
++
++        // Class announcements are read ONCE for the whole parent (id + class only), then matched to each child.
++        List<Object[]> announcements = announcementRepository.findIdAndClassBySchoolIdAndAudience(
+                 ctx.schoolId, Announcement.AUD_CLASS, PageRequest.of(0, 200));
+ 
+         for (ParentChildDTO child : ctx.kids) {
+             int unread = 0;
+             long lastIncoming = 0;
+-            for (Message m : loadAll(ctx, child)) {
++            for (Message m : loadAllUncached(ctx, child)) {
+                 if (m.getId() != null && m.getId() > lastId) lastId = m.getId();
+                 boolean fromParent = Message.FROM_PARENT.equals(m.getSenderType());
+                 if (!fromParent && m.getId() != null && m.getId() > lastIncoming) lastIncoming = m.getId();
+@@ -154,12 +189,24 @@ public class ParentMessageController {
+             total += unread;
+ 
+             long newestAnnouncement = 0;
+-            for (Announcement a : announcements) {
+-                if (a.getId() != null && a.getId() > newestAnnouncement && ParentUtil.classMatches(a.getClassName(), child)) {
+-                    newestAnnouncement = a.getId();
++            for (Object[] row : announcements) {
++                if (row[0] == null) continue;
++                long id = ((Number) row[0]).longValue();
++                if (id > newestAnnouncement && ParentUtil.classMatches((String) row[1], child)) {
++                    newestAnnouncement = id;
+                 }
+             }
+             annByChild.put(child.getRegNo(), newestAnnouncement);
++
++            Long newestDiary = diaryRepository.findNewestPublishedId(ctx.schoolId, ParentUtil.classLabel(child));
++            diaryByChild.put(child.getRegNo(), newestDiary == null ? 0L : newestDiary);
++            resultsByChild.put(child.getRegNo(), resultRepository.countBySchoolIdAndRegNoAndVisibleTrue(ctx.schoolId, child.getRegNo()));
++            String att = "";
++            for (com.softschool.backend.dto.ParentAttendanceDTO a :
++                    attendanceRepository.findParentView(ctx.schoolId, child.getRegNo(), today, today)) {
++                if ("STUDENT".equalsIgnoreCase(a.getMemberType())) att = ParentUtil.normalizeAttendance(a.getStatus());
++            }
++            attByChild.put(child.getRegNo(), att);
+         }
+         Map<String, Object> o = new LinkedHashMap<>();
+         o.put("unread", total);
+@@ -167,7 +214,11 @@ public class ParentMessageController {
+         o.put("lastId", lastId);
+         o.put("inByChild", inByChild);
+         o.put("annByChild", annByChild);
+-        return ResponseEntity.ok(o);
++        o.put("diaryByChild", diaryByChild);
++        o.put("resultsByChild", resultsByChild);
++        o.put("attByChild", attByChild);
++        o.put("today", today.toString());
++        return o;
+     }
+ 
+     // ───────────── SEND ─────────────
+@@ -305,8 +356,14 @@ public class ParentMessageController {
+ 
+     // ───────────── helpers ─────────────
+ 
+-    /** Every message this child can see, oldest first. */
++    /** Every message this child can see, oldest first (cached briefly; a send or a class change drops it at once). */
+     private List<Message> loadAll(ParentContext.Ctx ctx, ParentChildDTO child) {
++        return cache.get(ctx.schoolId, "msgs|" + child.getRegNo(), MESSAGES_TTL,
++                () -> loadAllUncached(ctx, child), Dep.MESSAGES, Dep.STUDENTS);
++    }
++
++    /** Same list, straight from the database. */
++    private List<Message> loadAllUncached(ParentContext.Ctx ctx, ParentChildDTO child) {
+         Map<Long, Message> byId = new LinkedHashMap<>();
+         for (Message m : parentMessageRepository.findBySchoolIdAndStudentRegNoAndChannelInOrderByCreatedAtDesc(
+                 ctx.schoolId, child.getRegNo(), PRIVATE_CHANNELS, PageRequest.of(0, MAX_LIST))) byId.put(m.getId(), m);
+@@ -325,6 +382,10 @@ public class ParentMessageController {
+     }
+ 
+     private Map<String, Instant> readMarks(ParentContext.Ctx ctx) {
++        return cache.get(ctx.schoolId, "rm|" + ctx.phone, 30, () -> readMarksUncached(ctx), Dep.READMARKS);
++    }
++
++    private Map<String, Instant> readMarksUncached(ParentContext.Ctx ctx) {
+         Map<String, Instant> m = new HashMap<>();
+         for (ParentReadMark r : readMarkRepository.findBySchoolIdAndPhone(ctx.schoolId, ctx.phone)) m.put(r.getThreadKey(), r.getReadAt());
+         return m;
+diff --git a/src/main/java/com/softschool/backend/controller/ParentPortalController.java b/src/main/java/com/softschool/backend/controller/ParentPortalController.java
+index 7bda023..a9b11ee 100644
+--- a/src/main/java/com/softschool/backend/controller/ParentPortalController.java
++++ b/src/main/java/com/softschool/backend/controller/ParentPortalController.java
+@@ -3,14 +3,19 @@ package com.softschool.backend.controller;
+ import com.fasterxml.jackson.databind.JsonNode;
+ import com.fasterxml.jackson.databind.ObjectMapper;
+ import com.fasterxml.jackson.databind.node.ObjectNode;
++import com.softschool.backend.dto.ParentAttendanceDTO;
+ import com.softschool.backend.dto.ParentChildDTO;
+ import com.softschool.backend.dto.ParentTeacherDTO;
+ import com.softschool.backend.model.*;
+ import com.softschool.backend.repository.*;
++import com.softschool.backend.service.DataCacheService;
++import com.softschool.backend.service.DataCacheService.Dep;
+ import com.softschool.backend.service.FileStorageService;
+ import com.softschool.backend.service.ParentChildrenService;
+ import com.softschool.backend.service.ParentContext;
+ import com.softschool.backend.service.ParentUtil;
++import com.softschool.backend.service.StudentCacheService;
++import com.softschool.backend.service.StudentCacheService.CachedFile;
+ import jakarta.servlet.http.HttpServletRequest;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.data.domain.PageRequest;
+@@ -19,6 +24,7 @@ import org.springframework.http.ResponseEntity;
+ import org.springframework.web.bind.annotation.*;
+ 
+ import java.io.IOException;
++import java.io.UncheckedIOException;
+ import java.nio.file.Files;
+ import java.nio.file.Path;
+ import java.time.Instant;
+@@ -45,12 +51,18 @@ import java.util.*;
+  *   GET /api/parent/children/{regNo}/teachers
+  *
+  * Chat is in ParentMessageController, applications/complaints/feedback in ParentSubmissionController.
++ *
++ * PERFORMANCE: authorisation ALWAYS runs first (ctx + child checks) and is never cached; only the data
++ * built for an already-authorised child is cached, per school and child, in DataCacheService. Each entry
++ * names the kinds of rows it depends on, so it is dropped as soon as the school changes any of them.
+  */
+ @RestController
+ @RequestMapping("/api/parent")
+ public class ParentPortalController {
+ 
+     private static final int MAX_LIST = 200;
++    /** Safety-net lifetime of a cached view; real freshness comes from the invalidation listeners. */
++    private static final long TTL = 60;
+ 
+     @Autowired private ParentContext parentContext;
+     @Autowired private SchoolRepository schoolRepository;
+@@ -65,6 +77,8 @@ public class ParentPortalController {
+     @Autowired private ExamResultRepository resultRepository;
+     @Autowired private ParentStaffRepository staffRepository;
+     @Autowired private FileStorageService fileStorageService;
++    @Autowired private DataCacheService cache;
++    @Autowired private StudentCacheService studentCache;
+ 
+     private final ObjectMapper mapper = new ObjectMapper();
+ 
+@@ -105,19 +119,44 @@ public class ParentPortalController {
+         return ResponseEntity.ok(out);
+     }
+ 
++    /**
++     * The child's photo. PERFORMANCE: served from the same in-memory file cache the admin pages use
++     * (StudentCacheService), so a page load no longer loads the child's whole student row (every
++     * LONGTEXT column included) from MySQL and re-decodes it. The entry is dropped automatically when
++     * that student's row changes.
++     */
+     @GetMapping("/children/{regNo}/photo")
+     public ResponseEntity<?> photo(@PathVariable String regNo, HttpServletRequest req) {
+         ParentContext.Ctx ctx = parentContext.resolve(req);
+         if (ctx == null) return ParentUtil.error(HttpStatus.UNAUTHORIZED, "Please log in again.");
+         if (ctx.child(regNo) == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
+-        Student s = studentRepository.findByRegNoAndSchoolId(regNo, ctx.schoolId).orElse(null);
++
++        final String schoolId = ctx.schoolId;
++        CachedFile file;
++        try {
++            file = studentCache.getFile(schoolId, "photo", regNo, () -> loadPhoto(schoolId, regNo));
++        } catch (UncheckedIOException e) {
++            return ResponseEntity.notFound().build();
++        }
++        if (file == null || file.mediaType() == null || !file.mediaType().startsWith("image/")) {
++            return ResponseEntity.notFound().build();
++        }
++        return ResponseEntity.ok().header("Content-Type", file.mediaType())
++                .header("Cache-Control", "private, max-age=3600")
++                .header("X-Content-Type-Options", "nosniff")
++                .body(file.bytes());
++    }
++
++    /** Reads and decodes the stored photo; null when there is nothing usable (never cached). */
++    private CachedFile loadPhoto(String schoolId, String regNo) {
++        Student s = studentRepository.findByRegNoAndSchoolId(regNo, schoolId).orElse(null);
+         String stored = s == null ? null : s.getPhoto();
+-        if (stored == null || stored.isBlank()) return ResponseEntity.notFound().build();
++        if (stored == null || stored.isBlank()) return null;
+         try {
+             byte[] bytes;
+             if (fileStorageService.isManagedPath(stored)) {
+                 Path f = fileStorageService.resolve(stored);
+-                if (!Files.exists(f)) return ResponseEntity.notFound().build();
++                if (!Files.exists(f)) return null;
+                 bytes = Files.readAllBytes(f);
+             } else {
+                 // Older rows hold the picture inline, as bare base64 or a data: URI.
+@@ -127,13 +166,9 @@ public class ParentPortalController {
+                 bytes = Base64.getMimeDecoder().decode(b64);
+             }
+             String type = FileStorageService.detectMediaType(bytes);
+-            if (type == null || !type.startsWith("image/")) return ResponseEntity.notFound().build();
+-            return ResponseEntity.ok().header("Content-Type", type)
+-                    .header("Cache-Control", "private, max-age=3600")
+-                    .header("X-Content-Type-Options", "nosniff")
+-                    .body(bytes);
++            return type == null ? null : new CachedFile(bytes, type);
+         } catch (IOException | IllegalArgumentException | SecurityException e) {
+-            return ResponseEntity.notFound().build();
++            return null;
+         }
+     }
+ 
+@@ -152,20 +187,31 @@ public class ParentPortalController {
+         if (ctx == null) return ParentUtil.error(HttpStatus.UNAUTHORIZED, "Please log in again.");
+         if (ctx.child(regNo) == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
+ 
+-        YearMonth ym = null;
++        YearMonth parsed = null;
+         if (month != null && !month.isBlank()) {
+-            try { ym = YearMonth.parse(month.trim()); }
++            try { parsed = YearMonth.parse(month.trim()); }
+             catch (Exception e) { return ParentUtil.error(HttpStatus.BAD_REQUEST, "month must look like 2026-10."); }
+         }
+-        LocalDate from = ym != null ? ym.atDay(1) : LocalDate.now().minusDays(150);
+-        LocalDate to = ym != null ? ym.atEndOfMonth() : LocalDate.now();
++        final YearMonth ym = parsed;
++        final LocalDate today = LocalDate.now();
++        final LocalDate from = ym != null ? ym.atDay(1) : today.minusDays(150);
++        final LocalDate to = ym != null ? ym.atEndOfMonth() : today;
++        // The rolling "last 150 days" window moves at midnight, so today's date is part of that key.
++        String key = "att|" + regNo + "|" + (ym == null ? "recent:" + today : ym.toString());
++
++        Map<String, Object> out = cache.get(ctx.schoolId, key, TTL,
++                () -> buildAttendance(ctx.schoolId, regNo, ym, from, to), Dep.ATTENDANCE);
++        return ResponseEntity.ok(out);
++    }
+ 
++    private Map<String, Object> buildAttendance(String schoolId, String regNo, YearMonth ym,
++                                                LocalDate from, LocalDate to) {
+         Map<String, String> days = new TreeMap<>();
+         Map<String, Object> details = new TreeMap<>();
+         int present = 0, absent = 0, leave = 0;
+-        for (Attendance a : attendanceRepository.findByMemberIdAndSchoolIdOrderByDateDesc(regNo, ctx.schoolId)) {
++        // Only the six plain columns, only inside the window (idx_att_member) - no capturedPhoto LONGTEXT.
++        for (ParentAttendanceDTO a : attendanceRepository.findParentView(schoolId, regNo, from, to)) {
+             if (!"STUDENT".equalsIgnoreCase(a.getMemberType()) || a.getDate() == null) continue;
+-            if (a.getDate().isBefore(from) || a.getDate().isAfter(to)) continue;
+             String st = ParentUtil.normalizeAttendance(a.getStatus());
+             String key = a.getDate().toString();
+             days.put(key, st);
+@@ -187,7 +233,7 @@ public class ParentPortalController {
+         out.put("days", days);
+         out.put("details", details);
+         out.put("summary", summary);
+-        return ResponseEntity.ok(out);
++        return out;
+     }
+ 
+     // ───────────── FEES ─────────────
+@@ -206,7 +252,15 @@ public class ParentPortalController {
+         if (ctx == null) return ParentUtil.error(HttpStatus.UNAUTHORIZED, "Please log in again.");
+         if (ctx.child(regNo) == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
+ 
+-        SchoolSettings ss = settingsRepository.findBySchoolId(ctx.schoolId).orElse(null);
++        // "due" turns into "overdue" as days pass, so today's date is part of the key.
++        String key = "fees|" + regNo + "|" + LocalDate.now();
++        Map<String, Object> out = cache.get(ctx.schoolId, key, TTL,
++                () -> buildFees(ctx.schoolId, regNo), Dep.FINANCE, Dep.SETTINGS);
++        return ResponseEntity.ok(out);
++    }
++
++    private Map<String, Object> buildFees(String schoolId, String regNo) {
++        SchoolSettings ss = settingsRepository.findBySchoolId(schoolId).orElse(null);
+         int deadlineDay = ss == null || ss.getLateFeeDeadlineDay() == null ? 10 : ss.getLateFeeDeadlineDay();
+         int grace = ss == null || ss.getLateFeeGrace() == null ? 0 : ss.getLateFeeGrace();
+         boolean lateOn = ss != null && !Boolean.FALSE.equals(ss.getLateFeeEnabled());
+@@ -214,7 +268,7 @@ public class ParentPortalController {
+         double lateAmount = ss == null || ss.getLateFeeAmount() == null ? 0.0 : ss.getLateFeeAmount();
+ 
+         List<Finance> rows = new ArrayList<>();
+-        for (Finance f : financeRepository.findBySchoolIdAndRegNo(ctx.schoolId, regNo)) {
++        for (Finance f : financeRepository.findBySchoolIdAndRegNo(schoolId, regNo)) {
+             if (Finance.TYPE_STUDENT_FEE.equals(f.getRecordType()) && f.getMonthKey() != null
+                     && f.getMonthKey().matches("\\d{4}-\\d{2}")) rows.add(f);
+         }
+@@ -256,7 +310,7 @@ public class ParentPortalController {
+         Map<String, Object> out = new LinkedHashMap<>();
+         out.put("outstanding", ParentUtil.round2(outstanding));
+         out.put("fees", list);
+-        return ResponseEntity.ok(out);
++        return out;
+     }
+ 
+     // ───────────── DIARY ─────────────
+@@ -267,9 +321,15 @@ public class ParentPortalController {
+         ParentChildDTO child = ctx.child(regNo);
+         if (child == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
+ 
++        List<Map<String, Object>> out = cache.get(ctx.schoolId, "diary|" + regNo, TTL,
++                () -> buildDiary(ctx.schoolId, regNo, child), Dep.DIARY, Dep.STUDENTS);
++        return ResponseEntity.ok(out);
++    }
++
++    private List<Map<String, Object>> buildDiary(String schoolId, String regNo, ParentChildDTO child) {
+         List<Map<String, Object>> out = new ArrayList<>();
+         for (DiaryEntry d : diaryRepository.findBySchoolIdAndClassNameAndPublishedTrueOrderByCreatedAtDesc(
+-                ctx.schoolId, ParentUtil.classLabel(child), PageRequest.of(0, MAX_LIST))) {
++                schoolId, ParentUtil.classLabel(child), PageRequest.of(0, MAX_LIST))) {
+             int count = d.getImagePaths() == null || d.getImagePaths().isBlank() ? 0 : d.getImagePaths().split("\n").length;
+             List<String> urls = new ArrayList<>();
+             for (int i = 0; i < count; i++) urls.add("/api/parent/children/" + regNo + "/diary/" + d.getId() + "/image/" + i);
+@@ -284,7 +344,7 @@ public class ParentPortalController {
+             m.put("createdAt", d.getCreatedAt().toString());
+             out.add(m);
+         }
+-        return ResponseEntity.ok(out);
++        return out;
+     }
+ 
+     @GetMapping("/children/{regNo}/diary/{id}/image/{n}")
+@@ -325,10 +385,16 @@ public class ParentPortalController {
+         ParentChildDTO child = ctx.child(regNo);
+         if (child == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
+ 
++        List<Map<String, Object>> out = cache.get(ctx.schoolId, "ann|" + regNo, TTL,
++                () -> buildAnnouncements(ctx.schoolId, child), Dep.ANNOUNCEMENTS, Dep.STUDENTS);
++        return ResponseEntity.ok(out);
++    }
++
++    private List<Map<String, Object>> buildAnnouncements(String schoolId, ParentChildDTO child) {
+         Instant fresh = Instant.now().minus(3, ChronoUnit.DAYS);
+         List<Map<String, Object>> out = new ArrayList<>();
+         for (Announcement a : announcementRepository.findBySchoolIdAndAudienceOrderByCreatedAtDesc(
+-                ctx.schoolId, Announcement.AUD_CLASS, PageRequest.of(0, MAX_LIST))) {
++                schoolId, Announcement.AUD_CLASS, PageRequest.of(0, MAX_LIST))) {
+             if (!ParentUtil.classMatches(a.getClassName(), child)) continue;
+             Map<String, Object> m = new LinkedHashMap<>();
+             m.put("id", a.getId());
+@@ -342,7 +408,7 @@ public class ParentPortalController {
+             m.put("isNew", a.getCreatedAt().isAfter(fresh));
+             out.add(m);
+         }
+-        return ResponseEntity.ok(out);
++        return out;
+     }
+ 
+     // ───────────── TESTS ─────────────
+@@ -357,9 +423,15 @@ public class ParentPortalController {
+         ParentChildDTO child = ctx.child(regNo);
+         if (child == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
+ 
++        List<Map<String, Object>> out = cache.get(ctx.schoolId, "tests|" + regNo, TTL,
++                () -> buildTests(ctx.schoolId, regNo, child), Dep.TESTS, Dep.STUDENTS);
++        return ResponseEntity.ok(out);
++    }
++
++    private List<Map<String, Object>> buildTests(String schoolId, String regNo, ParentChildDTO child) {
+         String cls = child.getStudentClass() == null ? "" : child.getStudentClass().trim();
+         List<Map<String, Object>> out = new ArrayList<>();
+-        for (TeacherTest t : testRepository.findForClass(ctx.schoolId, ParentUtil.classLabel(child), cls, PageRequest.of(0, 150))) {
++        for (TeacherTest t : testRepository.findForClass(schoolId, ParentUtil.classLabel(child), cls, PageRequest.of(0, 150))) {
+             JsonNode p;
+             try { p = mapper.readTree(t.getPayloadJson()); } catch (Exception e) { continue; }
+             if (!p.isObject()) continue;
+@@ -387,7 +459,7 @@ public class ParentPortalController {
+             m.put("status", marked ? "marked" : "pending");
+             out.add(m);
+         }
+-        return ResponseEntity.ok(out);
++        return out;
+     }
+ 
+     // ───────────── TIMETABLE ─────────────
+@@ -399,14 +471,20 @@ public class ParentPortalController {
+         ParentChildDTO child = ctx.child(regNo);
+         if (child == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
+ 
+-        ClassTimetable tt = timetableRepository.findBySchoolIdAndClassNameIgnoreCase(ctx.schoolId, ParentUtil.classLabel(child)).orElse(null);
++        ObjectNode out = cache.get(ctx.schoolId, "tt|" + regNo, TTL,
++                () -> buildTimetable(ctx.schoolId, child), Dep.TIMETABLE, Dep.STUDENTS);
++        return ResponseEntity.ok(out);
++    }
++
++    private ObjectNode buildTimetable(String schoolId, ParentChildDTO child) {
++        ClassTimetable tt = timetableRepository.findBySchoolIdAndClassNameIgnoreCase(schoolId, ParentUtil.classLabel(child)).orElse(null);
+         if (tt == null && child.getStudentClass() != null && !child.getStudentClass().isBlank()) {
+-            tt = timetableRepository.findBySchoolIdAndClassNameIgnoreCase(ctx.schoolId, child.getStudentClass().trim()).orElse(null);
++            tt = timetableRepository.findBySchoolIdAndClassNameIgnoreCase(schoolId, child.getStudentClass().trim()).orElse(null);
+         }
+         ObjectNode out = mapper.createObjectNode();
+         if (tt == null) {
+             out.put("available", false);
+-            return ResponseEntity.ok(out);
++            return out;
+         }
+         try {
+             JsonNode p = mapper.readTree(tt.getPayloadJson());
+@@ -415,7 +493,7 @@ public class ParentPortalController {
+         out.put("available", true);
+         out.put("className", tt.getClassName());
+         out.put("updatedAt", tt.getUpdatedAt().toString());
+-        return ResponseEntity.ok(out);
++        return out;
+     }
+ 
+     // ───────────── RESULTS ─────────────
+@@ -426,14 +504,20 @@ public class ParentPortalController {
+         if (ctx == null) return ParentUtil.error(HttpStatus.UNAUTHORIZED, "Please log in again.");
+         if (ctx.child(regNo) == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
+ 
++        ObjectNode out = cache.get(ctx.schoolId, "res|" + regNo, TTL,
++                () -> buildResults(ctx.schoolId, regNo), Dep.RESULTS);
++        return ResponseEntity.ok(out);
++    }
++
++    private ObjectNode buildResults(String schoolId, String regNo) {
+         ObjectNode out = mapper.createObjectNode();
+-        for (ExamResult r : resultRepository.findBySchoolIdAndRegNoAndVisibleTrue(ctx.schoolId, regNo)) {
++        for (ExamResult r : resultRepository.findBySchoolIdAndRegNoAndVisibleTrue(schoolId, regNo)) {
+             try {
+                 ObjectNode session = out.has(r.getSession()) ? (ObjectNode) out.get(r.getSession()) : out.putObject(r.getSession());
+                 session.set(r.getTerm(), mapper.readTree(r.getPayloadJson()));
+             } catch (Exception ignored) { /* skip a corrupt row */ }
+         }
+-        return ResponseEntity.ok(out);
++        return out;
+     }
+ 
+     // ───────────── TEACHERS (who can this parent message?) ─────────────
+@@ -444,9 +528,15 @@ public class ParentPortalController {
+         ParentChildDTO child = ctx.child(regNo);
+         if (child == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
+ 
++        List<Map<String, Object>> out = cache.get(ctx.schoolId, "teachers|" + regNo, TTL,
++                () -> buildTeachers(ctx.schoolId, child), Dep.STAFF, Dep.STUDENTS);
++        return ResponseEntity.ok(out);
++    }
++
++    private List<Map<String, Object>> buildTeachers(String schoolId, ParentChildDTO child) {
+         String label = ParentUtil.classLabel(child);
+         List<Map<String, Object>> out = new ArrayList<>();
+-        for (ParentTeacherDTO t : staffRepository.findTeachersBySchoolId(ctx.schoolId)) {
++        for (ParentTeacherDTO t : staffRepository.findTeachersBySchoolId(schoolId)) {
+             if (!ParentUtil.teachesClass(t, label)) continue;
+             Map<String, Object> m = new LinkedHashMap<>();
+             m.put("staffId", t.getStaffId());
+@@ -454,6 +544,6 @@ public class ParentPortalController {
+             m.put("subject", t.getSubjects());
+             out.add(m);
+         }
+-        return ResponseEntity.ok(out);
++        return out;
+     }
+ }
+diff --git a/src/main/java/com/softschool/backend/dto/ParentAttendanceDTO.java b/src/main/java/com/softschool/backend/dto/ParentAttendanceDTO.java
+new file mode 100644
+index 0000000..bc21556
+--- /dev/null
++++ b/src/main/java/com/softschool/backend/dto/ParentAttendanceDTO.java
+@@ -0,0 +1,35 @@
++package com.softschool.backend.dto;
++
++import java.time.LocalDate;
++import java.time.LocalTime;
++
++/**
++ * Light projection of Attendance for the parent portal: the six plain columns the attendance screen
++ * shows, and NEVER capturedPhoto (a LONGTEXT that the old query dragged along for every day of the
++ * child's history). Populated by a JPQL constructor expression in AttendanceRepository.
++ */
++public class ParentAttendanceDTO {
++    private final String memberType;
++    private final LocalDate date;
++    private final String status;
++    private final String reason;
++    private final LocalTime checkIn;
++    private final LocalTime checkOut;
++
++    public ParentAttendanceDTO(String memberType, LocalDate date, String status, String reason,
++                               LocalTime checkIn, LocalTime checkOut) {
++        this.memberType = memberType;
++        this.date = date;
++        this.status = status;
++        this.reason = reason;
++        this.checkIn = checkIn;
++        this.checkOut = checkOut;
++    }
++
++    public String getMemberType() { return memberType; }
++    public LocalDate getDate() { return date; }
++    public String getStatus() { return status; }
++    public String getReason() { return reason; }
++    public LocalTime getCheckIn() { return checkIn; }
++    public LocalTime getCheckOut() { return checkOut; }
++}
+diff --git a/src/main/java/com/softschool/backend/model/Announcement.java b/src/main/java/com/softschool/backend/model/Announcement.java
+index 4ea0438..86df67f 100644
+--- a/src/main/java/com/softschool/backend/model/Announcement.java
++++ b/src/main/java/com/softschool/backend/model/Announcement.java
+@@ -24,10 +24,13 @@ import java.time.Instant;
+ @Entity
+ @Data
+ @JsonIgnoreProperties(ignoreUnknown = true)
++@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
+ @Table(name = "announcement",
+        indexes = {
+            @Index(name = "idx_ann_school_created", columnList = "schoolId,createdAt"),
+-           @Index(name = "idx_ann_school_audience", columnList = "schoolId,audience")
++           @Index(name = "idx_ann_school_audience", columnList = "schoolId,audience"),
++           // parent portal: class notices newest first, without a sort
++           @Index(name = "idx_ann_school_aud_created", columnList = "schoolId,audience,createdAt")
+        })
+ public class Announcement {
+ 
+diff --git a/src/main/java/com/softschool/backend/model/Attendance.java b/src/main/java/com/softschool/backend/model/Attendance.java
+index 72e84d0..5ce7b3e 100644
+--- a/src/main/java/com/softschool/backend/model/Attendance.java
++++ b/src/main/java/com/softschool/backend/model/Attendance.java
+@@ -7,7 +7,16 @@ import java.time.LocalDate;
+ 
+ @Entity
+ @Data
+-@Table(name = "attendance")
++@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
++@Table(name = "attendance",
++       indexes = {
++           // parent portal + history: one person's records, newest first
++           @Index(name = "idx_att_member", columnList = "schoolId,memberId,attendance_date"),
++           // dashboard "present today", reports: everything for one day
++           @Index(name = "idx_att_school_date", columnList = "schoolId,attendance_date"),
++           // student / staff roster for one day
++           @Index(name = "idx_att_school_type_date", columnList = "schoolId,memberType,attendance_date")
++       })
+ public class Attendance {
+     @Id
+     @GeneratedValue(strategy = GenerationType.IDENTITY)
+diff --git a/src/main/java/com/softschool/backend/model/ClassTimetable.java b/src/main/java/com/softschool/backend/model/ClassTimetable.java
+index a70a379..5a3d25b 100644
+--- a/src/main/java/com/softschool/backend/model/ClassTimetable.java
++++ b/src/main/java/com/softschool/backend/model/ClassTimetable.java
+@@ -14,6 +14,7 @@ import java.time.Instant;
+  */
+ @Entity
+ @Data
++@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
+ @Table(name = "class_timetable",
+        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "className"}))
+ public class ClassTimetable {
+diff --git a/src/main/java/com/softschool/backend/model/DiaryEntry.java b/src/main/java/com/softschool/backend/model/DiaryEntry.java
+index e3c53db..35e3017 100644
+--- a/src/main/java/com/softschool/backend/model/DiaryEntry.java
++++ b/src/main/java/com/softschool/backend/model/DiaryEntry.java
+@@ -18,6 +18,7 @@ import java.time.Instant;
+  */
+ @Entity
+ @Data
++@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
+ @Table(name = "diary_entry",
+        indexes = {
+            @Index(name = "idx_diary_staff", columnList = "schoolId,staffId,createdAt"),
+diff --git a/src/main/java/com/softschool/backend/model/ExamResult.java b/src/main/java/com/softschool/backend/model/ExamResult.java
+index 9c9146f..b063a5f 100644
+--- a/src/main/java/com/softschool/backend/model/ExamResult.java
++++ b/src/main/java/com/softschool/backend/model/ExamResult.java
+@@ -12,6 +12,7 @@ import java.time.Instant;
+  */
+ @Entity
+ @Data
++@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
+ @Table(name = "exam_result",
+        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "regNo", "session", "term"}),
+        indexes = @Index(name = "idx_examres_student", columnList = "schoolId,regNo"))
+diff --git a/src/main/java/com/softschool/backend/model/Finance.java b/src/main/java/com/softschool/backend/model/Finance.java
+index e2c4ae9..db375de 100644
+--- a/src/main/java/com/softschool/backend/model/Finance.java
++++ b/src/main/java/com/softschool/backend/model/Finance.java
+@@ -53,6 +53,7 @@ import java.util.Date;
+  * frontend still sends don't cause a 400 on save.
+  */
+ @Entity
++@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
+ @Table(
+     name = "finance",
+     indexes = {
+diff --git a/src/main/java/com/softschool/backend/model/Message.java b/src/main/java/com/softschool/backend/model/Message.java
+index 15725e0..89e51dd 100644
+--- a/src/main/java/com/softschool/backend/model/Message.java
++++ b/src/main/java/com/softschool/backend/model/Message.java
+@@ -23,11 +23,14 @@ import java.time.Instant;
+  */
+ @Entity
+ @Data
++@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
+ @Table(name = "teacher_message",
+        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "staffId", "clientId"}),
+        indexes = {
+            @Index(name = "idx_tmsg_thread", columnList = "schoolId,staffId,createdAt"),
+-           @Index(name = "idx_tmsg_student", columnList = "schoolId,studentRegNo,createdAt")
++           @Index(name = "idx_tmsg_student", columnList = "schoolId,studentRegNo,createdAt"),
++           // class broadcasts to parents: (school, channel, class) newest first
++           @Index(name = "idx_tmsg_channel_class", columnList = "schoolId,channel,className,createdAt")
+        })
+ public class Message {
+ 
+diff --git a/src/main/java/com/softschool/backend/model/ParentAccount.java b/src/main/java/com/softschool/backend/model/ParentAccount.java
+index fc4cd89..44759b0 100644
+--- a/src/main/java/com/softschool/backend/model/ParentAccount.java
++++ b/src/main/java/com/softschool/backend/model/ParentAccount.java
+@@ -18,6 +18,7 @@ import java.time.Instant;
+  */
+ @Entity
+ @Data
++@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
+ @Table(name = "parent_account",
+        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "phone"}))
+ public class ParentAccount {
+diff --git a/src/main/java/com/softschool/backend/model/ParentLinkedChild.java b/src/main/java/com/softschool/backend/model/ParentLinkedChild.java
+index 61a85b7..339e14f 100644
+--- a/src/main/java/com/softschool/backend/model/ParentLinkedChild.java
++++ b/src/main/java/com/softschool/backend/model/ParentLinkedChild.java
+@@ -12,6 +12,7 @@ import java.time.Instant;
+  */
+ @Entity
+ @Data
++@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
+ @Table(name = "parent_linked_child",
+        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "phone", "regNo"}))
+ public class ParentLinkedChild {
+diff --git a/src/main/java/com/softschool/backend/model/ParentReadMark.java b/src/main/java/com/softschool/backend/model/ParentReadMark.java
+index b5951d1..76fdc47 100644
+--- a/src/main/java/com/softschool/backend/model/ParentReadMark.java
++++ b/src/main/java/com/softschool/backend/model/ParentReadMark.java
+@@ -13,6 +13,7 @@ import java.time.Instant;
+  */
+ @Entity
+ @Data
++@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
+ @Table(name = "parent_read_mark",
+        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "phone", "threadKey"}))
+ public class ParentReadMark {
+diff --git a/src/main/java/com/softschool/backend/model/SchoolSettings.java b/src/main/java/com/softschool/backend/model/SchoolSettings.java
+index e95b87e..e4b9d37 100644
+--- a/src/main/java/com/softschool/backend/model/SchoolSettings.java
++++ b/src/main/java/com/softschool/backend/model/SchoolSettings.java
+@@ -20,6 +20,7 @@ import java.util.List;
+  * Blocking/unblocking a school does NOT touch this table.
+  */
+ @Entity
++@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
+ @Table(name = "school_settings")
+ public class SchoolSettings {
+ 
+diff --git a/src/main/java/com/softschool/backend/model/Staff.java b/src/main/java/com/softschool/backend/model/Staff.java
+index fa933b2..26211a6 100644
+--- a/src/main/java/com/softschool/backend/model/Staff.java
++++ b/src/main/java/com/softschool/backend/model/Staff.java
+@@ -25,8 +25,10 @@ import lombok.Data;
+  * guardianName) don't cause a 400 on save.
+  */
+ @Entity
++@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
+ @Table(name = "staff",
+-       uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "staffId"}))
++       uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "staffId"}),
++       indexes = @Index(name = "idx_staff_school_type", columnList = "schoolId,type"))
+ @Data
+ @JsonIgnoreProperties(ignoreUnknown = true)
+ public class Staff {
+diff --git a/src/main/java/com/softschool/backend/model/Student.java b/src/main/java/com/softschool/backend/model/Student.java
+index 6cbab23..2f72a65 100644
+--- a/src/main/java/com/softschool/backend/model/Student.java
++++ b/src/main/java/com/softschool/backend/model/Student.java
+@@ -7,7 +7,15 @@ import java.util.Date;
+ 
+ @Entity
+ @Table(name = "students",
+-       uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "regNo"}))
++       uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "regNo"}),
++       indexes = {
++           // every "active students of a school" query (parent portal, dashboards)
++           @Index(name = "idx_students_school_status", columnList = "schoolId,status"),
++           // sibling lookups in the parent portal
++           @Index(name = "idx_students_school_sibling", columnList = "schoolId,siblingGroupId"),
++           // class rosters
++           @Index(name = "idx_students_school_class", columnList = "schoolId,studentClass")
++       })
+ // Clears the server-side student cache on every insert/update/delete of a row,
+ // whichever controller caused it. See StudentCacheService.
+ @EntityListeners(com.softschool.backend.service.StudentCacheInvalidationListener.class)
+diff --git a/src/main/java/com/softschool/backend/model/TeacherTest.java b/src/main/java/com/softschool/backend/model/TeacherTest.java
+index 5612244..0def71a 100644
+--- a/src/main/java/com/softschool/backend/model/TeacherTest.java
++++ b/src/main/java/com/softschool/backend/model/TeacherTest.java
+@@ -15,9 +15,14 @@ import java.time.Instant;
+  */
+ @Entity
+ @Data
++@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
+ @Table(name = "teacher_test",
+        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "staffId", "testId"}),
+-       indexes = @Index(name = "idx_tt_school_staff", columnList = "schoolId,staffId"))
++       indexes = {
++           @Index(name = "idx_tt_school_staff", columnList = "schoolId,staffId"),
++           // parent portal: tests of one class, newest first
++           @Index(name = "idx_tt_school_class", columnList = "schoolId,className,updatedAt")
++       })
+ public class TeacherTest {
+ 
+     @Id
+diff --git a/src/main/java/com/softschool/backend/repository/AnnouncementRepository.java b/src/main/java/com/softschool/backend/repository/AnnouncementRepository.java
+index f41919c..e9402a4 100644
+--- a/src/main/java/com/softschool/backend/repository/AnnouncementRepository.java
++++ b/src/main/java/com/softschool/backend/repository/AnnouncementRepository.java
+@@ -27,6 +27,17 @@ public interface AnnouncementRepository extends JpaRepository<Announcement, Long
+     /** Admin inbox: messages teachers sent to the admin. */
+     List<Announcement> findBySchoolIdAndAudienceOrderByCreatedAtDesc(String schoolId, String audience, Pageable pageable);
+ 
++    /**
++     * PERFORMANCE — parent portal /pulse. Only the id and class of the newest notices of one audience;
++     * the pulse never needs the title/body, and it runs every few seconds for every open portal.
++     * Each row is {id (Long), className (String)}, newest first.
++     */
++    @Query("select a.id, a.className from Announcement a where a.schoolId = :schoolId " +
++           "and a.audience = :audience order by a.createdAt desc")
++    List<Object[]> findIdAndClassBySchoolIdAndAudience(@Param("schoolId") String schoolId,
++                                                       @Param("audience") String audience,
++                                                       Pageable pageable);
++
+     Optional<Announcement> findByIdAndSchoolId(Long id, String schoolId);
+ 
+     /** Spam guard for teacher sends. */
+diff --git a/src/main/java/com/softschool/backend/repository/AttendanceRepository.java b/src/main/java/com/softschool/backend/repository/AttendanceRepository.java
+index 1180b0e..882e1bc 100644
+--- a/src/main/java/com/softschool/backend/repository/AttendanceRepository.java
++++ b/src/main/java/com/softschool/backend/repository/AttendanceRepository.java
+@@ -1,7 +1,10 @@
+ package com.softschool.backend.repository;
+ 
++import com.softschool.backend.dto.ParentAttendanceDTO;
+ import com.softschool.backend.model.Attendance;
+ import org.springframework.data.jpa.repository.JpaRepository;
++import org.springframework.data.jpa.repository.Query;
++import org.springframework.data.repository.query.Param;
+ import org.springframework.stereotype.Repository;
+ 
+ import java.time.LocalDate;
+@@ -32,6 +35,19 @@ public interface AttendanceRepository extends JpaRepository<Attendance, Long> {
+     // that happens to match one in another school never leaks in).
+     List<Attendance> findByMemberIdAndSchoolIdOrderByDateDesc(String memberId, String schoolId);
+ 
++    // PERFORMANCE — parent portal attendance screen. One person's rows inside a date window, selecting
++    // ONLY the six plain columns the screen shows. The old call (findByMemberIdAndSchoolIdOrderByDateDesc
++    // above) loaded the child's whole history including every capturedPhoto LONGTEXT and then threw
++    // most of it away in Java. Uses idx_att_member (schoolId, memberId, attendance_date).
++    @Query("select new com.softschool.backend.dto.ParentAttendanceDTO(" +
++           "a.memberType, a.date, a.status, a.reason, a.checkIn, a.checkOut) " +
++           "from Attendance a where a.schoolId = :schoolId and a.memberId = :memberId " +
++           "and a.date >= :fromDate and a.date <= :toDate")
++    List<ParentAttendanceDTO> findParentView(@Param("schoolId") String schoolId,
++                                             @Param("memberId") String memberId,
++                                             @Param("fromDate") LocalDate fromDate,
++                                             @Param("toDate") LocalDate toDate);
++
+     // Every STAFF attendance row for one school within a date range, in a
+     // single query — used by StaffController#applyAbsenceFines to count
+     // this month's absent days for every staff member at once instead of
+diff --git a/src/main/java/com/softschool/backend/repository/DiaryEntryRepository.java b/src/main/java/com/softschool/backend/repository/DiaryEntryRepository.java
+index ac632b5..47bb62c 100644
+--- a/src/main/java/com/softschool/backend/repository/DiaryEntryRepository.java
++++ b/src/main/java/com/softschool/backend/repository/DiaryEntryRepository.java
+@@ -17,6 +17,12 @@ public interface DiaryEntryRepository extends JpaRepository<DiaryEntry, Long> {
+     /** What the parent portal will show: published entries of one class. */
+     List<DiaryEntry> findBySchoolIdAndClassNameAndPublishedTrueOrderByCreatedAtDesc(String schoolId, String className, Pageable pageable);
+ 
++    /** PERFORMANCE - parent /pulse: only the newest published entry id of one class (null when none). */
++    @org.springframework.data.jpa.repository.Query(
++        "select max(d.id) from DiaryEntry d where d.schoolId = :schoolId and d.className = :className and d.published = true")
++    Long findNewestPublishedId(@org.springframework.data.repository.query.Param("schoolId") String schoolId,
++                               @org.springframework.data.repository.query.Param("className") String className);
++
+     Optional<DiaryEntry> findByIdAndSchoolId(Long id, String schoolId);
+ 
+     long countBySchoolIdAndStaffIdAndCreatedAtAfter(String schoolId, String staffId, Instant after);
+diff --git a/src/main/java/com/softschool/backend/repository/ExamResultRepository.java b/src/main/java/com/softschool/backend/repository/ExamResultRepository.java
+index 66ee764..19e4486 100644
+--- a/src/main/java/com/softschool/backend/repository/ExamResultRepository.java
++++ b/src/main/java/com/softschool/backend/repository/ExamResultRepository.java
+@@ -12,6 +12,9 @@ public interface ExamResultRepository extends JpaRepository<ExamResult, Long> {
+     /** What a parent may see: only results the admin has sent. */
+     List<ExamResult> findBySchoolIdAndRegNoAndVisibleTrue(String schoolId, String regNo);
+ 
++    /** PERFORMANCE - parent /pulse: how many results the admin has sent for this child. */
++    long countBySchoolIdAndRegNoAndVisibleTrue(String schoolId, String regNo);
++
+     /** Admin: the send / hold status of a whole session + term. */
+     List<ExamResult> findBySchoolIdAndSessionAndTerm(String schoolId, String session, String term);
+ 
+diff --git a/src/main/java/com/softschool/backend/service/DataCacheInvalidationListener.java b/src/main/java/com/softschool/backend/service/DataCacheInvalidationListener.java
+new file mode 100644
+index 0000000..7fdc0a9
+--- /dev/null
++++ b/src/main/java/com/softschool/backend/service/DataCacheInvalidationListener.java
+@@ -0,0 +1,63 @@
++package com.softschool.backend.service;
++
++import com.softschool.backend.model.Announcement;
++import com.softschool.backend.model.Attendance;
++import com.softschool.backend.model.ClassTimetable;
++import com.softschool.backend.model.DiaryEntry;
++import com.softschool.backend.model.ExamResult;
++import com.softschool.backend.model.Finance;
++import com.softschool.backend.model.Message;
++import com.softschool.backend.model.ParentAccount;
++import com.softschool.backend.model.ParentLinkedChild;
++import com.softschool.backend.model.ParentReadMark;
++import com.softschool.backend.model.SchoolSettings;
++import com.softschool.backend.model.Staff;
++import com.softschool.backend.model.TeacherTest;
++import com.softschool.backend.service.DataCacheService.Dep;
++import jakarta.persistence.PostPersist;
++import jakarta.persistence.PostRemove;
++import jakarta.persistence.PostUpdate;
++
++/**
++ * JPA entity listener shared by every entity that {@link DataCacheService}
++ * caches reads of. It fires for EVERY insert, update and delete of such a row,
++ * whichever controller or service caused it, so no write path has to remember
++ * to clear a cache. (Student rows are handled by StudentCacheInvalidationListener.)
++ *
++ * Hibernate instantiates this class itself, so it holds no injected state.
++ */
++public class DataCacheInvalidationListener {
++
++    @PostPersist
++    @PostUpdate
++    @PostRemove
++    public void changed(Object entity) {
++        if (entity instanceof Attendance) {
++            DataCacheService.changed(Dep.ATTENDANCE, ((Attendance) entity).getSchoolId());
++        } else if (entity instanceof Finance) {
++            DataCacheService.changed(Dep.FINANCE, ((Finance) entity).getSchoolId());
++        } else if (entity instanceof Message) {
++            DataCacheService.changed(Dep.MESSAGES, ((Message) entity).getSchoolId());
++        } else if (entity instanceof ParentReadMark) {
++            DataCacheService.changed(Dep.READMARKS, ((ParentReadMark) entity).getSchoolId());
++        } else if (entity instanceof Announcement) {
++            DataCacheService.changed(Dep.ANNOUNCEMENTS, ((Announcement) entity).getSchoolId());
++        } else if (entity instanceof DiaryEntry) {
++            DataCacheService.changed(Dep.DIARY, ((DiaryEntry) entity).getSchoolId());
++        } else if (entity instanceof TeacherTest) {
++            DataCacheService.changed(Dep.TESTS, ((TeacherTest) entity).getSchoolId());
++        } else if (entity instanceof ClassTimetable) {
++            DataCacheService.changed(Dep.TIMETABLE, ((ClassTimetable) entity).getSchoolId());
++        } else if (entity instanceof ExamResult) {
++            DataCacheService.changed(Dep.RESULTS, ((ExamResult) entity).getSchoolId());
++        } else if (entity instanceof Staff) {
++            DataCacheService.changed(Dep.STAFF, ((Staff) entity).getSchoolId());
++        } else if (entity instanceof SchoolSettings) {
++            DataCacheService.changed(Dep.SETTINGS, ((SchoolSettings) entity).getSchoolId());
++        } else if (entity instanceof ParentAccount) {
++            DataCacheService.changed(Dep.ACCOUNTS, ((ParentAccount) entity).getSchoolId());
++        } else if (entity instanceof ParentLinkedChild) {
++            DataCacheService.changed(Dep.LINKS, ((ParentLinkedChild) entity).getSchoolId());
++        }
++    }
++}
+diff --git a/src/main/java/com/softschool/backend/service/DataCacheService.java b/src/main/java/com/softschool/backend/service/DataCacheService.java
+new file mode 100644
+index 0000000..0751af9
+--- /dev/null
++++ b/src/main/java/com/softschool/backend/service/DataCacheService.java
+@@ -0,0 +1,306 @@
++package com.softschool.backend.service;
++
++import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.github.benmanes.caffeine.cache.Cache;
++import com.github.benmanes.caffeine.cache.Caffeine;
++import com.github.benmanes.caffeine.cache.Expiry;
++import jakarta.annotation.PostConstruct;
++import jakarta.annotation.PreDestroy;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.support.TransactionSynchronization;
++import org.springframework.transaction.support.TransactionSynchronizationManager;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.UncheckedIOException;
++import java.time.Duration;
++import java.util.Collection;
++import java.util.LinkedHashSet;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.function.Supplier;
++import java.util.zip.GZIPOutputStream;
++
++/**
++ * General server-side read cache for the parent portal and the heavier admin
++ * reads (attendance, finance). It complements {@link StudentCacheService},
++ * which keeps handling the student endpoints and photos.
++ *
++ * HOW A CACHED VALUE STAYS FRESH
++ *  Every cached value declares which kinds of data it depends on ({@link Dep}).
++ *  The cache key contains the CURRENT version number of each of those
++ *  dependencies for that school. When any row of that kind is inserted,
++ *  updated or deleted (see {@link DataCacheInvalidationListener}), the school's
++ *  version for that kind goes up, so the next read builds a different key and
++ *  recomputes from MySQL. Nothing has to be searched or removed, so a write
++ *  costs one counter increment no matter how many entries exist. Old entries
++ *  are never read again and simply age out (TTL / size bound).
++ *
++ *  The version is bumped when the row is flushed AND again after the
++ *  transaction finishes, which closes the small window where a concurrent
++ *  reader could cache the old row under the new version just before the
++ *  commit lands (same idea as StudentCacheService).
++ *
++ *  The TTL is only the safety net for the cases that bypass JPA entity events
++ *  (bulk JPQL UPDATE/DELETE statements, or manual changes in MySQL).
++ *
++ * TWO FLAVOURS
++ *  - {@link #get}: stores the Java object (small results: parent portal views).
++ *    Bounded by an approximate weight (rows / entries), not by byte size.
++ *  - {@link #getJson}: stores the finished, gzipped JSON (large admin lists
++ *    that can carry big text columns). Bounded by BYTES, like the student cache.
++ *
++ * RULES FOR CALLERS
++ *  - A loader MUST NOT call this cache again (Caffeine forbids updating other
++ *    mappings from inside a loader). Do the nested reads before or after.
++ *  - Cached objects are shared between requests: treat them as read-only.
++ *  - Never cache something that depends on the caller's identity unless the
++ *    identity (e.g. the parent's phone) is part of the key.
++ *
++ * SINGLE-INSTANCE NOTE
++ *  This is an in-process cache. With more than one backend instance, a write on
++ *  instance A cannot reach instance B, so lower app.cache.data.ttl-seconds (for
++ *  example 10-15) or set DATA_CACHE_ENABLED=false.
++ */
++@Service
++public class DataCacheService {
++
++    private static final Logger log = LoggerFactory.getLogger(DataCacheService.class);
++
++    /** The kinds of rows a cached value can depend on. One entity maps to one kind. */
++    public enum Dep {
++        STUDENTS, STAFF, ATTENDANCE, FINANCE, DIARY, ANNOUNCEMENTS, TESTS,
++        TIMETABLE, RESULTS, MESSAGES, READMARKS, SETTINGS, ACCOUNTS, LINKS
++    }
++
++    private static final char SEP = '\u0000';
++    private static final long MAX_TTL_SECONDS = 3600;
++
++    /** Set once the bean exists so the JPA entity listener (not a Spring bean) can reach it. */
++    private static volatile DataCacheService instance;
++
++    private static final class Slot {
++        final Object value;
++        final int weight;
++        final long ttlNanos;
++
++        Slot(Object value, int weight, long ttlNanos) {
++            this.value = value;
++            this.weight = weight;
++            this.ttlNanos = ttlNanos;
++        }
++    }
++
++    /** Every entry carries its own time-to-live. */
++    private static final class SlotExpiry implements Expiry<String, Slot> {
++        @Override
++        public long expireAfterCreate(String key, Slot value, long currentTime) {
++            return value.ttlNanos;
++        }
++
++        @Override
++        public long expireAfterUpdate(String key, Slot value, long currentTime, long currentDuration) {
++            return value.ttlNanos;
++        }
++
++        @Override
++        public long expireAfterRead(String key, Slot value, long currentTime, long currentDuration) {
++            return currentDuration;
++        }
++    }
++
++    private final ObjectMapper objectMapper;
++    private final boolean enabled;
++    private final long defaultTtlSeconds;
++    private final long maxWeight;
++    private final long jsonMaxBytes;
++
++    private final ConcurrentHashMap<String, AtomicLong> versions = new ConcurrentHashMap<>();
++    private Cache<String, Slot> objects;
++    private Cache<String, StudentCacheService.CachedJson> jsons;
++
++    public DataCacheService(ObjectMapper objectMapper,
++                            @Value("${app.cache.data.enabled:true}") boolean enabled,
++                            @Value("${app.cache.data.ttl-seconds:60}") long ttlSeconds,
++                            @Value("${app.cache.data.max-weight:50000}") long maxWeight,
++                            @Value("${app.cache.data.json-max-mb:48}") long jsonMaxMb) {
++        this.objectMapper = objectMapper;
++        this.enabled = enabled;
++        this.defaultTtlSeconds = Math.max(1, Math.min(ttlSeconds, MAX_TTL_SECONDS));
++        this.maxWeight = Math.max(100, maxWeight);
++        this.jsonMaxBytes = Math.max(1, jsonMaxMb) * 1024L * 1024L;
++    }
++
++    @PostConstruct
++    void init() {
++        objects = Caffeine.newBuilder()
++                .maximumWeight(maxWeight)
++                .weigher((String k, Slot v) -> v.weight)
++                .expireAfter(new SlotExpiry())
++                .build();
++        jsons = Caffeine.newBuilder()
++                .maximumWeight(jsonMaxBytes)
++                .weigher((String k, StudentCacheService.CachedJson v) -> v.gzipBytes().length)
++                .expireAfterWrite(Duration.ofSeconds(defaultTtlSeconds))
++                .build();
++        instance = this;
++        log.info("Data cache {} (default ttl={}s, objects<={} weight units, json<={}MB)",
++                enabled ? "ENABLED" : "DISABLED", defaultTtlSeconds, maxWeight, jsonMaxBytes / (1024 * 1024));
++    }
++
++    @PreDestroy
++    void shutdown() {
++        if (instance == this) {
++            instance = null;
++        }
++    }
++
++    // ── Reads ───────────────────────────────────────────────────────────
++
++    /**
++     * Returns the cached object for (school, subKey, versions of deps), running
++     * {@code loader} only when it is not cached. Exceptions from the loader
++     * propagate and nothing is cached. A null result is cached too (until a
++     * dependency changes or the TTL passes).
++     *
++     * @param ttlSeconds how long the entry may live; 0 or less uses the default
++     */
++    @SuppressWarnings("unchecked")
++    public <T> T get(String schoolId, String subKey, long ttlSeconds, Supplier<T> loader, Dep... deps) {
++        if (!enabled || schoolId == null) {
++            return loader.get();
++        }
++        final long ttl = ttlSeconds <= 0 ? defaultTtlSeconds : Math.min(ttlSeconds, MAX_TTL_SECONDS);
++        Slot slot = objects.get(key(schoolId, subKey, deps), k -> {
++            T value = loader.get();
++            return new Slot(value, weightOf(value), TimeUnit.SECONDS.toNanos(ttl));
++        });
++        return slot == null ? null : (T) slot.value;
++    }
++
++    /**
++     * Returns the cached, already serialised and gzipped JSON of whatever
++     * {@code loader} returns. Use {@link StudentCacheService#toResponse} to turn
++     * it into the HTTP response.
++     */
++    public StudentCacheService.CachedJson getJson(String schoolId, String subKey, Supplier<?> loader, Dep... deps) {
++        if (!enabled || schoolId == null) {
++            return buildJson(loader);
++        }
++        return jsons.get(key(schoolId, subKey, deps), k -> buildJson(loader));
++    }
++
++    private StudentCacheService.CachedJson buildJson(Supplier<?> loader) {
++        try {
++            byte[] json = objectMapper.writeValueAsBytes(loader.get());
++            ByteArrayOutputStream bos = new ByteArrayOutputStream(Math.max(1024, json.length / 4));
++            try (GZIPOutputStream gz = new GZIPOutputStream(bos)) {
++                gz.write(json);
++            }
++            return new StudentCacheService.CachedJson(bos.toByteArray());
++        } catch (JsonProcessingException e) {
++            throw new UncheckedIOException(e);
++        } catch (IOException e) {
++            throw new UncheckedIOException(e);
++        }
++    }
++
++    private static int weightOf(Object value) {
++        if (value instanceof Collection) {
++            return Math.max(1, ((Collection<?>) value).size());
++        }
++        if (value instanceof Map) {
++            return Math.max(1, ((Map<?, ?>) value).size());
++        }
++        return 1;
++    }
++
++    // ── Invalidation ────────────────────────────────────────────────────
++
++    /**
++     * Called (via the entity listeners) after a row of this kind was inserted,
++     * updated or deleted in this school. Safe from any thread, with or without
++     * an active transaction.
++     */
++    public static void changed(Dep dep, String schoolId) {
++        DataCacheService svc = instance;
++        if (svc == null || dep == null || schoolId == null) {
++            return;
++        }
++        svc.bump(dep, schoolId);
++        svc.bumpAgainAfterTransaction(dep, schoolId);
++    }
++
++    private void bump(Dep dep, String schoolId) {
++        versions.computeIfAbsent(versionKey(dep, schoolId), k -> new AtomicLong()).incrementAndGet();
++    }
++
++    private long versionOf(Dep dep, String schoolId) {
++        AtomicLong v = versions.get(versionKey(dep, schoolId));
++        return v == null ? 0L : v.get();
++    }
++
++    private static String versionKey(Dep dep, String schoolId) {
++        return dep.name() + SEP + schoolId;
++    }
++
++    private String key(String schoolId, String subKey, Dep[] deps) {
++        StringBuilder sb = new StringBuilder(64).append(schoolId).append(SEP).append(subKey).append(SEP);
++        if (deps != null) {
++            for (Dep dep : deps) {
++                sb.append(versionOf(dep, schoolId)).append('.');
++            }
++        }
++        return sb.toString();
++    }
++
++    /**
++     * The listener fires at flush time, i.e. BEFORE the commit is visible to
++     * other connections. Bump once more when the transaction has finished so a
++     * value cached in that gap is never read again.
++     */
++    private void bumpAgainAfterTransaction(Dep dep, String schoolId) {
++        if (!TransactionSynchronizationManager.isSynchronizationActive()) {
++            return;
++        }
++        for (TransactionSynchronization sync : TransactionSynchronizationManager.getSynchronizations()) {
++            if (sync instanceof BumpAfterCompletion) {
++                ((BumpAfterCompletion) sync).add(dep, schoolId);
++                return;
++            }
++        }
++        BumpAfterCompletion created = new BumpAfterCompletion(this);
++        created.add(dep, schoolId);
++        TransactionSynchronizationManager.registerSynchronization(created);
++    }
++
++    /** One per transaction, so saving 500 rows costs one callback, not 500. */
++    private static final class BumpAfterCompletion implements TransactionSynchronization {
++        private final DataCacheService service;
++        private final Set<String> pending = new LinkedHashSet<>();
++
++        BumpAfterCompletion(DataCacheService service) {
++            this.service = service;
++        }
++
++        void add(Dep dep, String schoolId) {
++            pending.add(dep.name() + SEP + schoolId);
++        }
++
++        @Override
++        public void afterCompletion(int status) {
++            for (String entry : pending) {
++                int cut = entry.indexOf(SEP);
++                Dep dep = Dep.valueOf(entry.substring(0, cut));
++                service.bump(dep, entry.substring(cut + 1));
++            }
++        }
++    }
++}
+diff --git a/src/main/java/com/softschool/backend/service/ParentContext.java b/src/main/java/com/softschool/backend/service/ParentContext.java
+index 0a9a743..3bb1838 100644
+--- a/src/main/java/com/softschool/backend/service/ParentContext.java
++++ b/src/main/java/com/softschool/backend/service/ParentContext.java
+@@ -4,6 +4,7 @@ import com.softschool.backend.dto.ParentChildDTO;
+ import com.softschool.backend.model.ParentAccount;
+ import com.softschool.backend.repository.ParentAccountRepository;
+ import com.softschool.backend.security.SchoolSessionService;
++import com.softschool.backend.service.DataCacheService.Dep;
+ import jakarta.servlet.http.HttpServletRequest;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.beans.factory.annotation.Value;
+@@ -28,6 +29,7 @@ public class ParentContext {
+     @Autowired private SchoolSessionService sessionService;
+     @Autowired private ParentChildrenService childrenService;
+     @Autowired private ParentAccountRepository accountRepository;
++    @Autowired private DataCacheService cache;
+ 
+     /**
+      * The school-wide default password is the same for every parent, and phone numbers are not secret,
+@@ -61,14 +63,26 @@ public class ParentContext {
+         SchoolSessionService.Principal p = sessionService.verifyToken(
+                 h != null && h.startsWith("Bearer ") ? h.substring(7).trim() : null);
+         if (!isParent(p)) return null;
+-        String phone = p.getUsername().substring(PREFIX.length());
++        final String schoolId = p.getSchoolId();
++        final String phone = p.getUsername().substring(PREFIX.length());
+         if (strict && requirePasswordChange) {
+-            ParentAccount a = accountRepository.findBySchoolIdAndPhone(p.getSchoolId(), phone).orElse(null);
+-            if (a == null || a.getPasswordHash() == null || a.getPasswordHash().isEmpty()) return null;
++            // PERFORMANCE: this runs on EVERY parent request (and the portal polls every few seconds), so the
++            // "has this parent already chosen their own password" lookup is cached. It is dropped the moment
++            // any ParentAccount row changes (password change, admin reset), see DataCacheInvalidationListener.
++            Boolean activated = cache.get(schoolId, "acct|" + phone, 30, () -> {
++                ParentAccount a = accountRepository.findBySchoolIdAndPhone(schoolId, phone).orElse(null);
++                return Boolean.valueOf(a != null && a.getPasswordHash() != null && !a.getPasswordHash().isEmpty());
++            }, Dep.ACCOUNTS);
++            if (activated == null || !activated.booleanValue()) return null;
+         }
+-        List<ParentChildDTO> kids = childrenService.childrenOf(p.getSchoolId(), phone);
+-        if (kids.isEmpty()) return null;
+-        return new Ctx(p.getSchoolId(), phone, kids);
++        // PERFORMANCE: working out "which children does this phone number own" costs a scan of the school's
++        // students (the phone is matched with LIKE over replace(...), which no index can serve) plus several
++        // sibling lookups. The result only changes when a student row, a signup link or a sibling mark
++        // changes, all of which invalidate this entry immediately; the TTL is just a safety net.
++        List<ParentChildDTO> kids = cache.get(schoolId, "kids|" + phone, 60,
++                () -> childrenService.childrenOf(schoolId, phone), Dep.STUDENTS, Dep.LINKS);
++        if (kids == null || kids.isEmpty()) return null;
++        return new Ctx(schoolId, phone, kids);
+     }
+ 
+     public static final class Ctx {
+diff --git a/src/main/java/com/softschool/backend/service/StudentCacheInvalidationListener.java b/src/main/java/com/softschool/backend/service/StudentCacheInvalidationListener.java
+index 18589c2..5d9d7cd 100644
+--- a/src/main/java/com/softschool/backend/service/StudentCacheInvalidationListener.java
++++ b/src/main/java/com/softschool/backend/service/StudentCacheInvalidationListener.java
+@@ -23,6 +23,8 @@ public class StudentCacheInvalidationListener {
+     public void studentChanged(Student student) {
+         if (student != null) {
+             StudentCacheService.studentChanged(student.getSchoolId(), student.getRegNo());
++            // The parent portal resolves "which children belong to this phone" from student rows.
++            DataCacheService.changed(DataCacheService.Dep.STUDENTS, student.getSchoolId());
+         }
+     }
+ }
+diff --git a/src/main/resources/application.properties b/src/main/resources/application.properties
+index 41f4887..c20c2a5 100644
+--- a/src/main/resources/application.properties
++++ b/src/main/resources/application.properties
+@@ -155,6 +155,15 @@ app.cache.students.json-max-mb=${STUDENT_CACHE_JSON_MAX_MB:48}
+ # Memory budget for cached photo / B-Form bytes, in megabytes.
+ app.cache.students.files-max-mb=${STUDENT_CACHE_FILES_MAX_MB:48}
+ 
++# ── General read cache (parent portal, /pulse, attendance + finance lists) ──
++# Entries are dropped the moment the underlying rows change (version bump on every insert/update/delete);
++# the TTL is only a safety net for writes that bypass JPA. Single backend instance assumed - with several
++# instances lower the TTL (10-15) or set DATA_CACHE_ENABLED=false.
++app.cache.data.enabled=${DATA_CACHE_ENABLED:true}
++app.cache.data.ttl-seconds=${DATA_CACHE_TTL_SECONDS:60}
++app.cache.data.max-weight=${DATA_CACHE_MAX_WEIGHT:50000}
++app.cache.data.json-max-mb=${DATA_CACHE_JSON_MAX_MB:48}
++
+ 
+ # ── Error / log hygiene ───────────────────────────────────────────────
+ # Never send stack traces or internal messages to clients.

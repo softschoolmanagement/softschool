@@ -6,7 +6,9 @@ import com.softschool.backend.dto.StudentSummaryDTO;
 import com.softschool.backend.dto.StudentSyncDTO;
 import com.softschool.backend.model.Student;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.data.repository.query.Param;
 import java.util.List;
 import java.util.Optional;
@@ -80,6 +82,31 @@ public interface StudentRepository extends JpaRepository<Student, Long> {
              "case when s.photo like 'photos/%' then s.photo else null end) " +
             "from Student s where s.schoolId = :schoolId")
     List<StudentListDTO> findListBySchoolId(@Param("schoolId") String schoolId);
+
+    // ── ONE-TIME base64 → file migration (MediaMigrationRunner) ──────────
+    // Only ids are selected here (never the LONGTEXT itself). `schoolPattern`
+    // is "%" for every school, or one schoolId (the runner re-checks equality).
+    @Query("select s.id from Student s where s.photo is not null " +
+           "and s.photo not like 'photos/%' and length(s.photo) > 0 " +
+           "and s.schoolId like :schoolPattern order by s.id")
+    List<Long> findLegacyPhotoIds(@Param("schoolPattern") String schoolPattern);
+
+    @Query("select s.id from Student s where s.certData is not null " +
+           "and s.certData not like 'bforms/%' and length(s.certData) > 0 " +
+           "and s.schoolId like :schoolPattern order by s.id")
+    List<Long> findLegacyCertIds(@Param("schoolPattern") String schoolPattern);
+
+    // The `length(...) = :len` guard makes each swap compare-and-set: if the
+    // photo was edited while the migration ran, 0 rows match and nothing is lost.
+    @Modifying
+    @Transactional
+    @Query("update Student s set s.photo = :path where s.id = :id and length(s.photo) = :len")
+    int replaceLegacyPhoto(@Param("id") Long id, @Param("path") String path, @Param("len") int len);
+
+    @Modifying
+    @Transactional
+    @Query("update Student s set s.certData = :path where s.id = :id and length(s.certData) = :len")
+    int replaceLegacyCert(@Param("id") Long id, @Param("path") String path, @Param("len") int len);
 
     // Used ONLY when a school is permanently deleted by the super admin —
     // wipes every student row belonging to that schoolId. Deliberately NOT

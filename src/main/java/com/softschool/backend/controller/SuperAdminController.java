@@ -4,6 +4,10 @@ import com.softschool.backend.model.Plan;
 import com.softschool.backend.model.School;
 import com.softschool.backend.repository.AttendanceRepository;
 import com.softschool.backend.repository.DropoutStaffRecordRepository;
+import com.softschool.backend.repository.ExamDateSheetRepository;
+import com.softschool.backend.repository.ExamGradingRepository;
+import com.softschool.backend.repository.ExamPaperRepository;
+import com.softschool.backend.repository.ExamPaperResultRepository;
 import com.softschool.backend.repository.FinanceRepository;
 import com.softschool.backend.repository.PlanRepository;
 import com.softschool.backend.repository.SchoolRepository;
@@ -52,6 +56,18 @@ public class SuperAdminController {
 
     @Autowired
     private DropoutStaffRecordRepository dropoutStaffRecordRepository;
+
+    @Autowired
+    private ExamPaperRepository examPaperRepository;
+
+    @Autowired
+    private ExamPaperResultRepository examResultRepository;
+
+    @Autowired
+    private ExamDateSheetRepository examDateSheetRepository;
+
+    @Autowired
+    private ExamGradingRepository examGradingRepository;
 
     private static final String SCHOOL_ID_PREFIX = "SS_77";
     private static final String SECURITY_CODE_LETTERS = "abcdefghijklmnopqrstuvwxyz";
@@ -520,6 +536,10 @@ public ResponseEntity<?> updatePlan(@PathVariable String id, @RequestBody Plan p
             schoolSettingsRepository.deleteBySchoolId(school.getSchoolId());
             attendanceRepository.deleteBySchoolId(school.getSchoolId());
             dropoutStaffRecordRepository.deleteBySchoolId(school.getSchoolId());
+            examResultRepository.deleteBySchoolId(school.getSchoolId());
+            examPaperRepository.deleteBySchoolId(school.getSchoolId());
+            examDateSheetRepository.deleteBySchoolId(school.getSchoolId());
+            examGradingRepository.deleteBySchoolId(school.getSchoolId());
             schoolRepository.delete(school);
             return ResponseEntity.noContent().build();
         }).orElse(ResponseEntity.notFound().build());
