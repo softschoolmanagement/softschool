@@ -7,7 +7,16 @@ import java.time.LocalDate;
 
 @Entity
 @Data
-@Table(name = "attendance")
+@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
+@Table(name = "attendance",
+       indexes = {
+           // parent portal + history: one person's records, newest first
+           @Index(name = "idx_att_member", columnList = "schoolId,memberId,attendance_date"),
+           // dashboard "present today", reports: everything for one day
+           @Index(name = "idx_att_school_date", columnList = "schoolId,attendance_date"),
+           // student / staff roster for one day
+           @Index(name = "idx_att_school_type_date", columnList = "schoolId,memberType,attendance_date")
+       })
 public class Attendance {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)

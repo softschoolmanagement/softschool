@@ -23,6 +23,8 @@ public class StudentCacheInvalidationListener {
     public void studentChanged(Student student) {
         if (student != null) {
             StudentCacheService.studentChanged(student.getSchoolId(), student.getRegNo());
+            // The parent portal resolves "which children belong to this phone" from student rows.
+            DataCacheService.changed(DataCacheService.Dep.STUDENTS, student.getSchoolId());
         }
     }
 }

@@ -23,11 +23,14 @@ import java.time.Instant;
  */
 @Entity
 @Data
+@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
 @Table(name = "teacher_message",
        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "staffId", "clientId"}),
        indexes = {
            @Index(name = "idx_tmsg_thread", columnList = "schoolId,staffId,createdAt"),
-           @Index(name = "idx_tmsg_student", columnList = "schoolId,studentRegNo,createdAt")
+           @Index(name = "idx_tmsg_student", columnList = "schoolId,studentRegNo,createdAt"),
+           // class broadcasts to parents: (school, channel, class) newest first
+           @Index(name = "idx_tmsg_channel_class", columnList = "schoolId,channel,className,createdAt")
        })
 public class Message {
 

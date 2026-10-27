@@ -7,7 +7,15 @@ import java.util.Date;
 
 @Entity
 @Table(name = "students",
-       uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "regNo"}))
+       uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "regNo"}),
+       indexes = {
+           // every "active students of a school" query (parent portal, dashboards)
+           @Index(name = "idx_students_school_status", columnList = "schoolId,status"),
+           // sibling lookups in the parent portal
+           @Index(name = "idx_students_school_sibling", columnList = "schoolId,siblingGroupId"),
+           // class rosters
+           @Index(name = "idx_students_school_class", columnList = "schoolId,studentClass")
+       })
 // Clears the server-side student cache on every insert/update/delete of a row,
 // whichever controller caused it. See StudentCacheService.
 @EntityListeners(com.softschool.backend.service.StudentCacheInvalidationListener.class)

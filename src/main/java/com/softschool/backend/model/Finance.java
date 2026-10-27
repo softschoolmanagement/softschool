@@ -53,6 +53,7 @@ import java.util.Date;
  * frontend still sends don't cause a 400 on save.
  */
 @Entity
+@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
 @Table(
     name = "finance",
     indexes = {

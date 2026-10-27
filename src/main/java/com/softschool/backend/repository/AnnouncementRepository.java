@@ -27,6 +27,17 @@ public interface AnnouncementRepository extends JpaRepository<Announcement, Long
     /** Admin inbox: messages teachers sent to the admin. */
     List<Announcement> findBySchoolIdAndAudienceOrderByCreatedAtDesc(String schoolId, String audience, Pageable pageable);
 
+    /**
+     * PERFORMANCE — parent portal /pulse. Only the id and class of the newest notices of one audience;
+     * the pulse never needs the title/body, and it runs every few seconds for every open portal.
+     * Each row is {id (Long), className (String)}, newest first.
+     */
+    @Query("select a.id, a.className from Announcement a where a.schoolId = :schoolId " +
+           "and a.audience = :audience order by a.createdAt desc")
+    List<Object[]> findIdAndClassBySchoolIdAndAudience(@Param("schoolId") String schoolId,
+                                                       @Param("audience") String audience,
+                                                       Pageable pageable);
+
     Optional<Announcement> findByIdAndSchoolId(Long id, String schoolId);
 
     /** Spam guard for teacher sends. */

@@ -41,6 +41,8 @@ import java.util.*;
  *   PUT    /api/parent-admin/results                       SEND: { session, term, notify?, results:[{regNo, subjects:[{name,total,obtained,absent?}]}] }
  *   POST   /api/parent-admin/results/hold                  HOLD BACK: { session, term, regNos:[...] }
  *   POST   /api/parent-admin/results/withdraw              WITHDRAW:  { session, term, regNos:[...] }
+ *   POST   /api/parent-admin/attendance-report              { period:"weekly"|"monthly", className, section?, date?, regNos?:[...] }
+ *                                                           sends each student's attendance report to the parent
  */
 @RestController
 @RequestMapping("/api/parent-admin")
@@ -57,6 +59,7 @@ public class ParentAdminController {
     @Autowired private ExamResultRepository resultRepository;
     @Autowired private StudentRepository studentRepository;
     @Autowired private MessageRepository messageRepository;
+    @Autowired private com.softschool.backend.service.ParentNoticeService noticeService;
     @Autowired private FileStorageService fileStorageService;
 
     private final ObjectMapper mapper = new ObjectMapper();
@@ -387,6 +390,45 @@ public class ParentAdminController {
     }
 
     /** "first-term" -> "First Term" */
+    // ───────────── ATTENDANCE REPORT ─────────────
+    /**
+     * Send the weekly or monthly attendance report of a class (or just the chosen students) to their parents.
+     *   { period: "weekly" | "monthly", className, section?, date?: "yyyy-MM-dd", regNos?: [...] }
+     * The report covers the week (Mon-Sun) / month that contains {@code date} (default today), never past today.
+     * Students with nothing marked in that period are skipped. Each send creates a new message in the
+     * parent's School Office chat, so sending twice shows the report twice.
+     */
+    @PostMapping("/attendance-report")
+    public ResponseEntity<?> sendAttendanceReport(@RequestBody JsonNode body, HttpServletRequest req) {
+        SchoolSessionService.Principal p = admin(req);
+        if (p == null) return denied(req);
+        String period = body.path("period").asText("").trim().toLowerCase(Locale.ROOT);
+        if (!period.equals("weekly") && !period.equals("monthly")) {
+            return ParentUtil.error(HttpStatus.BAD_REQUEST, "period must be weekly or monthly.");
+        }
+        String className = body.path("className").asText("").trim();
+        if (className.isEmpty()) return ParentUtil.error(HttpStatus.BAD_REQUEST, "className is required.");
+        String section = body.path("section").asText("").trim();
+        java.time.LocalDate ref = null;
+        String date = body.path("date").asText("").trim();
+        if (!date.isEmpty()) {
+            try { ref = java.time.LocalDate.parse(date); }
+            catch (Exception e) { return ParentUtil.error(HttpStatus.BAD_REQUEST, "date must look like 2026-10-25."); }
+        }
+        Set<String> only = new HashSet<>(regNosOf(body));
+
+        List<Student> students = new ArrayList<>();
+        for (Student s : studentRepository.findBySchoolIdAndStatus(p.getSchoolId(), "active")) {
+            if (s.getRegNo() == null || !className.equalsIgnoreCase(String.valueOf(s.getStudentClass()).trim())) continue;
+            if (!section.isEmpty() && !section.equalsIgnoreCase(String.valueOf(s.getSection()).trim())) continue;
+            if (!only.isEmpty() && !only.contains(s.getRegNo())) continue;
+            students.add(s);
+        }
+        if (students.isEmpty()) return ParentUtil.error(HttpStatus.BAD_REQUEST, "No matching students found.");
+        if (students.size() > MAX_RESULT_ROWS) return ParentUtil.error(HttpStatus.BAD_REQUEST, "Too many students in one request (max " + MAX_RESULT_ROWS + ").");
+        return ResponseEntity.ok(noticeService.sendReports(p.getSchoolId(), period, ref, students));
+    }
+
     private static String prettyTerm(String key) {
         StringBuilder b = new StringBuilder();
         for (String w : key.replace('_', '-').split("-")) {

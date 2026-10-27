@@ -24,10 +24,13 @@ import java.time.Instant;
 @Entity
 @Data
 @JsonIgnoreProperties(ignoreUnknown = true)
+@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
 @Table(name = "announcement",
        indexes = {
            @Index(name = "idx_ann_school_created", columnList = "schoolId,createdAt"),
-           @Index(name = "idx_ann_school_audience", columnList = "schoolId,audience")
+           @Index(name = "idx_ann_school_audience", columnList = "schoolId,audience"),
+           // parent portal: class notices newest first, without a sort
+           @Index(name = "idx_ann_school_aud_created", columnList = "schoolId,audience,createdAt")
        })
 public class Announcement {
 

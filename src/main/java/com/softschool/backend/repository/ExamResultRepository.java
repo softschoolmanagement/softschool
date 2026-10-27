@@ -12,6 +12,9 @@ public interface ExamResultRepository extends JpaRepository<ExamResult, Long> {
     /** What a parent may see: only results the admin has sent. */
     List<ExamResult> findBySchoolIdAndRegNoAndVisibleTrue(String schoolId, String regNo);
 
+    /** PERFORMANCE - parent /pulse: how many results the admin has sent for this child. */
+    long countBySchoolIdAndRegNoAndVisibleTrue(String schoolId, String regNo);
+
     /** Admin: the send / hold status of a whole session + term. */
     List<ExamResult> findBySchoolIdAndSessionAndTerm(String schoolId, String session, String term);
 

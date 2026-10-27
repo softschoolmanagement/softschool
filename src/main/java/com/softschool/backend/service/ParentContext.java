@@ -4,6 +4,7 @@ import com.softschool.backend.dto.ParentChildDTO;
 import com.softschool.backend.model.ParentAccount;
 import com.softschool.backend.repository.ParentAccountRepository;
 import com.softschool.backend.security.SchoolSessionService;
+import com.softschool.backend.service.DataCacheService.Dep;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -28,6 +29,7 @@ public class ParentContext {
     @Autowired private SchoolSessionService sessionService;
     @Autowired private ParentChildrenService childrenService;
     @Autowired private ParentAccountRepository accountRepository;
+    @Autowired private DataCacheService cache;
 
     /**
      * The school-wide default password is the same for every parent, and phone numbers are not secret,
@@ -61,14 +63,26 @@ public class ParentContext {
         SchoolSessionService.Principal p = sessionService.verifyToken(
                 h != null && h.startsWith("Bearer ") ? h.substring(7).trim() : null);
         if (!isParent(p)) return null;
-        String phone = p.getUsername().substring(PREFIX.length());
+        final String schoolId = p.getSchoolId();
+        final String phone = p.getUsername().substring(PREFIX.length());
         if (strict && requirePasswordChange) {
-            ParentAccount a = accountRepository.findBySchoolIdAndPhone(p.getSchoolId(), phone).orElse(null);
-            if (a == null || a.getPasswordHash() == null || a.getPasswordHash().isEmpty()) return null;
+            // PERFORMANCE: this runs on EVERY parent request (and the portal polls every few seconds), so the
+            // "has this parent already chosen their own password" lookup is cached. It is dropped the moment
+            // any ParentAccount row changes (password change, admin reset), see DataCacheInvalidationListener.
+            Boolean activated = cache.get(schoolId, "acct|" + phone, 30, () -> {
+                ParentAccount a = accountRepository.findBySchoolIdAndPhone(schoolId, phone).orElse(null);
+                return Boolean.valueOf(a != null && a.getPasswordHash() != null && !a.getPasswordHash().isEmpty());
+            }, Dep.ACCOUNTS);
+            if (activated == null || !activated.booleanValue()) return null;
         }
-        List<ParentChildDTO> kids = childrenService.childrenOf(p.getSchoolId(), phone);
-        if (kids.isEmpty()) return null;
-        return new Ctx(p.getSchoolId(), phone, kids);
+        // PERFORMANCE: working out "which children does this phone number own" costs a scan of the school's
+        // students (the phone is matched with LIKE over replace(...), which no index can serve) plus several
+        // sibling lookups. The result only changes when a student row, a signup link or a sibling mark
+        // changes, all of which invalidate this entry immediately; the TTL is just a safety net.
+        List<ParentChildDTO> kids = cache.get(schoolId, "kids|" + phone, 60,
+                () -> childrenService.childrenOf(schoolId, phone), Dep.STUDENTS, Dep.LINKS);
+        if (kids == null || kids.isEmpty()) return null;
+        return new Ctx(schoolId, phone, kids);
     }
 
     public static final class Ctx {

@@ -18,6 +18,7 @@ import java.time.Instant;
  */
 @Entity
 @Data
+@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
 @Table(name = "parent_account",
        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "phone"}))
 public class ParentAccount {

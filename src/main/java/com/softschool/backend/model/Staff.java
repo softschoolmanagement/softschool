@@ -25,8 +25,10 @@ import lombok.Data;
  * guardianName) don't cause a 400 on save.
  */
 @Entity
+@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
 @Table(name = "staff",
-       uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "staffId"}))
+       uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "staffId"}),
+       indexes = @Index(name = "idx_staff_school_type", columnList = "schoolId,type"))
 @Data
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class Staff {

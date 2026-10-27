@@ -13,6 +13,7 @@ import java.time.Instant;
  */
 @Entity
 @Data
+@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
 @Table(name = "parent_read_mark",
        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "phone", "threadKey"}))
 public class ParentReadMark {

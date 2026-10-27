@@ -12,6 +12,7 @@ import java.time.Instant;
  */
 @Entity
 @Data
+@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
 @Table(name = "exam_result",
        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "regNo", "session", "term"}),
        indexes = @Index(name = "idx_examres_student", columnList = "schoolId,regNo"))

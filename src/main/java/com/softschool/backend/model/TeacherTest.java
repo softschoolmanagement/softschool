@@ -15,9 +15,14 @@ import java.time.Instant;
  */
 @Entity
 @Data
+@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
 @Table(name = "teacher_test",
        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "staffId", "testId"}),
-       indexes = @Index(name = "idx_tt_school_staff", columnList = "schoolId,staffId"))
+       indexes = {
+           @Index(name = "idx_tt_school_staff", columnList = "schoolId,staffId"),
+           // parent portal: tests of one class, newest first
+           @Index(name = "idx_tt_school_class", columnList = "schoolId,className,updatedAt")
+       })
 public class TeacherTest {
 
     @Id

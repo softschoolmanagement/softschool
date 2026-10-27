@@ -10,7 +10,11 @@ import com.softschool.backend.repository.DropoutStaffRecordRepository;
 import com.softschool.backend.repository.FinanceRepository;
 import com.softschool.backend.repository.StaffRepository;
 import com.softschool.backend.repository.StudentRepository;
+import com.softschool.backend.service.DataCacheService;
+import com.softschool.backend.service.DataCacheService.Dep;
 import com.softschool.backend.service.PlanEnforcementService;
+import com.softschool.backend.service.StudentCacheService;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -50,6 +54,12 @@ public class FinanceController {
     @Autowired private FinanceRepository financeRepository;
     @Autowired private DropoutStaffRecordRepository dropoutStaffRecordRepository;
     @Autowired private PlanEnforcementService planEnforcementService;
+    // PERFORMANCE: the dashboard and Manage Finance poll the read endpoints below. Their finished JSON is
+    // cached per school and rebuilt only after a finance row of that school changes (see
+    // DataCacheInvalidationListener). The request proxy is only used to read Accept-Encoding.
+    @Autowired private DataCacheService dataCache;
+    @Autowired private StudentCacheService studentCache;
+    @Autowired private HttpServletRequest currentRequest;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     // =========================================================
@@ -319,9 +329,9 @@ public class FinanceController {
         // separately re-filter to active students for anything actionable
         // (Pay Bill, Generate Voucher, etc.), so this doesn't resurrect a
         // dropped student anywhere they could actually be billed again.
-        List<Finance> records = financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
-                monthKey, Finance.TYPE_STUDENT_FEE, schoolId);
-        return ResponseEntity.ok(records);
+        return cachedJson(schoolId, "fin-status-all|" + monthKey,
+                () -> financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
+                        monthKey, Finance.TYPE_STUDENT_FEE, schoolId));
     }
 
     // =========================================================
@@ -1058,9 +1068,9 @@ public class FinanceController {
         // of one-per-student. Same "never hide a dropped student's already-
         // charged/paid fine history" rule applies here too, since this is
         // the same underlying data.
-        List<Finance> fines = financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
-                monthKey, Finance.TYPE_FINE, schoolId);
-        return ResponseEntity.ok(fines);
+        return cachedJson(schoolId, "fin-fine-details-all|" + monthKey,
+                () -> financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
+                        monthKey, Finance.TYPE_FINE, schoolId));
     }
 
     // =========================================================
@@ -1278,8 +1288,8 @@ public class FinanceController {
     @GetMapping("/salary/records")
     public ResponseEntity<?> getSalaryRecords(@RequestParam String schoolId) {
         if (isBlank(schoolId)) return badRequest("schoolId is required.");
-        return ResponseEntity.ok(
-                financeRepository.findByRecordTypeAndSchoolIdOrderByCreatedAtAsc(
+        return cachedJson(schoolId, "fin-salary-records",
+                () -> financeRepository.findByRecordTypeAndSchoolIdOrderByCreatedAtAsc(
                         Finance.TYPE_SALARY, schoolId));
     }
 
@@ -1435,7 +1445,18 @@ public class FinanceController {
 
     private ResponseEntity<?> bulkGet(String recordType, String schoolId) {
         if (isBlank(schoolId)) return badRequest("schoolId is required.");
-        return ResponseEntity.ok(bulkList(recordType, schoolId));
+        return cachedJson(schoolId, "fin-bulk|" + recordType, () -> bulkList(recordType, schoolId));
+    }
+
+    /**
+     * Serves the finished, gzipped JSON of a read-only finance list from the server cache. The cache key
+     * carries the school's current "finance version", so any insert/update/delete of a finance row in
+     * this school makes the next call rebuild it from MySQL.
+     */
+    private ResponseEntity<?> cachedJson(String schoolId, String subKey, java.util.function.Supplier<?> loader) {
+        return studentCache.toResponse(
+                dataCache.getJson(schoolId, subKey, loader, Dep.FINANCE),
+                currentRequest.getHeader("Accept-Encoding"));
     }
 
     /**

@@ -14,6 +14,7 @@ import java.time.Instant;
  */
 @Entity
 @Data
+@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
 @Table(name = "class_timetable",
        uniqueConstraints = @UniqueConstraint(columnNames = {"schoolId", "className"}))
 public class ClassTimetable {

@@ -1,7 +1,10 @@
 package com.softschool.backend.repository;
 
+import com.softschool.backend.dto.ParentAttendanceDTO;
 import com.softschool.backend.model.Attendance;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
 import java.time.LocalDate;
@@ -31,6 +34,19 @@ public interface AttendanceRepository extends JpaRepository<Attendance, Long> {
     // Full history for a person, scoped to their school (so a staffId/regNo
     // that happens to match one in another school never leaks in).
     List<Attendance> findByMemberIdAndSchoolIdOrderByDateDesc(String memberId, String schoolId);
+
+    // PERFORMANCE — parent portal attendance screen. One person's rows inside a date window, selecting
+    // ONLY the six plain columns the screen shows. The old call (findByMemberIdAndSchoolIdOrderByDateDesc
+    // above) loaded the child's whole history including every capturedPhoto LONGTEXT and then threw
+    // most of it away in Java. Uses idx_att_member (schoolId, memberId, attendance_date).
+    @Query("select new com.softschool.backend.dto.ParentAttendanceDTO(" +
+           "a.memberType, a.date, a.status, a.reason, a.checkIn, a.checkOut) " +
+           "from Attendance a where a.schoolId = :schoolId and a.memberId = :memberId " +
+           "and a.date >= :fromDate and a.date <= :toDate")
+    List<ParentAttendanceDTO> findParentView(@Param("schoolId") String schoolId,
+                                             @Param("memberId") String memberId,
+                                             @Param("fromDate") LocalDate fromDate,
+                                             @Param("toDate") LocalDate toDate);
 
     // Every STAFF attendance row for one school within a date range, in a
     // single query — used by StaffController#applyAbsenceFines to count

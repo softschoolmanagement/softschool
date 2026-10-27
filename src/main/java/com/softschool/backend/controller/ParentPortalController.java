@@ -3,14 +3,19 @@ package com.softschool.backend.controller;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.softschool.backend.dto.ParentAttendanceDTO;
 import com.softschool.backend.dto.ParentChildDTO;
 import com.softschool.backend.dto.ParentTeacherDTO;
 import com.softschool.backend.model.*;
 import com.softschool.backend.repository.*;
+import com.softschool.backend.service.DataCacheService;
+import com.softschool.backend.service.DataCacheService.Dep;
 import com.softschool.backend.service.FileStorageService;
 import com.softschool.backend.service.ParentChildrenService;
 import com.softschool.backend.service.ParentContext;
 import com.softschool.backend.service.ParentUtil;
+import com.softschool.backend.service.StudentCacheService;
+import com.softschool.backend.service.StudentCacheService.CachedFile;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.PageRequest;
@@ -19,6 +24,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -45,12 +51,18 @@ import java.util.*;
  *   GET /api/parent/children/{regNo}/teachers
  *
  * Chat is in ParentMessageController, applications/complaints/feedback in ParentSubmissionController.
+ *
+ * PERFORMANCE: authorisation ALWAYS runs first (ctx + child checks) and is never cached; only the data
+ * built for an already-authorised child is cached, per school and child, in DataCacheService. Each entry
+ * names the kinds of rows it depends on, so it is dropped as soon as the school changes any of them.
  */
 @RestController
 @RequestMapping("/api/parent")
 public class ParentPortalController {
 
     private static final int MAX_LIST = 200;
+    /** Safety-net lifetime of a cached view; real freshness comes from the invalidation listeners. */
+    private static final long TTL = 60;
 
     @Autowired private ParentContext parentContext;
     @Autowired private SchoolRepository schoolRepository;
@@ -65,6 +77,8 @@ public class ParentPortalController {
     @Autowired private ExamResultRepository resultRepository;
     @Autowired private ParentStaffRepository staffRepository;
     @Autowired private FileStorageService fileStorageService;
+    @Autowired private DataCacheService cache;
+    @Autowired private StudentCacheService studentCache;
 
     private final ObjectMapper mapper = new ObjectMapper();
 
@@ -105,19 +119,44 @@ public class ParentPortalController {
         return ResponseEntity.ok(out);
     }
 
+    /**
+     * The child's photo. PERFORMANCE: served from the same in-memory file cache the admin pages use
+     * (StudentCacheService), so a page load no longer loads the child's whole student row (every
+     * LONGTEXT column included) from MySQL and re-decodes it. The entry is dropped automatically when
+     * that student's row changes.
+     */
     @GetMapping("/children/{regNo}/photo")
     public ResponseEntity<?> photo(@PathVariable String regNo, HttpServletRequest req) {
         ParentContext.Ctx ctx = parentContext.resolve(req);
         if (ctx == null) return ParentUtil.error(HttpStatus.UNAUTHORIZED, "Please log in again.");
         if (ctx.child(regNo) == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
-        Student s = studentRepository.findByRegNoAndSchoolId(regNo, ctx.schoolId).orElse(null);
+
+        final String schoolId = ctx.schoolId;
+        CachedFile file;
+        try {
+            file = studentCache.getFile(schoolId, "photo", regNo, () -> loadPhoto(schoolId, regNo));
+        } catch (UncheckedIOException e) {
+            return ResponseEntity.notFound().build();
+        }
+        if (file == null || file.mediaType() == null || !file.mediaType().startsWith("image/")) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok().header("Content-Type", file.mediaType())
+                .header("Cache-Control", "private, max-age=3600")
+                .header("X-Content-Type-Options", "nosniff")
+                .body(file.bytes());
+    }
+
+    /** Reads and decodes the stored photo; null when there is nothing usable (never cached). */
+    private CachedFile loadPhoto(String schoolId, String regNo) {
+        Student s = studentRepository.findByRegNoAndSchoolId(regNo, schoolId).orElse(null);
         String stored = s == null ? null : s.getPhoto();
-        if (stored == null || stored.isBlank()) return ResponseEntity.notFound().build();
+        if (stored == null || stored.isBlank()) return null;
         try {
             byte[] bytes;
             if (fileStorageService.isManagedPath(stored)) {
                 Path f = fileStorageService.resolve(stored);
-                if (!Files.exists(f)) return ResponseEntity.notFound().build();
+                if (!Files.exists(f)) return null;
                 bytes = Files.readAllBytes(f);
             } else {
                 // Older rows hold the picture inline, as bare base64 or a data: URI.
@@ -127,13 +166,9 @@ public class ParentPortalController {
                 bytes = Base64.getMimeDecoder().decode(b64);
             }
             String type = FileStorageService.detectMediaType(bytes);
-            if (type == null || !type.startsWith("image/")) return ResponseEntity.notFound().build();
-            return ResponseEntity.ok().header("Content-Type", type)
-                    .header("Cache-Control", "private, max-age=3600")
-                    .header("X-Content-Type-Options", "nosniff")
-                    .body(bytes);
+            return type == null ? null : new CachedFile(bytes, type);
         } catch (IOException | IllegalArgumentException | SecurityException e) {
-            return ResponseEntity.notFound().build();
+            return null;
         }
     }
 
@@ -152,20 +187,31 @@ public class ParentPortalController {
         if (ctx == null) return ParentUtil.error(HttpStatus.UNAUTHORIZED, "Please log in again.");
         if (ctx.child(regNo) == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
 
-        YearMonth ym = null;
+        YearMonth parsed = null;
         if (month != null && !month.isBlank()) {
-            try { ym = YearMonth.parse(month.trim()); }
+            try { parsed = YearMonth.parse(month.trim()); }
             catch (Exception e) { return ParentUtil.error(HttpStatus.BAD_REQUEST, "month must look like 2026-10."); }
         }
-        LocalDate from = ym != null ? ym.atDay(1) : LocalDate.now().minusDays(150);
-        LocalDate to = ym != null ? ym.atEndOfMonth() : LocalDate.now();
+        final YearMonth ym = parsed;
+        final LocalDate today = LocalDate.now();
+        final LocalDate from = ym != null ? ym.atDay(1) : today.minusDays(150);
+        final LocalDate to = ym != null ? ym.atEndOfMonth() : today;
+        // The rolling "last 150 days" window moves at midnight, so today's date is part of that key.
+        String key = "att|" + regNo + "|" + (ym == null ? "recent:" + today : ym.toString());
 
+        Map<String, Object> out = cache.get(ctx.schoolId, key, TTL,
+                () -> buildAttendance(ctx.schoolId, regNo, ym, from, to), Dep.ATTENDANCE);
+        return ResponseEntity.ok(out);
+    }
+
+    private Map<String, Object> buildAttendance(String schoolId, String regNo, YearMonth ym,
+                                                LocalDate from, LocalDate to) {
         Map<String, String> days = new TreeMap<>();
         Map<String, Object> details = new TreeMap<>();
         int present = 0, absent = 0, leave = 0;
-        for (Attendance a : attendanceRepository.findByMemberIdAndSchoolIdOrderByDateDesc(regNo, ctx.schoolId)) {
+        // Only the six plain columns, only inside the window (idx_att_member) - no capturedPhoto LONGTEXT.
+        for (ParentAttendanceDTO a : attendanceRepository.findParentView(schoolId, regNo, from, to)) {
             if (!"STUDENT".equalsIgnoreCase(a.getMemberType()) || a.getDate() == null) continue;
-            if (a.getDate().isBefore(from) || a.getDate().isAfter(to)) continue;
             String st = ParentUtil.normalizeAttendance(a.getStatus());
             String key = a.getDate().toString();
             days.put(key, st);
@@ -187,7 +233,7 @@ public class ParentPortalController {
         out.put("days", days);
         out.put("details", details);
         out.put("summary", summary);
-        return ResponseEntity.ok(out);
+        return out;
     }
 
     // ───────────── FEES ─────────────
@@ -206,7 +252,15 @@ public class ParentPortalController {
         if (ctx == null) return ParentUtil.error(HttpStatus.UNAUTHORIZED, "Please log in again.");
         if (ctx.child(regNo) == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
 
-        SchoolSettings ss = settingsRepository.findBySchoolId(ctx.schoolId).orElse(null);
+        // "due" turns into "overdue" as days pass, so today's date is part of the key.
+        String key = "fees|" + regNo + "|" + LocalDate.now();
+        Map<String, Object> out = cache.get(ctx.schoolId, key, TTL,
+                () -> buildFees(ctx.schoolId, regNo), Dep.FINANCE, Dep.SETTINGS);
+        return ResponseEntity.ok(out);
+    }
+
+    private Map<String, Object> buildFees(String schoolId, String regNo) {
+        SchoolSettings ss = settingsRepository.findBySchoolId(schoolId).orElse(null);
         int deadlineDay = ss == null || ss.getLateFeeDeadlineDay() == null ? 10 : ss.getLateFeeDeadlineDay();
         int grace = ss == null || ss.getLateFeeGrace() == null ? 0 : ss.getLateFeeGrace();
         boolean lateOn = ss != null && !Boolean.FALSE.equals(ss.getLateFeeEnabled());
@@ -214,7 +268,7 @@ public class ParentPortalController {
         double lateAmount = ss == null || ss.getLateFeeAmount() == null ? 0.0 : ss.getLateFeeAmount();
 
         List<Finance> rows = new ArrayList<>();
-        for (Finance f : financeRepository.findBySchoolIdAndRegNo(ctx.schoolId, regNo)) {
+        for (Finance f : financeRepository.findBySchoolIdAndRegNo(schoolId, regNo)) {
             if (Finance.TYPE_STUDENT_FEE.equals(f.getRecordType()) && f.getMonthKey() != null
                     && f.getMonthKey().matches("\\d{4}-\\d{2}")) rows.add(f);
         }
@@ -256,7 +310,7 @@ public class ParentPortalController {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("outstanding", ParentUtil.round2(outstanding));
         out.put("fees", list);
-        return ResponseEntity.ok(out);
+        return out;
     }
 
     // ───────────── DIARY ─────────────
@@ -267,9 +321,15 @@ public class ParentPortalController {
         ParentChildDTO child = ctx.child(regNo);
         if (child == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
 
+        List<Map<String, Object>> out = cache.get(ctx.schoolId, "diary|" + regNo, TTL,
+                () -> buildDiary(ctx.schoolId, regNo, child), Dep.DIARY, Dep.STUDENTS);
+        return ResponseEntity.ok(out);
+    }
+
+    private List<Map<String, Object>> buildDiary(String schoolId, String regNo, ParentChildDTO child) {
         List<Map<String, Object>> out = new ArrayList<>();
         for (DiaryEntry d : diaryRepository.findBySchoolIdAndClassNameAndPublishedTrueOrderByCreatedAtDesc(
-                ctx.schoolId, ParentUtil.classLabel(child), PageRequest.of(0, MAX_LIST))) {
+                schoolId, ParentUtil.classLabel(child), PageRequest.of(0, MAX_LIST))) {
             int count = d.getImagePaths() == null || d.getImagePaths().isBlank() ? 0 : d.getImagePaths().split("\n").length;
             List<String> urls = new ArrayList<>();
             for (int i = 0; i < count; i++) urls.add("/api/parent/children/" + regNo + "/diary/" + d.getId() + "/image/" + i);
@@ -284,7 +344,7 @@ public class ParentPortalController {
             m.put("createdAt", d.getCreatedAt().toString());
             out.add(m);
         }
-        return ResponseEntity.ok(out);
+        return out;
     }
 
     @GetMapping("/children/{regNo}/diary/{id}/image/{n}")
@@ -325,10 +385,16 @@ public class ParentPortalController {
         ParentChildDTO child = ctx.child(regNo);
         if (child == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
 
+        List<Map<String, Object>> out = cache.get(ctx.schoolId, "ann|" + regNo, TTL,
+                () -> buildAnnouncements(ctx.schoolId, child), Dep.ANNOUNCEMENTS, Dep.STUDENTS);
+        return ResponseEntity.ok(out);
+    }
+
+    private List<Map<String, Object>> buildAnnouncements(String schoolId, ParentChildDTO child) {
         Instant fresh = Instant.now().minus(3, ChronoUnit.DAYS);
         List<Map<String, Object>> out = new ArrayList<>();
         for (Announcement a : announcementRepository.findBySchoolIdAndAudienceOrderByCreatedAtDesc(
-                ctx.schoolId, Announcement.AUD_CLASS, PageRequest.of(0, MAX_LIST))) {
+                schoolId, Announcement.AUD_CLASS, PageRequest.of(0, MAX_LIST))) {
             if (!ParentUtil.classMatches(a.getClassName(), child)) continue;
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("id", a.getId());
@@ -342,7 +408,7 @@ public class ParentPortalController {
             m.put("isNew", a.getCreatedAt().isAfter(fresh));
             out.add(m);
         }
-        return ResponseEntity.ok(out);
+        return out;
     }
 
     // ───────────── TESTS ─────────────
@@ -357,9 +423,15 @@ public class ParentPortalController {
         ParentChildDTO child = ctx.child(regNo);
         if (child == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
 
+        List<Map<String, Object>> out = cache.get(ctx.schoolId, "tests|" + regNo, TTL,
+                () -> buildTests(ctx.schoolId, regNo, child), Dep.TESTS, Dep.STUDENTS);
+        return ResponseEntity.ok(out);
+    }
+
+    private List<Map<String, Object>> buildTests(String schoolId, String regNo, ParentChildDTO child) {
         String cls = child.getStudentClass() == null ? "" : child.getStudentClass().trim();
         List<Map<String, Object>> out = new ArrayList<>();
-        for (TeacherTest t : testRepository.findForClass(ctx.schoolId, ParentUtil.classLabel(child), cls, PageRequest.of(0, 150))) {
+        for (TeacherTest t : testRepository.findForClass(schoolId, ParentUtil.classLabel(child), cls, PageRequest.of(0, 150))) {
             JsonNode p;
             try { p = mapper.readTree(t.getPayloadJson()); } catch (Exception e) { continue; }
             if (!p.isObject()) continue;
@@ -387,7 +459,7 @@ public class ParentPortalController {
             m.put("status", marked ? "marked" : "pending");
             out.add(m);
         }
-        return ResponseEntity.ok(out);
+        return out;
     }
 
     // ───────────── TIMETABLE ─────────────
@@ -399,14 +471,20 @@ public class ParentPortalController {
         ParentChildDTO child = ctx.child(regNo);
         if (child == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
 
-        ClassTimetable tt = timetableRepository.findBySchoolIdAndClassNameIgnoreCase(ctx.schoolId, ParentUtil.classLabel(child)).orElse(null);
+        ObjectNode out = cache.get(ctx.schoolId, "tt|" + regNo, TTL,
+                () -> buildTimetable(ctx.schoolId, child), Dep.TIMETABLE, Dep.STUDENTS);
+        return ResponseEntity.ok(out);
+    }
+
+    private ObjectNode buildTimetable(String schoolId, ParentChildDTO child) {
+        ClassTimetable tt = timetableRepository.findBySchoolIdAndClassNameIgnoreCase(schoolId, ParentUtil.classLabel(child)).orElse(null);
         if (tt == null && child.getStudentClass() != null && !child.getStudentClass().isBlank()) {
-            tt = timetableRepository.findBySchoolIdAndClassNameIgnoreCase(ctx.schoolId, child.getStudentClass().trim()).orElse(null);
+            tt = timetableRepository.findBySchoolIdAndClassNameIgnoreCase(schoolId, child.getStudentClass().trim()).orElse(null);
         }
         ObjectNode out = mapper.createObjectNode();
         if (tt == null) {
             out.put("available", false);
-            return ResponseEntity.ok(out);
+            return out;
         }
         try {
             JsonNode p = mapper.readTree(tt.getPayloadJson());
@@ -415,7 +493,7 @@ public class ParentPortalController {
         out.put("available", true);
         out.put("className", tt.getClassName());
         out.put("updatedAt", tt.getUpdatedAt().toString());
-        return ResponseEntity.ok(out);
+        return out;
     }
 
     // ───────────── RESULTS ─────────────
@@ -426,14 +504,20 @@ public class ParentPortalController {
         if (ctx == null) return ParentUtil.error(HttpStatus.UNAUTHORIZED, "Please log in again.");
         if (ctx.child(regNo) == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
 
+        ObjectNode out = cache.get(ctx.schoolId, "res|" + regNo, TTL,
+                () -> buildResults(ctx.schoolId, regNo), Dep.RESULTS);
+        return ResponseEntity.ok(out);
+    }
+
+    private ObjectNode buildResults(String schoolId, String regNo) {
         ObjectNode out = mapper.createObjectNode();
-        for (ExamResult r : resultRepository.findBySchoolIdAndRegNoAndVisibleTrue(ctx.schoolId, regNo)) {
+        for (ExamResult r : resultRepository.findBySchoolIdAndRegNoAndVisibleTrue(schoolId, regNo)) {
             try {
                 ObjectNode session = out.has(r.getSession()) ? (ObjectNode) out.get(r.getSession()) : out.putObject(r.getSession());
                 session.set(r.getTerm(), mapper.readTree(r.getPayloadJson()));
             } catch (Exception ignored) { /* skip a corrupt row */ }
         }
-        return ResponseEntity.ok(out);
+        return out;
     }
 
     // ───────────── TEACHERS (who can this parent message?) ─────────────
@@ -444,9 +528,15 @@ public class ParentPortalController {
         ParentChildDTO child = ctx.child(regNo);
         if (child == null) return ParentUtil.error(HttpStatus.FORBIDDEN, "Not allowed.");
 
+        List<Map<String, Object>> out = cache.get(ctx.schoolId, "teachers|" + regNo, TTL,
+                () -> buildTeachers(ctx.schoolId, child), Dep.STAFF, Dep.STUDENTS);
+        return ResponseEntity.ok(out);
+    }
+
+    private List<Map<String, Object>> buildTeachers(String schoolId, ParentChildDTO child) {
         String label = ParentUtil.classLabel(child);
         List<Map<String, Object>> out = new ArrayList<>();
-        for (ParentTeacherDTO t : staffRepository.findTeachersBySchoolId(ctx.schoolId)) {
+        for (ParentTeacherDTO t : staffRepository.findTeachersBySchoolId(schoolId)) {
             if (!ParentUtil.teachesClass(t, label)) continue;
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("staffId", t.getStaffId());
@@ -454,6 +544,6 @@ public class ParentPortalController {
             m.put("subject", t.getSubjects());
             out.add(m);
         }
-        return ResponseEntity.ok(out);
+        return out;
     }
 }

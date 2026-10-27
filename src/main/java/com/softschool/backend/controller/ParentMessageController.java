@@ -7,10 +7,15 @@ import com.softschool.backend.model.Announcement;
 import com.softschool.backend.model.Message;
 import com.softschool.backend.model.ParentReadMark;
 import com.softschool.backend.repository.AnnouncementRepository;
+import com.softschool.backend.repository.AttendanceRepository;
+import com.softschool.backend.repository.DiaryEntryRepository;
+import com.softschool.backend.repository.ExamResultRepository;
 import com.softschool.backend.repository.MessageRepository;
 import com.softschool.backend.repository.ParentMessageRepository;
 import com.softschool.backend.repository.ParentReadMarkRepository;
 import com.softschool.backend.repository.ParentStaffRepository;
+import com.softschool.backend.service.DataCacheService;
+import com.softschool.backend.service.DataCacheService.Dep;
 import com.softschool.backend.service.ParentContext;
 import com.softschool.backend.service.ParentUtil;
 import jakarta.servlet.http.HttpServletRequest;
@@ -56,6 +61,10 @@ public class ParentMessageController {
 
     private static final int MAX_LIST = 500;
     private static final int PARENT_DAILY_LIMIT = 60;
+    /** /pulse is polled every few seconds by every open portal, so it is answered from memory in between. */
+    private static final long PULSE_TTL = 15;
+    /** Message lists change on every send; the entry is also dropped by the write itself (see DataCacheService). */
+    private static final long MESSAGES_TTL = 8;
     private static final String READ_LOCK = "This message has been read, so it can't be edited or deleted.";
     private static final List<String> PRIVATE_CHANNELS = Arrays.asList(Message.CH_PARENT_ADMIN, Message.CH_PARENT_TEACHER);
 
@@ -65,6 +74,10 @@ public class ParentMessageController {
     @Autowired private ParentReadMarkRepository readMarkRepository;
     @Autowired private ParentStaffRepository staffRepository;
     @Autowired private AnnouncementRepository announcementRepository;
+    @Autowired private DataCacheService cache;
+    @Autowired private DiaryEntryRepository diaryRepository;
+    @Autowired private ExamResultRepository resultRepository;
+    @Autowired private AttendanceRepository attendanceRepository;
 
     // ───────────── READ ─────────────
     @GetMapping("/messages")
@@ -123,26 +136,48 @@ public class ParentMessageController {
         return ResponseEntity.ok(out);
     }
 
-    /** Cheap probe for notifications: total unread across all children and the newest message id. */
+    /**
+     * Cheap probe for notifications: total unread across all children and the newest message id.
+     *
+     * PERFORMANCE: every open portal calls this every few seconds, and building it used to load up to
+     * ~900 full message rows per child plus 200 full announcements. The finished answer is now cached per
+     * parent. A new message, a read receipt, a new announcement or a change to the parent's children
+     * drops it immediately (DataCacheInvalidationListener), so a new item still shows on the very next
+     * poll; the 15 s lifetime only covers writes that bypass JPA.
+     */
     @GetMapping("/pulse")
     public ResponseEntity<?> pulse(HttpServletRequest req) {
         ParentContext.Ctx ctx = parentContext.resolve(req);
         if (ctx == null) return ParentUtil.error(HttpStatus.UNAUTHORIZED, "Please log in again.");
-        Map<String, Instant> marks = readMarks(ctx);
+        Map<String, Object> o = cache.get(ctx.schoolId, "pulse|" + ctx.phone + "|" + java.time.LocalDate.now(), PULSE_TTL,
+                () -> buildPulse(ctx),
+                Dep.MESSAGES, Dep.READMARKS, Dep.ANNOUNCEMENTS, Dep.STUDENTS, Dep.LINKS,
+                Dep.DIARY, Dep.RESULTS, Dep.ATTENDANCE);
+        return ResponseEntity.ok(o);
+    }
+
+    /** Must read from the database directly: a cache loader may not call the cache again. */
+    private Map<String, Object> buildPulse(ParentContext.Ctx ctx) {
+        Map<String, Instant> marks = readMarksUncached(ctx);
         long lastId = 0;
         int total = 0;
         Map<String, Integer> byChild = new LinkedHashMap<>();
         Map<String, Long> inByChild = new LinkedHashMap<>();
         Map<String, Long> annByChild = new LinkedHashMap<>();
+        // Homework, results and today's attendance, so those can raise an alert too (not only chat + notices).
+        Map<String, Long> diaryByChild = new LinkedHashMap<>();
+        Map<String, Long> resultsByChild = new LinkedHashMap<>();
+        Map<String, String> attByChild = new LinkedHashMap<>();
+        final java.time.LocalDate today = java.time.LocalDate.now();
 
-        // Class announcements are read ONCE for the whole parent, then matched to each child.
-        List<Announcement> announcements = announcementRepository.findBySchoolIdAndAudienceOrderByCreatedAtDesc(
+        // Class announcements are read ONCE for the whole parent (id + class only), then matched to each child.
+        List<Object[]> announcements = announcementRepository.findIdAndClassBySchoolIdAndAudience(
                 ctx.schoolId, Announcement.AUD_CLASS, PageRequest.of(0, 200));
 
         for (ParentChildDTO child : ctx.kids) {
             int unread = 0;
             long lastIncoming = 0;
-            for (Message m : loadAll(ctx, child)) {
+            for (Message m : loadAllUncached(ctx, child)) {
                 if (m.getId() != null && m.getId() > lastId) lastId = m.getId();
                 boolean fromParent = Message.FROM_PARENT.equals(m.getSenderType());
                 if (!fromParent && m.getId() != null && m.getId() > lastIncoming) lastIncoming = m.getId();
@@ -154,12 +189,24 @@ public class ParentMessageController {
             total += unread;
 
             long newestAnnouncement = 0;
-            for (Announcement a : announcements) {
-                if (a.getId() != null && a.getId() > newestAnnouncement && ParentUtil.classMatches(a.getClassName(), child)) {
-                    newestAnnouncement = a.getId();
+            for (Object[] row : announcements) {
+                if (row[0] == null) continue;
+                long id = ((Number) row[0]).longValue();
+                if (id > newestAnnouncement && ParentUtil.classMatches((String) row[1], child)) {
+                    newestAnnouncement = id;
                 }
             }
             annByChild.put(child.getRegNo(), newestAnnouncement);
+
+            Long newestDiary = diaryRepository.findNewestPublishedId(ctx.schoolId, ParentUtil.classLabel(child));
+            diaryByChild.put(child.getRegNo(), newestDiary == null ? 0L : newestDiary);
+            resultsByChild.put(child.getRegNo(), resultRepository.countBySchoolIdAndRegNoAndVisibleTrue(ctx.schoolId, child.getRegNo()));
+            String att = "";
+            for (com.softschool.backend.dto.ParentAttendanceDTO a :
+                    attendanceRepository.findParentView(ctx.schoolId, child.getRegNo(), today, today)) {
+                if ("STUDENT".equalsIgnoreCase(a.getMemberType())) att = ParentUtil.normalizeAttendance(a.getStatus());
+            }
+            attByChild.put(child.getRegNo(), att);
         }
         Map<String, Object> o = new LinkedHashMap<>();
         o.put("unread", total);
@@ -167,7 +214,11 @@ public class ParentMessageController {
         o.put("lastId", lastId);
         o.put("inByChild", inByChild);
         o.put("annByChild", annByChild);
-        return ResponseEntity.ok(o);
+        o.put("diaryByChild", diaryByChild);
+        o.put("resultsByChild", resultsByChild);
+        o.put("attByChild", attByChild);
+        o.put("today", today.toString());
+        return o;
     }
 
     // ───────────── SEND ─────────────
@@ -305,8 +356,14 @@ public class ParentMessageController {
 
     // ───────────── helpers ─────────────
 
-    /** Every message this child can see, oldest first. */
+    /** Every message this child can see, oldest first (cached briefly; a send or a class change drops it at once). */
     private List<Message> loadAll(ParentContext.Ctx ctx, ParentChildDTO child) {
+        return cache.get(ctx.schoolId, "msgs|" + child.getRegNo(), MESSAGES_TTL,
+                () -> loadAllUncached(ctx, child), Dep.MESSAGES, Dep.STUDENTS);
+    }
+
+    /** Same list, straight from the database. */
+    private List<Message> loadAllUncached(ParentContext.Ctx ctx, ParentChildDTO child) {
         Map<Long, Message> byId = new LinkedHashMap<>();
         for (Message m : parentMessageRepository.findBySchoolIdAndStudentRegNoAndChannelInOrderByCreatedAtDesc(
                 ctx.schoolId, child.getRegNo(), PRIVATE_CHANNELS, PageRequest.of(0, MAX_LIST))) byId.put(m.getId(), m);
@@ -325,6 +382,10 @@ public class ParentMessageController {
     }
 
     private Map<String, Instant> readMarks(ParentContext.Ctx ctx) {
+        return cache.get(ctx.schoolId, "rm|" + ctx.phone, 30, () -> readMarksUncached(ctx), Dep.READMARKS);
+    }
+
+    private Map<String, Instant> readMarksUncached(ParentContext.Ctx ctx) {
         Map<String, Instant> m = new HashMap<>();
         for (ParentReadMark r : readMarkRepository.findBySchoolIdAndPhone(ctx.schoolId, ctx.phone)) m.put(r.getThreadKey(), r.getReadAt());
         return m;

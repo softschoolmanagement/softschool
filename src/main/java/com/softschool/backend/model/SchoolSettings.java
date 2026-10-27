@@ -20,6 +20,7 @@ import java.util.List;
  * Blocking/unblocking a school does NOT touch this table.
  */
 @Entity
+@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
 @Table(name = "school_settings")
 public class SchoolSettings {
 
@@ -68,6 +69,11 @@ public class SchoolSettings {
     private Integer autosave2Minute = 0;
     private String  autosave2Meridiem = "PM";
     private Boolean autosave2Enabled = true;
+
+    // ── Attendance Setting: tell parents when their child is marked absent ───
+    // Off by default. When on, every time student attendance is saved for today,
+    // the parent of each absent student gets one notice in the School Office chat.
+    private Boolean dailyAbsentNotify = false;
 
     // ── Class Fee Structure ──────────────────────
     @ElementCollection(fetch = FetchType.EAGER)
@@ -352,6 +358,14 @@ public class SchoolSettings {
         this.autosave2Enabled = autosave2Enabled;
     }
 
+
+    public Boolean getDailyAbsentNotify() {
+        return dailyAbsentNotify != null && dailyAbsentNotify;   // rows created before this column existed read as "off"
+    }
+
+    public void setDailyAbsentNotify(Boolean dailyAbsentNotify) {
+        this.dailyAbsentNotify = dailyAbsentNotify != null && dailyAbsentNotify;
+    }
     public List<ClassFee> getClasses() {
         return classes;
     }

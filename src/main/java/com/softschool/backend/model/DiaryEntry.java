@@ -18,6 +18,7 @@ import java.time.Instant;
  */
 @Entity
 @Data
+@EntityListeners(com.softschool.backend.service.DataCacheInvalidationListener.class)
 @Table(name = "diary_entry",
        indexes = {
            @Index(name = "idx_diary_staff", columnList = "schoolId,staffId,createdAt"),

@@ -23,7 +23,7 @@ import java.util.Map;
  *
  *   GET   /api/settings/{schoolId}         -> load everything (School Info tab wires all fields at once)
  *   PUT   /api/settings/{schoolId}         -> "Save All" button (school info + classes + late fee + pay variables)
- *   PUT   /api/settings/{schoolId}/timing  -> "Save Timings" button (Attendance Timing tab, saved separately)
+ *   PUT   /api/settings/{schoolId}/timing  -> "Save" button (Attendance Setting tab: auto-save times + daily absent notice, saved separately)
  *   GET   /api/settings/{schoolId}/classes -> just the class fee structure grid
  *   POST  /api/settings/{schoolId}/reset   -> "Reset" button (restores defaults for that school)
  *
@@ -267,6 +267,9 @@ public class SchoolSettingsController {
         settings.setAutosave2Minute(incoming.getAutosave2Minute());
         settings.setAutosave2Meridiem(incoming.getAutosave2Meridiem());
         settings.setAutosave2Enabled(incoming.getAutosave2Enabled());
+
+        // "Attendance Setting" tab: daily absent notice to parents
+        settings.setDailyAbsentNotify(incoming.getDailyAbsentNotify());
 
         return ResponseEntity.ok(repository.save(settings));
     }

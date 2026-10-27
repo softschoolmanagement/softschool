@@ -2,7 +2,10 @@ package com.softschool.backend.controller;
 
 import com.softschool.backend.model.Attendance;
 import com.softschool.backend.repository.AttendanceRepository;
+import com.softschool.backend.service.DataCacheService;
+import com.softschool.backend.service.DataCacheService.Dep;
 import com.softschool.backend.service.PlanEnforcementService;
+import com.softschool.backend.service.StudentCacheService;
 import com.softschool.backend.service.ZktecoService;
 
 import org.springframework.beans.factory.annotation.Autowired;
@@ -25,6 +28,18 @@ public class AttendanceController {
 
     @Autowired
     private PlanEnforcementService planEnforcementService;
+
+    @Autowired
+    private com.softschool.backend.service.ParentNoticeService parentNoticeService;
+
+    // PERFORMANCE: the read endpoints below are polled by the dashboard / attendance / reports pages.
+    // Their finished JSON is cached per school and rebuilt only after an attendance row of that school
+    // changes (DataCacheInvalidationListener), so repeated polls cost no MySQL query and no serialisation.
+    @Autowired
+    private DataCacheService dataCache;
+
+    @Autowired
+    private StudentCacheService studentCache;
 
     @PostMapping("/save")
     public ResponseEntity<String> saveAttendance(@RequestBody List<Attendance> attendanceList) {
@@ -95,6 +110,11 @@ public class AttendanceController {
         }
 
         attendanceRepository.saveAll(toPersist);
+
+        // Settings > Attendance Setting > "Send daily absent notice to parents": tell the parent of every
+        // student marked absent today. Does nothing while that setting is off and never fails the save.
+        parentNoticeService.syncAbsentAlerts(attendanceList.get(0).getSchoolId(), toPersist);
+
         return ResponseEntity.ok("Saved " + toPersist.size() + " records successfully!");
     }
 
@@ -123,11 +143,16 @@ public String testBiometric(@RequestParam String id) {
 // returns every row for the school, across every date, so Reports can
 // build its own per-month breakdown the same way the other trend charts do.
 @GetMapping("/all")
-public ResponseEntity<?> getAllAttendance(@RequestParam String schoolId) {
+public ResponseEntity<?> getAllAttendance(
+        @RequestParam String schoolId,
+        @RequestHeader(value = "Accept-Encoding", required = false) String acceptEncoding) {
     if (schoolId == null || schoolId.trim().isEmpty()) {
         return ResponseEntity.badRequest().body("schoolId is required");
     }
-    return ResponseEntity.ok(attendanceRepository.findBySchoolId(schoolId));
+    // Cached as finished, gzipped JSON (bounded by bytes): this is the whole year's rows for the school.
+    return studentCache.toResponse(
+            dataCache.getJson(schoolId, "att-all", () -> attendanceRepository.findBySchoolId(schoolId), Dep.ATTENDANCE),
+            acceptEncoding);
 }
 
 // Dashboard summary for one day: how many students/staff are marked
@@ -141,7 +166,14 @@ public ResponseEntity<?> getAttendanceSummary(@RequestParam String date, @Reques
     if (schoolId == null || schoolId.trim().isEmpty()) {
         return ResponseEntity.badRequest().body("schoolId is required");
     }
-    List<Attendance> records = attendanceRepository.findByDateAndSchoolId(LocalDate.parse(date), schoolId);
+    final LocalDate day = LocalDate.parse(date);
+    Map<String, Object> summary = dataCache.get(schoolId, "att-summary|" + day, 30,
+            () -> buildAttendanceSummary(day, schoolId), Dep.ATTENDANCE);
+    return ResponseEntity.ok(summary);
+}
+
+private Map<String, Object> buildAttendanceSummary(LocalDate day, String schoolId) {
+    List<Attendance> records = attendanceRepository.findByDateAndSchoolId(day, schoolId);
 
     long presentStudents = records.stream()
             .filter(a -> "STUDENT".equalsIgnoreCase(a.getMemberType()))
@@ -158,7 +190,7 @@ public ResponseEntity<?> getAttendanceSummary(@RequestParam String date, @Reques
     summary.put("presentStudents", presentStudents);
     summary.put("presentStaff", presentStaff);
     summary.put("hasData", !records.isEmpty());
-    return ResponseEntity.ok(summary);
+    return summary;
 }
 
 // Marked students for one school on one day — mirrors /staff below, but
@@ -170,38 +202,56 @@ public ResponseEntity<?> getAttendanceSummary(@RequestParam String date, @Reques
 public ResponseEntity<?> getStudentAttendance(
         @RequestParam String date,
         @RequestParam String schoolId,
-        @RequestParam(required = false) String className) {
+        @RequestParam(required = false) String className,
+        @RequestHeader(value = "Accept-Encoding", required = false) String acceptEncoding) {
     if (schoolId == null || schoolId.trim().isEmpty()) {
         return ResponseEntity.badRequest().body("schoolId is required");
     }
-    LocalDate parsedDate = LocalDate.parse(date);
-    if (className != null && !className.trim().isEmpty()) {
-        return ResponseEntity.ok(attendanceRepository.findByMemberTypeAndDateAndSchoolIdAndClassName(
-                "STUDENT", parsedDate, schoolId, className));
-    }
-    return ResponseEntity.ok(
-            attendanceRepository.findByMemberTypeAndDateAndSchoolId("STUDENT", parsedDate, schoolId));
+    final LocalDate parsedDate = LocalDate.parse(date);
+    final boolean byClass = className != null && !className.trim().isEmpty();
+    return studentCache.toResponse(
+            dataCache.getJson(schoolId, "att-students|" + parsedDate + "|" + (byClass ? className : ""),
+                    () -> byClass
+                            ? attendanceRepository.findByMemberTypeAndDateAndSchoolIdAndClassName(
+                                    "STUDENT", parsedDate, schoolId, className)
+                            : attendanceRepository.findByMemberTypeAndDateAndSchoolId(
+                                    "STUDENT", parsedDate, schoolId),
+                    Dep.ATTENDANCE),
+            acceptEncoding);
 }
 
 @GetMapping("/staff")
-public ResponseEntity<?> getStaffAttendance(@RequestParam String date, @RequestParam String schoolId) {
+public ResponseEntity<?> getStaffAttendance(
+        @RequestParam String date,
+        @RequestParam String schoolId,
+        @RequestHeader(value = "Accept-Encoding", required = false) String acceptEncoding) {
     // This returns all marked staff for today (biometric or manual), for ONE school only.
     if (schoolId == null || schoolId.trim().isEmpty()) {
         return ResponseEntity.badRequest().body("schoolId is required");
     }
-    return ResponseEntity.ok(
-            attendanceRepository.findByMemberTypeAndDateAndSchoolId("STAFF", LocalDate.parse(date), schoolId));
+    final LocalDate parsedDate = LocalDate.parse(date);
+    return studentCache.toResponse(
+            dataCache.getJson(schoolId, "att-staff|" + parsedDate,
+                    () -> attendanceRepository.findByMemberTypeAndDateAndSchoolId("STAFF", parsedDate, schoolId),
+                    Dep.ATTENDANCE),
+            acceptEncoding);
 }
 
 // Full attendance history for one member (staff or student), scoped to
 // their school so the frontend's "History" view never shows another
 // school's records even if the memberId string happens to match.
 @GetMapping("/history/{memberId}")
-public ResponseEntity<?> getMemberHistory(@PathVariable String memberId, @RequestParam String schoolId) {
+public ResponseEntity<?> getMemberHistory(
+        @PathVariable String memberId,
+        @RequestParam String schoolId,
+        @RequestHeader(value = "Accept-Encoding", required = false) String acceptEncoding) {
     if (schoolId == null || schoolId.trim().isEmpty()) {
         return ResponseEntity.badRequest().body("schoolId is required");
     }
-    return ResponseEntity.ok(
-            attendanceRepository.findByMemberIdAndSchoolIdOrderByDateDesc(memberId, schoolId));
+    return studentCache.toResponse(
+            dataCache.getJson(schoolId, "att-history|" + memberId,
+                    () -> attendanceRepository.findByMemberIdAndSchoolIdOrderByDateDesc(memberId, schoolId),
+                    Dep.ATTENDANCE),
+            acceptEncoding);
 }
 }

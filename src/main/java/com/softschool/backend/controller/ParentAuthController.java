@@ -266,8 +266,10 @@ public class ParentAuthController {
 
         String oldPassword = req == null ? null : req.get("oldPassword");
         String newPassword = req == null ? null : req.get("newPassword");
-        String tail = ParentUtil.tail10(req == null ? null : req.get("phone"));
-        // The phone typed on the page must be the one this session belongs to.
+        // The Settings page sends no phone: the session already knows which parent this is. The older
+        // change-password page still sends one, and then it must be the one this session belongs to.
+        String sentPhone = req == null ? null : req.get("phone");
+        String tail = sentPhone == null || sentPhone.isBlank() ? ctx.phone : ParentUtil.tail10(sentPhone);
         if (tail == null || !tail.equals(ctx.phone)) {
             return ParentUtil.error(HttpStatus.FORBIDDEN, "That phone number does not match your account.");
         }

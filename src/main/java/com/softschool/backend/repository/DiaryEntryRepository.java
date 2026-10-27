@@ -17,6 +17,12 @@ public interface DiaryEntryRepository extends JpaRepository<DiaryEntry, Long> {
     /** What the parent portal will show: published entries of one class. */
     List<DiaryEntry> findBySchoolIdAndClassNameAndPublishedTrueOrderByCreatedAtDesc(String schoolId, String className, Pageable pageable);
 
+    /** PERFORMANCE - parent /pulse: only the newest published entry id of one class (null when none). */
+    @org.springframework.data.jpa.repository.Query(
+        "select max(d.id) from DiaryEntry d where d.schoolId = :schoolId and d.className = :className and d.published = true")
+    Long findNewestPublishedId(@org.springframework.data.repository.query.Param("schoolId") String schoolId,
+                               @org.springframework.data.repository.query.Param("className") String className);
+
     Optional<DiaryEntry> findByIdAndSchoolId(Long id, String schoolId);
 
     long countBySchoolIdAndStaffIdAndCreatedAtAfter(String schoolId, String staffId, Instant after);
