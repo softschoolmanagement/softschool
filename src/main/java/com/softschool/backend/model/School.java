@@ -6,8 +6,12 @@ import java.time.LocalDate;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import lombok.AllArgsConstructor;
+import org.hibernate.annotations.DynamicUpdate;
 
 @Entity
+// Login saves this row (remember token, hash upgrade). Without this, Hibernate re-sends EVERY column,
+// including the large base64 `logo` LONGTEXT, on each login. Now only changed columns are written.
+@DynamicUpdate
 @Table(name = "schools")
 @Data               // Automatically creates Getters, Setters, toString, equals, hashCode
 @NoArgsConstructor  // Required by JPA
