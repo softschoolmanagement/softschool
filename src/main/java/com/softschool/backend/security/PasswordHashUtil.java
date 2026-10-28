@@ -44,6 +44,7 @@ import java.util.Base64;
 public final class PasswordHashUtil {
 
     private static final String PREFIX = "pbkdf2";
+    private static final String TOKEN_PREFIX = "sha256$";
     private static final int ITERATIONS = 600_000;
     private static final int SALT_BYTES = 16;
     private static final int KEY_BITS = 256;
@@ -62,10 +63,34 @@ public final class PasswordHashUtil {
                 + Base64.getEncoder().encodeToString(dk);
     }
 
-    /** Constant-time compare against a stored hash (PBKDF2 or legacy SHA-256). */
+    /**
+     * Hash for HIGH-ENTROPY random tokens (e.g. the 256-bit "Remember Me" token). Such a value cannot be
+     * brute-forced, so the deliberately slow PBKDF2 used for human passwords only wastes ~0.3-1s of CPU per
+     * call. A salted SHA-256 is the right tool here. Format: "sha256$<base64 salt>$<base64 hash>".
+     * NEVER use this for human-chosen passwords - use {@link #hash(String)}.
+     */
+    public static String hashToken(String token) {
+        byte[] salt = new byte[SALT_BYTES];
+        RANDOM.nextBytes(salt);
+        try {
+            return TOKEN_PREFIX + Base64.getEncoder().encodeToString(salt) + "$"
+                    + Base64.getEncoder().encodeToString(legacySha256(salt, token));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
+    }
+
+    /** Constant-time compare against a stored hash (PBKDF2, fast token hash, or legacy SHA-256). */
     public static boolean verify(String plaintext, String stored) {
         if (plaintext == null || stored == null) return false;
         try {
+            if (stored.startsWith(TOKEN_PREFIX)) {
+                String[] p = stored.split("\\$");
+                if (p.length != 3) return false;
+                byte[] salt = Base64.getDecoder().decode(p[1]);
+                byte[] expected = Base64.getDecoder().decode(p[2]);
+                return MessageDigest.isEqual(expected, legacySha256(salt, plaintext));
+            }
             if (stored.startsWith(PREFIX + "$")) {
                 String[] p = stored.split("\\$");
                 if (p.length != 4) return false;
