@@ -445,7 +445,9 @@ public class SchoolAuthController {
         byte[] tokenBytes = new byte[32];
         RANDOM.nextBytes(tokenBytes);
         String token = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes);
-        school.setRememberTokenHash(hashPassword(token));
+        // 256-bit random token: a fast salted SHA-256 is enough (PBKDF2 here cost an extra ~0.5s per login
+        // and per auto-login). Tokens already stored with PBKDF2 still verify and get replaced on first use.
+        school.setRememberTokenHash(PasswordHashUtil.hashToken(token));
         school.setRememberTokenExpiry(Instant.now().plus(REMEMBER_TOKEN_DAYS, ChronoUnit.DAYS));
         return token;
     }
