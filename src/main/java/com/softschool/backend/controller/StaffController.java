@@ -13,7 +13,10 @@ import com.softschool.backend.repository.DropoutStaffRecordRepository;
 import com.softschool.backend.repository.FinanceRepository;
 import com.softschool.backend.repository.SchoolSettingsRepository;
 import com.softschool.backend.repository.StaffRepository;
+import com.softschool.backend.service.DataCacheService;
+import com.softschool.backend.service.DataCacheService.Dep;
 import com.softschool.backend.service.PlanEnforcementService;
+import com.softschool.backend.service.StudentCacheService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -57,6 +60,12 @@ public class StaffController {
 
     @Autowired
     private SchoolSettingsRepository schoolSettingsRepository;
+
+    @Autowired
+    private DataCacheService dataCache;
+
+    @Autowired
+    private StudentCacheService studentCache;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -194,13 +203,24 @@ public class StaffController {
      * Manage Staff.
      */
     @GetMapping("/summary")
-    public ResponseEntity<?> getSummary(@RequestParam(required = false) String schoolId) {
+    public ResponseEntity<?> getSummary(
+            @RequestParam(required = false) String schoolId,
+            @RequestHeader(value = "Accept-Encoding", required = false) String acceptEncoding) {
         if (isBlank(schoolId)) {
             return badRequest("schoolId query parameter is required.");
         }
-        List<StaffSummaryDTO> summaryList = staffRepository.findSummaryBySchoolId(schoolId);
-        applyAbsenceFinesToSummary(summaryList, schoolId);
-        return ResponseEntity.ok(summaryList);
+        // PERFORMANCE FIX - the dashboard (and the setup check) call this on every load, and each call used to
+        // read a whole month of attendance rows to work out absence fines. The result only changes when staff,
+        // attendance or the Leave Penalty setting change (all three bump the cache version), and the month is
+        // part of the key so fines roll over on the 1st. Same cache + gzip path as the other heavy reads.
+        final String monthKey = java.time.YearMonth.now().toString();
+        return studentCache.toResponse(
+                dataCache.getJson(schoolId, "staff-summary|" + monthKey, () -> {
+                    List<StaffSummaryDTO> summaryList = staffRepository.findSummaryBySchoolId(schoolId);
+                    applyAbsenceFinesToSummary(summaryList, schoolId);
+                    return summaryList;
+                }, Dep.STAFF, Dep.ATTENDANCE, Dep.SETTINGS),
+                acceptEncoding);
     }
 
     /**
