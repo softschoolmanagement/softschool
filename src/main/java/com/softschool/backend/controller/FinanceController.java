@@ -1590,6 +1590,117 @@ public class FinanceController {
         return ResponseEntity.ok(result);
     }
 
+    // =========================================================
+    // LATE FINE WAIVER — "Fine Waived Off" in the Pay Bill screen
+    // =========================================================
+    /**
+     * FEATURE — lets the admin waive a student's late fine for a month while
+     * taking a payment.
+     *
+     * The late fine is derived on the frontend (manage-finance.js's
+     * computeFeeBreakdown / isPastDue) and is NOT part of the STUDENT_FEE
+     * ledger row, so waiving it never changes netPayable / paidAmount /
+     * remainingBalance here. What it needs is a durable flag the frontend can
+     * read back on any device: one LATE_FINE_WAIVER row per
+     * (schoolId, regNo, monthKey). GET /late-fine-waivers/{monthKey} returns
+     * those rows and the frontend stops adding the late fine for them.
+     *
+     * Idempotent: waiving the same student+month again updates the existing
+     * row (amount / reason) instead of creating a duplicate.
+     */
+    @PostMapping("/waive-late-fine")
+    @Transactional
+    public ResponseEntity<?> waiveLateFine(@RequestBody Map<String, Object> payload) {
+        String schoolId = str(payload, "schoolId");
+        String regNo = str(payload, "regNo");
+        String monthKey = str(payload, "monthKey");
+        String reason = str(payload, "reason");
+        Double amount = doubleOrNull(payload, "amount");
+
+        if (isBlank(schoolId)) return badRequest("schoolId is required.");
+        planEnforcementService.requireFeature(schoolId, PlanEnforcementService.FEATURE_FINANCE);
+        if (isBlank(regNo) || isBlank(monthKey)) {
+            return badRequest("regNo and monthKey are required.");
+        }
+
+        Student student = findStudentInSchool(regNo, schoolId);
+        if (student == null) {
+            return badRequest("Student not found.");
+        }
+        String studentRegNo = student.getRegNo();
+
+        Finance row = financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolId(
+                studentRegNo, monthKey, Finance.TYPE_LATE_FINE_WAIVER, schoolId).orElse(null);
+        if (row == null) {
+            row = new Finance();
+            row.setSchoolId(schoolId);
+            row.setRecordType(Finance.TYPE_LATE_FINE_WAIVER);
+            row.setRegNo(studentRegNo);
+            row.setMonthKey(monthKey);
+            row.stampApplyNow();
+        }
+        row.setStudentName(student.getFullName());
+        row.setStudentClass(student.getStudentClass());
+        row.setSection(student.getSection());
+        row.setGuardianName(student.getGuardianName());
+        row.setAmount(amount != null && amount > 0 ? amount : 0.0);
+        row.setReason(isBlank(reason) ? "" : reason.trim());
+        row.setPaymentStatus("Waived");
+        row.stampPayNow();
+        row.setLastTransactionDate(new Date());
+        financeRepository.save(row);
+
+        return ResponseEntity.ok(lateFineWaiverView(row));
+    }
+
+    /** Undo a waiver — the late fine is charged again. Safe to call when none exists. */
+    @DeleteMapping("/waive-late-fine/{regNo}/{monthKey}")
+    @Transactional
+    public ResponseEntity<?> undoLateFineWaiver(@PathVariable String regNo,
+                                                @PathVariable String monthKey,
+                                                @RequestParam String schoolId) {
+        if (isBlank(schoolId)) return badRequest("schoolId is required.");
+        planEnforcementService.requireFeature(schoolId, PlanEnforcementService.FEATURE_FINANCE);
+
+        Optional<Finance> row = financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolId(
+                regNo, monthKey, Finance.TYPE_LATE_FINE_WAIVER, schoolId);
+        row.ifPresent(financeRepository::delete);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("regNo", regNo);
+        result.put("monthKey", monthKey);
+        result.put("removed", row.isPresent());
+        return ResponseEntity.ok(result);
+    }
+
+    /** Every late-fine waiver recorded for a month (the frontend turns this into a regNo -> waiver map). */
+    @GetMapping("/late-fine-waivers/{monthKey}")
+    public ResponseEntity<?> getLateFineWaivers(@PathVariable String monthKey,
+                                                @RequestParam String schoolId) {
+        if (isBlank(schoolId)) return badRequest("schoolId is required.");
+        return cachedJson(schoolId, "fin-late-waivers|" + monthKey, () -> {
+            List<Map<String, Object>> out = new ArrayList<>();
+            for (Finance row : financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
+                    monthKey, Finance.TYPE_LATE_FINE_WAIVER, schoolId)) {
+                out.add(lateFineWaiverView(row));
+            }
+            return out;
+        });
+    }
+
+    private Map<String, Object> lateFineWaiverView(Finance row) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("regNo", row.getRegNo());
+        m.put("monthKey", row.getMonthKey());
+        m.put("amount", nz(row.getAmount()));
+        m.put("reason", row.getReason() != null ? row.getReason() : "");
+        m.put("payDate", row.getPayDate());
+        m.put("payTime", row.getPayTime());
+        m.put("date", row.getLastTransactionDate() != null
+                ? row.getLastTransactionDate().toInstant().toString() : null);
+        return m;
+    }
+
     // Staff advances are a special case: real advances are already written
     // one row at a time by POST /salary/advance (TYPE_ADVANCE) and consumed
     // by paySalary()'s math above, so PUT here writes to a separate
