@@ -95,6 +95,17 @@ public class Finance {
     // /staff-advances merges both sets back together for the frontend.
     public static final String TYPE_STAFF_ADVANCE_BULK = "STAFF_ADVANCE_BULK";
 
+    // FEATURE — "don't reprint a Family Voucher that was already printed this
+    // month". One row per (schoolId, monthKey, family) is written by
+    // FinanceController#markVouchersPrinted the moment the Print Vouchers
+    // button is pressed for a Family Voucher. The family ID is the normalized
+    // guardian name (same key manage-finance.js's _familyKey() uses to group
+    // siblings), stored in the guardianName column; paymentStatus = "Printed";
+    // payDate/payTime = when it was printed; payloadJson = {familyKey, regNos,
+    // printCount, lastPrintedAt}. Because the row is keyed by monthKey, a new
+    // billing month automatically starts with nothing printed.
+    public static final String TYPE_VOUCHER_PRINT = "VOUCHER_PRINT";
+
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
