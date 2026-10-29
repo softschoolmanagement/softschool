@@ -106,6 +106,17 @@ public class Finance {
     // billing month automatically starts with nothing printed.
     public static final String TYPE_VOUCHER_PRINT = "VOUCHER_PRINT";
 
+    // FEATURE — "Fine Waived Off" in Pay Bill. One row per (schoolId, regNo,
+    // monthKey) records that the admin waived that student's LATE FINE for
+    // that month. The late fine itself is computed by the frontend (it is not
+    // part of the STUDENT_FEE ledger), so this row is only a flag the
+    // frontend reads back: amount = the late fine that was waived, reason =
+    // the admin's optional note, paymentStatus = "Waived", payDate/payTime =
+    // when it was waived. Written by FinanceController#waiveLateFine, removed
+    // by #undoLateFineWaiver. No new column is needed — it reuses the
+    // existing regNo/monthKey/amount/reason/paymentStatus columns.
+    public static final String TYPE_LATE_FINE_WAIVER = "LATE_FINE_WAIVER";
+
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
