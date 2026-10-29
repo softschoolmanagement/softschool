@@ -1400,6 +1400,196 @@ public class FinanceController {
         return bulkSave(Finance.TYPE_VOUCHER, payload);
     }
 
+    // =========================================================
+    // FAMILY VOUCHER PRINT TRACKING
+    // =========================================================
+    /**
+     * Called when the user presses Print in the Print Vouchers flow (a single
+     * student, a class, or all classes). The frontend sends every Family
+     * Voucher it is about to print — one entry per family: { familyKey,
+     * regNos }. For each family, this checks whether it has already been
+     * marked "Printed" for monthKey:
+     *   - not printed yet  -> marked Printed now, returned in "toPrint"
+     *   - already printed  -> returned in "skipped" (the frontend leaves it
+     *                         out of the print job, saving the wasted pages)
+     * Pass force=true to deliberately reprint: nothing is skipped and the
+     * family's printCount is incremented.
+     *
+     * Check + mark happen together in one transaction, so two people pressing
+     * Print at the same time can't both get the same family in "toPrint".
+     */
+    @PostMapping("/voucher-print")
+    @Transactional
+    public ResponseEntity<?> markVouchersPrinted(@RequestBody Map<String, Object> payload) {
+        String schoolId = str(payload, "schoolId");
+        String monthKey = str(payload, "monthKey");
+        if (isBlank(schoolId)) return badRequest("schoolId is required.");
+        planEnforcementService.requireFeature(schoolId, PlanEnforcementService.FEATURE_FINANCE);
+        if (isBlank(monthKey)) return badRequest("monthKey is required.");
+        if (!(payload.get("families") instanceof List)) return badRequest("families array is required.");
+        boolean force = Boolean.parseBoolean(str(payload, "force"));
+        long printedAtMs = longOrZero(payload.get("printedAt"));
+        if (printedAtMs <= 0L) printedAtMs = System.currentTimeMillis();
+
+        // family key -> already-printed row for this month
+        Map<String, Finance> printedRows = new HashMap<>();
+        for (Finance row : financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
+                monthKey, Finance.TYPE_VOUCHER_PRINT, schoolId)) {
+            if (!isBlank(row.getGuardianName())) printedRows.put(row.getGuardianName(), row);
+        }
+
+        List<String> toPrint = new ArrayList<>();
+        List<String> skipped = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+
+        for (Object item : (List<?>) payload.get("families")) {
+            if (!(item instanceof Map)) continue;
+            Map<?, ?> fam = (Map<?, ?>) item;
+            Object rawKeyObj = fam.get("familyKey");
+            String rawKey = rawKeyObj != null ? rawKeyObj.toString() : null;
+            if (isBlank(rawKey)) continue;
+            String key = rawKey.trim().toLowerCase(Locale.ROOT);
+            if (!seen.add(key)) continue; // same family listed twice in one request
+
+            Finance row = printedRows.get(key);
+
+            // A voucher generated for one of this family's children AFTER the
+            // family was last printed means the printed copy is out of date
+            // (e.g. a sibling's voucher was generated later), so the "already
+            // printed" skip must NOT apply — it prints again and is re-marked.
+            // Both timestamps come from the browser's clock (voucher
+            // generatedAt vs. the printedAt sent with the print request), so
+            // they're directly comparable.
+            boolean regeneratedAfterPrint = false;
+            if (row != null) {
+                long latestVoucherAt = longOrZero(fam.get("latestVoucherAt"));
+                long lastPrintedAt = 0L;
+                try {
+                    lastPrintedAt = objectMapper.readTree(row.getPayloadJson()).path("printedAtMs").asLong(0L);
+                } catch (Exception ignored) { /* fall through to the DB timestamp */ }
+                if (lastPrintedAt == 0L && row.getLastTransactionDate() != null) {
+                    lastPrintedAt = row.getLastTransactionDate().getTime();
+                }
+                regeneratedAfterPrint = latestVoucherAt > lastPrintedAt;
+            }
+
+            if (row != null && !force && !regeneratedAfterPrint) {
+                skipped.add(rawKey);
+                continue;
+            }
+
+            int printCount = 1;
+            if (row == null) {
+                row = new Finance();
+                row.setSchoolId(schoolId);
+                row.setRecordType(Finance.TYPE_VOUCHER_PRINT);
+                row.setMonthKey(monthKey);
+                row.setGuardianName(key);
+                printedRows.put(key, row);
+            } else {
+                try {
+                    JsonNode old = objectMapper.readTree(row.getPayloadJson());
+                    printCount = old.path("printCount").asInt(1) + 1;
+                } catch (Exception ignored) {
+                    printCount = 2;
+                }
+            }
+
+            com.fasterxml.jackson.databind.node.ObjectNode json = objectMapper.createObjectNode();
+            json.put("familyKey", key);
+            com.fasterxml.jackson.databind.node.ArrayNode regNos = json.putArray("regNos");
+            if (fam.get("regNos") instanceof List) {
+                for (Object r : (List<?>) fam.get("regNos")) {
+                    if (r != null) regNos.add(r.toString());
+                }
+            }
+            json.put("printCount", printCount);
+            json.put("printedAtMs", printedAtMs);
+            json.put("lastPrintedAt", LocalDateTime.now().toString());
+            try {
+                row.setPayloadJson(objectMapper.writeValueAsString(json));
+            } catch (Exception e) {
+                row.setPayloadJson(null);
+            }
+
+            row.setPaymentStatus("Printed");
+            row.stampPayNow();
+            row.setLastTransactionDate(new Date());
+            financeRepository.save(row);
+            toPrint.add(rawKey);
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("monthKey", monthKey);
+        result.put("toPrint", toPrint);
+        result.put("skipped", skipped);
+        return ResponseEntity.ok(result);
+    }
+
+    /**
+     * Clears "Printed" marks for a month so those Family Vouchers print again.
+     * Used when the user cancels the browser print box (the marks were saved
+     * the moment Print was pressed), from the "Reset print status" button in
+     * the Print Vouchers modal, and automatically on "Move to Next Month".
+     * familyKeys omitted/empty -> every family for that month is reset.
+     */
+    @PostMapping("/voucher-print-reset")
+    @Transactional
+    public ResponseEntity<?> resetVoucherPrintStatus(@RequestBody Map<String, Object> payload) {
+        String schoolId = str(payload, "schoolId");
+        String monthKey = str(payload, "monthKey");
+        if (isBlank(schoolId)) return badRequest("schoolId is required.");
+        planEnforcementService.requireFeature(schoolId, PlanEnforcementService.FEATURE_FINANCE);
+        if (isBlank(monthKey)) return badRequest("monthKey is required.");
+
+        Set<String> onlyKeys = new HashSet<>();
+        if (payload.get("familyKeys") instanceof List) {
+            for (Object k : (List<?>) payload.get("familyKeys")) {
+                if (k != null && !isBlank(k.toString())) {
+                    onlyKeys.add(k.toString().trim().toLowerCase(Locale.ROOT));
+                }
+            }
+        }
+
+        List<Finance> toDelete = new ArrayList<>();
+        for (Finance row : financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
+                monthKey, Finance.TYPE_VOUCHER_PRINT, schoolId)) {
+            if (onlyKeys.isEmpty() || onlyKeys.contains(row.getGuardianName())) toDelete.add(row);
+        }
+        financeRepository.deleteAll(toDelete);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("monthKey", monthKey);
+        result.put("reset", toDelete.size());
+        return ResponseEntity.ok(result);
+    }
+
+    private long longOrZero(Object v) {
+        if (v == null) return 0L;
+        try {
+            return (long) Double.parseDouble(v.toString());
+        } catch (Exception e) {
+            return 0L;
+        }
+    }
+
+    /** Family IDs already marked Printed for a month (read-only, always live). */
+    @GetMapping("/voucher-print-status")
+    public ResponseEntity<?> getVoucherPrintStatus(@RequestParam String schoolId,
+                                                    @RequestParam String monthKey) {
+        if (isBlank(schoolId)) return badRequest("schoolId is required.");
+        if (isBlank(monthKey)) return badRequest("monthKey is required.");
+        List<String> printed = new ArrayList<>();
+        for (Finance row : financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(
+                monthKey, Finance.TYPE_VOUCHER_PRINT, schoolId)) {
+            if (!isBlank(row.getGuardianName())) printed.add(row.getGuardianName());
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("monthKey", monthKey);
+        result.put("printedFamilies", printed);
+        return ResponseEntity.ok(result);
+    }
+
     // Staff advances are a special case: real advances are already written
     // one row at a time by POST /salary/advance (TYPE_ADVANCE) and consumed
     // by paySalary()'s math above, so PUT here writes to a separate
