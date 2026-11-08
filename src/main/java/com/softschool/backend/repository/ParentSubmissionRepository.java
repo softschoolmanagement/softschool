@@ -18,6 +18,8 @@ public interface ParentSubmissionRepository extends JpaRepository<ParentSubmissi
     // Super Admin: every school's submissions of one kind (e.g. "feedback" = feedback about the software).
     List<ParentSubmission> findByKindOrderByCreatedAtDesc(String kind, Pageable pageable);
 
+    long countByKindAndIdGreaterThan(String kind, Long id);
+
     Optional<ParentSubmission> findByIdAndSchoolId(Long id, String schoolId);
 
     long countBySchoolIdAndPhoneAndCreatedAtAfter(String schoolId, String phone, Instant after);

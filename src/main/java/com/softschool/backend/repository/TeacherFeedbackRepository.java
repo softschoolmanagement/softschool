@@ -14,5 +14,7 @@ public interface TeacherFeedbackRepository extends JpaRepository<TeacherFeedback
 
     long countBySchoolIdAndStaffIdAndCreatedAtAfter(String schoolId, String staffId, Instant after);
 
+    long countByIdGreaterThan(Long id);
+
     long deleteBySchoolId(String schoolId);
 }
