@@ -69,6 +69,9 @@ public class SuperAdminController {
     @Autowired
     private ExamGradingRepository examGradingRepository;
 
+    @Autowired
+    private com.softschool.backend.repository.TeacherFeedbackRepository teacherFeedbackRepository;
+
     private static final String SCHOOL_ID_PREFIX = "SS_77";
     private static final String SECURITY_CODE_LETTERS = "abcdefghijklmnopqrstuvwxyz";
     private static final String SECURITY_CODE_DIGITS = "0123456789";
@@ -540,6 +543,7 @@ public ResponseEntity<?> updatePlan(@PathVariable String id, @RequestBody Plan p
             examPaperRepository.deleteBySchoolId(school.getSchoolId());
             examDateSheetRepository.deleteBySchoolId(school.getSchoolId());
             examGradingRepository.deleteBySchoolId(school.getSchoolId());
+            teacherFeedbackRepository.deleteBySchoolId(school.getSchoolId());
             schoolRepository.delete(school);
             return ResponseEntity.noContent().build();
         }).orElse(ResponseEntity.notFound().build());
