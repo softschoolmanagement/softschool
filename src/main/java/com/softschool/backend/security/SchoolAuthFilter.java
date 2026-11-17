@@ -36,7 +36,7 @@ public class SchoolAuthFilter extends OncePerRequestFilter {
     private static final long MAX_INSPECTED_BODY_BYTES = 16L * 1024L * 1024L;
     private static final Set<String> PROTECTED_PREFIXES = Set.of(
             "/api/students", "/api/staff", "/api/finance", "/api/attendance",
-            "/api/biometric", "/api/settings", "/api/exams");
+            "/api/biometric", "/api/settings", "/api/exams", "/api/whatsapp");
 
     @Autowired
     private SchoolSessionService sessionService;
