@@ -54,6 +54,7 @@ public class FinanceController {
     @Autowired private FinanceRepository financeRepository;
     @Autowired private DropoutStaffRecordRepository dropoutStaffRecordRepository;
     @Autowired private PlanEnforcementService planEnforcementService;
+    @Autowired private com.softschool.backend.service.WhatsAppService whatsAppService;
     // PERFORMANCE: the dashboard and Manage Finance poll the read endpoints below. Their finished JSON is
     // cached per school and rebuilt only after a finance row of that school changes (see
     // DataCacheInvalidationListener). The request proxy is only used to read Accept-Encoding.
@@ -835,6 +836,8 @@ public class FinanceController {
 
         Finance savedMaster = financeRepository.save(master);
         refreshPromotionCarrySnapshot(schoolId, regNo, monthKey, nz(savedMaster.getRemainingBalance()));
+        // Settings > WhatsApp: fee receipt to the parent (background, never fails the payment)
+        if (amount > 0) whatsAppService.notifyFeePaid(schoolId, regNo, monthKey, amount, nz(savedMaster.getRemainingBalance()));
         return ResponseEntity.ok(savedMaster);
     }
 

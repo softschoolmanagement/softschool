@@ -32,6 +32,9 @@ public class AttendanceController {
     @Autowired
     private com.softschool.backend.service.ParentNoticeService parentNoticeService;
 
+    @Autowired
+    private com.softschool.backend.service.WhatsAppService whatsAppService;
+
     // PERFORMANCE: the read endpoints below are polled by the dashboard / attendance / reports pages.
     // Their finished JSON is cached per school and rebuilt only after an attendance row of that school
     // changes (DataCacheInvalidationListener), so repeated polls cost no MySQL query and no serialisation.
@@ -114,6 +117,10 @@ public class AttendanceController {
         // Settings > Attendance Setting > "Send daily absent notice to parents": tell the parent of every
         // student marked absent today. Does nothing while that setting is off and never fails the save.
         parentNoticeService.syncAbsentAlerts(attendanceList.get(0).getSchoolId(), toPersist);
+
+        // Settings > WhatsApp: message the parent's WhatsApp for every student marked absent today
+        // (background thread, once per student per day, never fails the save).
+        whatsAppService.notifyAbsent(attendanceList.get(0).getSchoolId(), toPersist);
 
         return ResponseEntity.ok("Saved " + toPersist.size() + " records successfully!");
     }
