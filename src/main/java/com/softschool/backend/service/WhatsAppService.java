@@ -271,7 +271,7 @@ public class WhatsAppService {
         List<Map<String, String>> msgs = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         int noPhone = 0;
-        boolean usesCodes = template != null && template.contains("%[");   // fee codes work in manual messages too
+        boolean usesCodes = template != null && FEE_CODE.matcher(normalizeTemplate(template)).find();   // fee codes work in manual messages too
         String monthKey = YearMonth.now().toString();
         for (Student st : studentRepository.findBySchoolId(schoolId)) {
             if (st.getStatus() != null && !"active".equalsIgnoreCase(st.getStatus())) continue;
@@ -326,7 +326,7 @@ public class WhatsAppService {
     }
 
     private String render(String tpl, String fallback, Student st, String school, Map<String, String> extra) {
-        String t = notBlank(tpl) ? tpl : fallback;
+        String t = normalizeTemplate(notBlank(tpl) ? tpl : fallback);
         Map<String, String> v = new HashMap<>(extra);
         v.put("student", st.getFullName() == null ? "" : st.getFullName());
         v.put("class", (st.getStudentClass() == null ? "" : st.getStudentClass())
@@ -334,8 +334,89 @@ public class WhatsAppService {
         v.put("regno", st.getRegNo() == null ? "" : st.getRegNo());
         v.put("school", school);
         v.putIfAbsent("date", LocalDate.now().format(DAY));
-        for (Map.Entry<String, String> e : v.entrySet()) t = t.replace("{" + e.getKey() + "}", e.getValue());
-        return applyFormatting(applyNewLines(fillCodes(t, v)));
+        // %[code]% student codes: work in EVERY message (absent, fee voucher, fee reminder, message to parents)
+        v.put("stName", st.getFullName() == null ? "" : st.getFullName());
+        v.put("stClass", st.getStudentClass() == null ? "" : st.getStudentClass());
+        v.put("stSection", st.getSection() == null ? "" : st.getSection());
+        v.put("grdName", st.getGuardianName() == null ? "" : st.getGuardianName());
+        v.put("regNo", st.getRegNo() == null ? "" : st.getRegNo());
+        return applyFormatting(applyNewLines(fillCodes(fillPlaceholders(t, v), v)));
+    }
+
+    /** The fee-ledger codes. Student codes (stName, stClass...) need no lookup, so they are not listed here. */
+    private static final Pattern FEE_CODE = Pattern.compile(
+            "%\\[\\s*(feeMonth|dueDate|tutionFee|arr|transportFee|ttlDisc|otherFee|fine|ttlFee|winDue|AfDue)\\s*\\]%?",
+            Pattern.CASE_INSENSITIVE);
+
+    // ─────────────── RTL / Urdu safe templates ───────────────
+    /*
+     * A template typed on an Urdu (right-to-left) keyboard or pasted from a phone often carries hidden
+     * direction marks (LRM, RLM, ZWNJ, embeddings), Arabic look-alike symbols for * and %, full-width
+     * brackets, or braces/brackets typed in mirrored order. normalizeTemplate() turns all of that back
+     * into the exact ASCII tags and codes the rest of this class understands, so formatting, new lines,
+     * {placeholders} and %[codes]% behave the same in Urdu as in English.
+     */
+    private static final String INVC = "\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u2069\\uFEFF\\u061C";
+    private static final String INV = "[" + INVC + "]*";
+    private static final String GAP = "[ \\t\\u00A0" + INVC + "]*";
+    private static final String SPC = "[\\s\\u00A0\\u202F" + INVC + "]*";
+    private static final String STAR = "[*\\u066D\\uFF0A]";
+    private static final String PCT = "[%\\u066A\\uFF05]";
+    private static final String BRACE = "[{}\\uFF5B\\uFF5D]";
+    private static final String SQUARE = "[\\[\\]\\uFF3B\\uFF3D]";
+    private static final String SLASH = "[/\\\\\\uFF0F]";
+
+    private static final Pattern NL_TAG_LOOSE = Pattern.compile(
+            GAP + STAR + INV + BRACE + INV + "n" + INV + "l" + INV + BRACE + INV + STAR + GAP,
+            Pattern.CASE_INSENSITIVE);
+    private static final Pattern FMT_TAG_LOOSE = Pattern.compile(
+            STAR + INV + BRACE + INV + "(" + SLASH + ")?" + INV + "([bis])" + INV + BRACE + INV + STAR,
+            Pattern.CASE_INSENSITIVE);
+    private static final Pattern CODE_LOOSE = Pattern.compile(
+            PCT + INV + SQUARE + SPC + "([A-Za-z]+)" + SPC + SQUARE + INV + "(" + PCT + ")?");
+    private static final Pattern PLACEHOLDER_LOOSE = Pattern.compile(
+            BRACE + INV + "([A-Za-z]+)" + INV + BRACE);
+
+    private static boolean isInvisible(char c) {
+        return (c >= 0x200B && c <= 0x200F) || (c >= 0x202A && c <= 0x202E)
+                || (c >= 0x2060 && c <= 0x2069) || c == 0xFEFF || c == 0x061C;
+    }
+
+    /** Rewrites the loose (Urdu keyboard) forms of *{nL}*, *{b}*...*{/b}* and %[code]% into the exact ASCII forms. */
+    static String normalizeTemplate(String text) {
+        if (text == null || text.isEmpty()) return text;
+        String t = NL_TAG_LOOSE.matcher(text).replaceAll(Matcher.quoteReplacement("*{nL}*"));
+        Matcher f = FMT_TAG_LOOSE.matcher(t);
+        StringBuilder sb = new StringBuilder();
+        while (f.find()) {
+            String slash = f.group(1) == null ? "" : "/";
+            String letter = f.group(2).toLowerCase(Locale.ROOT);
+            f.appendReplacement(sb, Matcher.quoteReplacement("*{" + slash + letter + "}*"));
+        }
+        f.appendTail(sb);
+        t = sb.toString();
+        Matcher c = CODE_LOOSE.matcher(t);
+        sb = new StringBuilder();
+        while (c.find()) {
+            c.appendReplacement(sb, Matcher.quoteReplacement("%[" + c.group(1) + "]" + (c.group(2) != null ? "%" : "")));
+        }
+        c.appendTail(sb);
+        return sb.toString();
+    }
+
+    /** One-pass {student} {class} {school} ... replacement; names are case-insensitive, unknown ones stay as typed. */
+    private static String fillPlaceholders(String text, Map<String, String> values) {
+        if (text == null || text.isEmpty()) return text;
+        Map<String, String> byKey = new HashMap<>();
+        for (Map.Entry<String, String> e : values.entrySet()) byKey.put(e.getKey().toLowerCase(Locale.ROOT), e.getValue());
+        Matcher m = PLACEHOLDER_LOOSE.matcher(text);
+        StringBuilder out = new StringBuilder();
+        while (m.find()) {
+            String val = byKey.get(m.group(1).toLowerCase(Locale.ROOT));
+            m.appendReplacement(out, Matcher.quoteReplacement(val == null ? m.group() : val));
+        }
+        m.appendTail(out);
+        return out.toString();
     }
 
     // ─────────────── new line tag: Fee Month *{nL}* Due Date  ->  two lines ───────────────
@@ -347,6 +428,7 @@ public class WhatsAppService {
 
     /** Replaces every *{nL}* with a real line break. Runs before applyFormatting so styles wrap per line. */
     static String applyNewLines(String text) {
+        text = normalizeTemplate(text);
         if (text == null || text.indexOf('{') < 0) return text;
         return NEWLINE.matcher(text).replaceAll("\n");
     }
@@ -366,6 +448,7 @@ public class WhatsAppService {
      * because WhatsApp formatting cannot span a line break.
      */
     static String applyFormatting(String text) {
+        text = normalizeTemplate(text);
         if (text == null || text.indexOf('{') < 0) return text;
         Matcher m = FMT.matcher(text);
         StringBuilder out = new StringBuilder();
@@ -378,6 +461,10 @@ public class WhatsAppService {
                 if (i > 0) r.append('\n');
                 String line = lines[i];
                 String core = line.strip();
+                int a = 0, b = core.length();
+                while (a < b && isInvisible(core.charAt(a))) a++;
+                while (b > a && isInvisible(core.charAt(b - 1))) b--;
+                core = core.substring(a, b).strip();
                 if (core.isEmpty()) { r.append(line); continue; }
                 int lead = line.length() - line.stripLeading().length();
                 int trail = line.length() - line.stripTrailing().length();
@@ -410,6 +497,7 @@ public class WhatsAppService {
 
     /**
      * Values for the fee codes, read from the student's saved fee ledger row for that month:
+     * (student codes stName stClass stSection grdName regNo are added by render() for every message)
      * stName feeMonth dueDate tutionFee arr transportFee ttlDisc otherFee fine ttlFee winDue AfDue.
      *  - arr      = unpaid balance carried over from the previous month (never more than the row's "other charges")
      *  - otherFee = the rest of the row's "other charges" (custom fee rows)
