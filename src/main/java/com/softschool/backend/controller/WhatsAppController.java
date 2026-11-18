@@ -58,9 +58,16 @@ public class WhatsAppController {
         WhatsAppConfig c = wa.config(school(r));
         if (in.containsKey("enabled")) c.setEnabled(Boolean.TRUE.equals(in.get("enabled")));
         if (in.containsKey("notifyAbsent")) c.setNotifyAbsent(Boolean.TRUE.equals(in.get("notifyAbsent")));
-        if (in.containsKey("notifyFeePaid")) c.setNotifyFeePaid(Boolean.TRUE.equals(in.get("notifyFeePaid")));
+        if (in.get("dailyLimit") instanceof Number n) {
+            int v = n.intValue();
+            c.setDailyLimit(v <= 0 ? null : Math.max(10, Math.min(v, 1000)));
+            wa.pushLimit(school(r), c.getDailyLimit());
+        }
+        if (in.containsKey("notifyVoucher")) c.setNotifyVoucher(Boolean.TRUE.equals(in.get("notifyVoucher")));
+        if (in.containsKey("notifyReminder")) c.setNotifyReminder(Boolean.TRUE.equals(in.get("notifyReminder")));
         if (in.get("absentTemplate") instanceof String s) c.setAbsentTemplate(clip(s));
-        if (in.get("feeTemplate") instanceof String s) c.setFeeTemplate(clip(s));
+        if (in.get("voucherTemplate") instanceof String s) c.setVoucherTemplate(clip(s));
+        if (in.get("reminderTemplate") instanceof String s) c.setReminderTemplate(clip(s));
         return configRepo.save(c);
     }
 

@@ -442,6 +442,10 @@ public class FinanceController {
             f = financeRepository.save(f);
         }
 
+        // Settings > WhatsApp "Fee Voucher": message the parent once per student per month
+        // (background; de-duplicated, so editing/re-saving a voucher never re-sends).
+        whatsAppService.notifyVoucher(schoolId, regNo, monthKey, nz(f.getNetPayable()), nz(f.getRemainingBalance()));
+
         return ResponseEntity.ok(f);
     }
 
@@ -836,8 +840,6 @@ public class FinanceController {
 
         Finance savedMaster = financeRepository.save(master);
         refreshPromotionCarrySnapshot(schoolId, regNo, monthKey, nz(savedMaster.getRemainingBalance()));
-        // Settings > WhatsApp: fee receipt to the parent (background, never fails the payment)
-        if (amount > 0) whatsAppService.notifyFeePaid(schoolId, regNo, monthKey, amount, nz(savedMaster.getRemainingBalance()));
         return ResponseEntity.ok(savedMaster);
     }
 
