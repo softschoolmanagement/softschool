@@ -2,10 +2,11 @@
 // Only the Spring Boot backend talks to this service (shared API key, bind to localhost).
 //
 // Ban protection (see safety.js): every school number has its own queue that drains slowly and
-// "like a person" — random gaps, typing time, rests between batches, hourly/daily caps, quiet hours,
+// "like a person" — random gaps, typing time, rests between batches, hourly/daily caps,
 // a slow warm-up for newly linked numbers, per-parent and duplicate limits, and a pause after errors.
-// Messages are never refused for being too many; they wait in the queue (saved to disk, so a restart
-// does not lose them) and are delivered a little late instead.
+// A single message is sent immediately. Bulk requests (2+ messages) and messages that follow another one
+// within a short time ("in a row") wait in the queue (saved to disk, so a restart does not lose them) and
+// are delivered a little late instead. There is no time-of-day restriction.
 import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
@@ -28,13 +29,10 @@ const cfg = {
   apiKey: process.env.API_KEY || '',
   sessionsDir: path.resolve(process.env.SESSIONS_DIR || './sessions'),
   cc: String(process.env.DEFAULT_COUNTRY_CODE || '92').replace(/\D/g, ''),
-  burstSize: num(process.env.BURST_SIZE, 10),        // this many messages go out quickly when the number has been idle ...
-  burstGapMin: num(process.env.BURST_GAP_MIN_MS, 2000), // ... only 2-5 seconds apart
-  burstGapMax: num(process.env.BURST_GAP_MAX_MS, 5000),
-  burstRefillMs: num(process.env.BURST_REFILL_MS, 2 * MIN), // one burst slot comes back every 2 minutes of rest
-  minDelay: num(process.env.MIN_DELAY_MS, 8000),    // gap between two messages once the burst is used up
+  minDelay: num(process.env.MIN_DELAY_MS, 8000),    // gap between two messages from one number
   maxDelay: num(process.env.MAX_DELAY_MS, 20000),
   maxQueue: num(process.env.MAX_QUEUE, 5000),        // per school; beyond this new messages are refused (429)
+  rowGapMs: num(process.env.DIRECT_ROW_GAP_MS, 30_000), // a single message within this time of the previous send counts as "in a row" -> queued
   maxAgeMs: num(process.env.MAX_QUEUE_AGE_HOURS, 72) * 60 * MIN, // a message still waiting after this is dropped (too stale to be useful)
   maxPerRequest: num(process.env.MAX_PER_REQUEST, 500),
   maxText: num(process.env.MAX_TEXT_LENGTH, 1500),   // very long messages look like spam
@@ -46,8 +44,6 @@ const cfg = {
     batchPauseMin: num(process.env.BATCH_PAUSE_MIN_MS, 3 * MIN),
     batchPauseMax: num(process.env.BATCH_PAUSE_MAX_MS, 7 * MIN),
     perRecipientDaily: num(process.env.PER_RECIPIENT_DAILY, 3),
-    windowStart: num(process.env.SEND_WINDOW_START, 0),   // default 0-24 = send around the clock (set e.g. 8 and 21 to hold messages at night)
-    windowEnd: num(process.env.SEND_WINDOW_END, 24),
     tz: process.env.SEND_TZ || 'Asia/Karachi',
     warmupDays: num(process.env.WARMUP_DAYS, 7),
     warmupStart: num(process.env.WARMUP_START, 30),
@@ -117,6 +113,8 @@ class Session {
     this.freshLink = false;  // true when this start() is a brand-new link (QR/pairing), not a restore
     this.waCache = new Map(); // number -> { jid, exists, at }   (avoid re-checking the same number)
     this.waitReason = null;
+    this.lastSendAt = 0;      // when the last message (direct or queued) went out
+    this.directBusy = false;  // true while a single immediate send is in progress
     this.guard = new SendGuard(cfg.guard, readJson(path.join(this.dir, 'guard.json'), {}));
     const q = readJson(path.join(this.dir, 'queue.json'), []);
     this.queue = Array.isArray(q) ? q : [];
@@ -285,7 +283,57 @@ class Session {
     return out;
   }
 
-  /** Re-checks the limits later (rest, hourly cap, quiet hours ...) and carries on by itself. */
+  /** True when this request may skip the queue: exactly one message, nothing waiting, not "in a row", guard happy. */
+  canSendDirect(items, bulk = false) {
+    if (bulk || items.length !== 1) return false;
+    if (this.state !== 'connected' || !this.sock) return false;
+    if (this.queue.length || this.working || this.directBusy) return false;
+    if (Date.now() - this.lastSendAt < cfg.rowGapMs) return false;   // sent something a moment ago => in a row
+    return this.guard.check().ok;
+  }
+
+  /**
+   * Entry point for /send. Single message -> delivered right now (still typing-delay + all caps).
+   * Bulk / in a row / guard says wait -> goes to the queue and is delivered at a safe pace.
+   */
+  async submit(items, country, bulk = false) {
+    if (!this.canSendDirect(items, bulk)) return { mode: 'queue', results: this.enqueue(items, country) };
+
+    const it = items[0];
+    const to = normalizePhone(it?.to, country);
+    if (!to) return { mode: 'direct', results: [{ to: it?.to, accepted: false, reason: 'invalid number' }] };
+    const text = String(it?.text ?? '').trim().slice(0, cfg.maxText);
+    if (!text) return { mode: 'direct', results: [{ to, accepted: false, reason: 'empty message' }] };
+    // per-parent daily cap / duplicate text: same protection as the queue gives
+    const rule = this.guard.canSendTo(to, text);
+    if (!rule.ok) return { mode: 'direct', results: [{ to, accepted: false, reason: rule.reason }] };
+
+    this.directBusy = true;
+    this.lastSendAt = Date.now(); // claim the slot so a second request right behind this one is queued
+    try {
+      const jid = await this.resolve(to);
+      if (!jid) return { mode: 'direct', results: [{ to, accepted: false, reason: 'number not on WhatsApp' }] };
+      await this.sock.sendPresenceUpdate('composing', jid);
+      await sleep(Math.min(3000, Math.max(800, text.length * 20)) + rand(200, 800));
+      await this.sock.sendMessage(jid, { text });
+      try { await this.sock.sendPresenceUpdate('paused', jid); } catch { /* noop */ }
+      this.guard.recordSent(to, text);
+      this.lastSendAt = Date.now();
+      this.persistSoon();
+      return { mode: 'direct', results: [{ to, accepted: true, sent: true }] };
+    } catch (e) {
+      log.warn({ school: this.schoolId, e: e.message }, 'direct send failed');
+      if (this.state !== 'connected') return { mode: 'queue', results: this.enqueue(items, country) }; // link dropped: retry after reconnect
+      this.guard.recordFailure();
+      this.persistSoon();
+      return { mode: 'direct', results: [{ to, accepted: false, reason: 'send failed' }] };
+    } finally {
+      this.directBusy = false;
+      if (this.queue.length) this.pump();
+    }
+  }
+
+  /** Re-checks the limits later (rest, hourly cap ...) and carries on by itself. */
   wakeIn(ms, reason) {
     this.waitReason = reason;
     clearTimeout(this.wakeTimer);
@@ -296,6 +344,7 @@ class Session {
   /** One drain loop per school. Sends at most one message at a time, always asking the guard first. */
   async pump() {
     if (this.working || this.state !== 'connected') return;
+    if (this.directBusy) { this.wakeIn(2000, 'busy'); return; } // a single immediate send is in progress
     this.working = true;
     try {
       while (this.queue.length && this.state === 'connected') {
@@ -316,6 +365,10 @@ class Session {
           continue;
         }
 
+        // keep a natural gap after the previous message, even if that one was a direct send
+        const since = Date.now() - this.lastSendAt;
+        if (since < cfg.minDelay) await sleep(cfg.minDelay - since + rand(0, 2000));
+
         let sent = false;
         try {
           const jid = await this.resolve(m.to);
@@ -326,6 +379,7 @@ class Session {
             await this.sock.sendMessage(jid, { text: m.text });
             try { await this.sock.sendPresenceUpdate('paused', jid); } catch { /* noop */ }
             this.guard.recordSent(m.to, m.text);
+            this.lastSendAt = Date.now();
             sent = true;
           } else {
             log.info({ to: m.to }, 'number is not on WhatsApp, skipped');
@@ -339,27 +393,12 @@ class Session {
         }
         this.persistSoon();
         if (!this.queue.length) break;
-        // First few messages after an idle period go out quickly (burst); after that, a slow random gap
-        // with an occasional longer "got distracted" pause. The rest of a big batch simply waits in the queue.
-        let gap;
-        if (this.takeBurstSlot()) gap = rand(cfg.burstGapMin, cfg.burstGapMax);
-        else {
-          gap = rand(cfg.minDelay, cfg.maxDelay);
-          if (sent && Math.random() < 0.1) gap += rand(20_000, 60_000);
-        }
+        // Random gap between messages, with an occasional longer "got distracted" pause.
+        let gap = rand(cfg.minDelay, cfg.maxDelay);
+        if (sent && Math.random() < 0.1) gap += rand(20_000, 60_000);
         await sleep(gap);
       }
     } finally { this.working = false; }
-  }
-
-  /** Burst allowance: refills one slot per BURST_REFILL_MS of rest, up to BURST_SIZE. True = send the next one quickly. */
-  takeBurstSlot() {
-    const now = Date.now();
-    if (this.burstTokens === undefined) { this.burstTokens = cfg.burstSize; this.burstAt = now; }
-    this.burstTokens = Math.min(cfg.burstSize, this.burstTokens + (now - this.burstAt) / cfg.burstRefillMs);
-    this.burstAt = now;
-    if (this.burstTokens >= 1) { this.burstTokens -= 1; return true; }
-    return false;
   }
 
   /** number -> WhatsApp jid (or null when the number has no WhatsApp). Cached to avoid repeated lookups. */
@@ -445,8 +484,9 @@ app.put('/sessions/:schoolId/limits', (req, res) => {
 });
 
 // body: { messages: [{ to, text }], country?, dailyLimit? }   (single send = one item)
-// Always answers fast: messages are only QUEUED here and delivered later at a safe pace.
-app.post('/sessions/:schoolId/send', (req, res) => {
+// A single message (nothing waiting, not right behind another one) is sent immediately.
+// Bulk requests (2+ messages), `bulk: true`, or messages in a row are QUEUED and delivered at a safe pace.
+app.post('/sessions/:schoolId/send', async (req, res) => {
   const s = getSession(req.params.schoolId);
   if (!s || !s.canQueue()) return res.status(409).json({ error: 'whatsapp not connected' });
   const items = Array.isArray(req.body?.messages) ? req.body.messages : [];
@@ -454,13 +494,14 @@ app.post('/sessions/:schoolId/send', (req, res) => {
     return res.status(400).json({ error: `1..${cfg.maxPerRequest} messages required per request` });
   }
   if (req.body?.dailyLimit !== undefined) s.guard.setUserLimit(req.body.dailyLimit);
-  if (s.queue.length + items.length > cfg.maxQueue) {
+  const bulk = req.body?.bulk === true;
+  if (!s.canSendDirect(items, bulk) && s.queue.length + items.length > cfg.maxQueue) {
     return res.status(429).set('Retry-After', '600').json({
       error: 'queue is full for this number, try again later', queued: s.queue.length, maxQueue: cfg.maxQueue,
     });
   }
-  const results = s.enqueue(items, req.body?.country);
-  res.json({ results, queued: s.queue.length, etaMinutes: s.guard.etaMinutes(s.queue.length, cfg.minDelay, cfg.maxDelay) });
+  const { mode, results } = await s.submit(items, req.body?.country, bulk);
+  res.json({ mode, results, queued: s.queue.length, etaMinutes: s.guard.etaMinutes(s.queue.length, cfg.minDelay, cfg.maxDelay) });
 });
 
 // A stray rejection inside Baileys must never kill the whole process: a crash drops EVERY school's

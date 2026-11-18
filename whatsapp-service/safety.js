@@ -13,9 +13,7 @@ export const defaultOpts = {
   batchPauseMin: 3 * MIN,     // ... rest for 3-7 minutes, like a person would
   batchPauseMax: 7 * MIN,
   perRecipientDaily: 3,       // one parent number gets at most this many messages a day (siblings share numbers)
-  windowStart: 0,             // optional quiet hours: e.g. 8 and 21 = only send 08:00-21:00 (school local time). 0 and 24 = always
-  windowEnd: 24,
-  tz: 'Asia/Karachi',
+  tz: 'Asia/Karachi',         // only used to decide when the "day" rolls over for the daily counters
   warmupDays: 7,              // a freshly linked number ramps up slowly over its first week
   warmupStart: 30,            // messages allowed on day one
   failLimit: 5,               // this many send failures in a row ...
@@ -50,16 +48,6 @@ export class SendGuard {
   // ───────── time helpers (school-local) ─────────
   dayKey(ms = this.now()) {
     return new Intl.DateTimeFormat('en-CA', { timeZone: this.o.tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(ms);
-  }
-  hourOf(ms = this.now()) {
-    const h = new Intl.DateTimeFormat('en-GB', { timeZone: this.o.tz, hour: 'numeric', hourCycle: 'h23' }).format(ms);
-    return Number(h) % 24;
-  }
-  inWindow(ms = this.now()) {
-    const { windowStart: a, windowEnd: b } = this.o;
-    if (a <= 0 && b >= 24) return true;
-    const h = this.hourOf(ms);
-    return a < b ? (h >= a && h < b) : (h >= a || h < b);
   }
 
   rollDay() {
@@ -108,7 +96,6 @@ export class SendGuard {
     this.rollDay();
     const t = this.now();
     if (this.s.pauseUntil > t) return { ok: false, waitMs: this.s.pauseUntil - t, reason: this.s.pauseReason || 'cooldown' };
-    if (!this.inWindow(t)) return { ok: false, waitMs: 5 * MIN, reason: 'quiet_hours' };
     if (this.s.sentToday >= this.effectiveDaily()) return { ok: false, waitMs: 10 * MIN, reason: 'daily_limit' };
     if (this.s.sentTimes.length >= this.effectiveHourly()) {
       const wait = this.s.sentTimes[0] + HOUR - t + this.rand(5_000, 60_000);
@@ -149,7 +136,7 @@ export class SendGuard {
     }
   }
 
-  /** Estimated minutes until `queued` messages are out (pacing + rests; ignores quiet hours). */
+  /** Estimated minutes until `queued` messages are out (pacing + rests). */
   etaMinutes(queued, minDelay, maxDelay) {
     if (!queued) return 0;
     const per = (minDelay + maxDelay) / 2 + 3000;
@@ -170,8 +157,6 @@ export class SendGuard {
       maxDailyLimit: this.o.dailyLimit,
       hourlyLimit: this.effectiveHourly(),
       warmupDay: this.warmupDay(),
-      quietHours: !this.inWindow(t),
-      window: `${this.o.windowStart}:00-${this.o.windowEnd}:00`,
       pausedReason: this.s.pauseUntil > t ? this.s.pauseReason : null,
       pausedForMs: this.s.pauseUntil > t ? this.s.pauseUntil - t : 0,
     };
