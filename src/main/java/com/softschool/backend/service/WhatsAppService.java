@@ -1,10 +1,14 @@
 package com.softschool.backend.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.softschool.backend.model.Attendance;
+import com.softschool.backend.model.Finance;
 import com.softschool.backend.model.SchoolSettings;
 import com.softschool.backend.model.Student;
 import com.softschool.backend.model.WhatsAppConfig;
 import com.softschool.backend.model.WhatsAppLog;
+import com.softschool.backend.repository.FinanceRepository;
 import com.softschool.backend.repository.SchoolSettingsRepository;
 import com.softschool.backend.repository.StudentRepository;
 import com.softschool.backend.repository.WhatsAppConfigRepository;
@@ -15,10 +19,12 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
 
 import java.time.LocalDate;
+import java.time.YearMonth;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
@@ -42,6 +48,8 @@ public class WhatsAppService {
     @Autowired private WhatsAppLogRepository logRepo;
     @Autowired private StudentRepository studentRepository;
     @Autowired private SchoolSettingsRepository settingsRepository;
+    @Autowired private FinanceRepository financeRepository;
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     private final ExecutorService pool = Executors.newFixedThreadPool(2, r -> {
         Thread t = new Thread(r, "whatsapp-notify");
@@ -95,13 +103,32 @@ public class WhatsAppService {
         http().post().uri("/sessions/{id}/logout", schoolId).retrieve().toBodilessEntity();
     }
 
-    /** Hands messages to the gateway queue. Returns false when the school's WhatsApp is not connected. */
+    /** Tells the gateway this school's own daily limit right away (it is also sent along with every batch). */
+    public void pushLimit(String schoolId, Integer dailyLimit) {
+        if (!isConfigured()) return;
+        try {
+            Map<String, Object> body = new HashMap<>();
+            body.put("dailyLimit", dailyLimit == null ? 0 : dailyLimit);
+            http().put().uri("/sessions/{id}/limits", schoolId).contentType(MediaType.APPLICATION_JSON)
+                    .body(body).retrieve().toBodilessEntity();
+        } catch (Exception e) { log.warn("WhatsApp limit not pushed for {}: {}", schoolId, e.getMessage()); }
+    }
+
+    /**
+     * Hands messages to the gateway QUEUE. The gateway delivers them slowly and later (limits, rests, quiet
+     * hours), so "true" means accepted, not delivered. False when WhatsApp is not connected or the queue is full.
+     */
     @SuppressWarnings("unchecked")
     public boolean send(String schoolId, List<Map<String, String>> messages) {
         if (!isConfigured() || messages.isEmpty()) return false;
         try {
+            Map<String, Object> body = new HashMap<>();
+            body.put("messages", messages);
+            body.put("country", countryCode);
+            WhatsAppConfig cfg = configRepo.findBySchoolId(schoolId).orElse(null);
+            if (cfg != null && cfg.getDailyLimit() != null) body.put("dailyLimit", cfg.getDailyLimit());
             http().post().uri("/sessions/{id}/send", schoolId).contentType(MediaType.APPLICATION_JSON)
-                    .body(Map.of("messages", messages, "country", countryCode)).retrieve().toBodilessEntity();
+                    .body(body).retrieve().toBodilessEntity();
             return true;
         } catch (Exception e) {
             log.warn("WhatsApp send skipped for {}: {}", schoolId, e.getMessage());
@@ -140,25 +167,95 @@ public class WhatsAppService {
         });
     }
 
-    /** Called after a fee payment is recorded. */
-    public void notifyFeePaid(String schoolId, String regNo, String monthKey, double amount, double remaining) {
+    /**
+     * Called when a fee voucher is generated. One message per student per month, ever (re-generating or
+     * editing the voucher never re-sends). Runs in the background so it can never fail voucher generation.
+     */
+    public void notifyVoucher(String schoolId, String regNo, String monthKey, double total, double remaining) {
         if (!isConfigured() || schoolId == null || regNo == null) return;
         pool.submit(() -> {
             try {
                 WhatsAppConfig cfg = configRepo.findBySchoolId(schoolId).orElse(null);
-                if (cfg == null || !cfg.wantsFee()) return;
+                if (cfg == null || !cfg.wantsVoucher()) return;
+                String key = "vch:" + regNo + ":" + monthKey;
+                if (logRepo.existsBySchoolIdAndDedupeKey(schoolId, key)) return;
                 Student st = studentRepository.findByRegNoAndSchoolId(regNo, schoolId).orElse(null);
                 String phone = phoneOf(st);
                 if (phone == null) return;
-                String key = "pay:" + regNo + ":" + monthKey + ":" + amount + ":" + (System.currentTimeMillis() / 60000);
-                if (logRepo.existsBySchoolIdAndDedupeKey(schoolId, key)) return; // double-click guard
-                String text = render(cfg.getFeeTemplate(), WhatsAppConfig.DEFAULT_FEE, st, schoolName(schoolId), Map.of(
-                        "amount", money(amount), "balance", money(remaining), "month", monthKey == null ? "" : monthKey));
+                String text = render(cfg.getVoucherTemplate(), WhatsAppConfig.DEFAULT_VOUCHER, st, schoolName(schoolId), Map.of(
+                        "amount", money(total), "balance", money(remaining),
+                        "month", monthLabel(monthKey), "duedate", dueDate(schoolId, monthKey).format(DAY)));
                 if (send(schoolId, List.of(Map.of("to", phone, "text", text)))) {
-                    record(schoolId, key, "FEE", regNo, phone);
+                    record(schoolId, key, "VOUCHER", regNo, phone);
                 }
-            } catch (Exception e) { log.warn("notifyFeePaid failed: {}", e.getMessage()); }
+            } catch (Exception e) { log.warn("notifyVoucher failed: {}", e.getMessage()); }
         });
+    }
+
+    /**
+     * Daily check (10:00 Pakistan time). For every school that switched "Fee Reminder" on: once the
+     * deadline (+ grace days) of the current month has passed, message ONLY the parents whose generated
+     * voucher still has a pending balance. Paid students are skipped; each student is reminded once per month.
+     */
+    @Scheduled(cron = "0 0 10 * * *", zone = "Asia/Karachi")
+    public void sendFeeReminders() {
+        if (!isConfigured()) return;
+        for (WhatsAppConfig cfg : configRepo.findAll()) {
+            if (cfg == null || !cfg.wantsReminder()) continue;
+            try { remindSchool(cfg); }
+            catch (Exception e) { log.warn("fee reminder failed for {}: {}", cfg.getSchoolId(), e.getMessage()); }
+        }
+    }
+
+    private void remindSchool(WhatsAppConfig cfg) throws Exception {
+        String schoolId = cfg.getSchoolId();
+        LocalDate today = LocalDate.now();
+        String monthKey = YearMonth.from(today).toString();
+        SchoolSettings ss = settingsRepository.findBySchoolId(schoolId).orElse(null);
+        int grace = ss == null || ss.getLateFeeGrace() == null ? 0 : ss.getLateFeeGrace();
+        LocalDate due = dueDate(schoolId, monthKey);
+        if (!today.isAfter(due.plusDays(grace))) return; // deadline has not passed yet
+
+        String school = schoolName(schoolId);
+        String dueText = due.format(DAY);
+        Set<String> regNos = new LinkedHashSet<>();
+        for (Finance v : financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(monthKey, Finance.TYPE_VOUCHER, schoolId)) {
+            if (v.getPayloadJson() == null) continue;
+            JsonNode n = objectMapper.readTree(v.getPayloadJson());
+            if (n.hasNonNull("studentId")) regNos.add(n.get("studentId").asText());
+        }
+        for (String regNo : regNos) {
+            Finance master = financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolId(
+                    regNo, monthKey, Finance.TYPE_STUDENT_FEE, schoolId).orElse(null);
+            if (master == null) continue;
+            double net = master.getNetPayable() == null ? 0.0 : master.getNetPayable();
+            double paid = master.getPaidAmount() == null ? 0.0 : master.getPaidAmount();
+            double remaining = master.getRemainingBalance() == null ? Math.max(0.0, net - paid) : master.getRemainingBalance();
+            if (remaining <= 0.01) continue;                                   // already paid: no reminder
+            String key = "rem:" + regNo + ":" + monthKey;
+            if (logRepo.existsBySchoolIdAndDedupeKey(schoolId, key)) continue; // already reminded this month
+            Student st = studentRepository.findByRegNoAndSchoolId(regNo, schoolId).orElse(null);
+            if (st == null || (st.getStatus() != null && !"active".equalsIgnoreCase(st.getStatus()))) continue;
+            String phone = phoneOf(st);
+            if (phone == null) continue;
+            String text = render(cfg.getReminderTemplate(), WhatsAppConfig.DEFAULT_REMINDER, st, school, Map.of(
+                    "balance", money(remaining), "month", monthLabel(monthKey), "duedate", dueText));
+            if (send(schoolId, List.of(Map.of("to", phone, "text", text)))) {
+                record(schoolId, key, "REMINDER", regNo, phone);
+            }
+        }
+    }
+
+    private LocalDate dueDate(String schoolId, String monthKey) {
+        SchoolSettings ss = settingsRepository.findBySchoolId(schoolId).orElse(null);
+        int day = ss == null || ss.getLateFeeDeadlineDay() == null ? 10 : ss.getLateFeeDeadlineDay();
+        YearMonth ym = YearMonth.parse(monthKey);
+        return ym.atDay(Math.min(Math.max(day, 1), ym.lengthOfMonth()));
+    }
+
+    private static String monthLabel(String monthKey) {
+        try { return YearMonth.parse(monthKey).format(DateTimeFormatter.ofPattern("MMMM yyyy", Locale.ENGLISH)); }
+        catch (Exception e) { return monthKey == null ? "" : monthKey; }
     }
 
     /** Manual broadcast (announcement / fee reminder) to parents of a class, a section, or everyone. */
