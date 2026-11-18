@@ -33,6 +33,16 @@ public class WhatsAppController {
         String id = school(r);
         Map<String, Object> out = new java.util.HashMap<>(wa.status(id));
         out.put("config", wa.config(id));
+        // fields the "Send to parents" popup shows
+        Object lim = out.get("dailyLimit"), sent = out.get("sentToday"), queued = out.get("queued");
+        if (lim instanceof Number l && sent instanceof Number s) {
+            int q = queued instanceof Number n ? n.intValue() : 0;
+            out.put("dailyCap", l.intValue());
+            out.put("remainingToday", Math.max(0, l.intValue() - s.intValue() - q));
+        }
+        out.put("warmup", out.get("warmupDay") != null);
+        out.put("quietNow", false);
+        out.put("maxPerSend", WhatsAppService.MAX_PER_SEND);
         return out;
     }
 
@@ -111,6 +121,39 @@ public class WhatsAppController {
         String id = school(r);
         if (!wa.config(id).isOn()) return ResponseEntity.status(409).body(Map.of("error", "Turn WhatsApp automation on first."));
         return ResponseEntity.ok(wa.broadcast(id, in.get("className"), in.get("section"), clip(text)));
+    }
+
+    /** Popup data: classes, then (for a chosen class) sections and students with parent numbers and fee balance. */
+    @GetMapping("/recipients")
+    public Map<String, Object> recipients(HttpServletRequest r,
+                                          @RequestParam(required = false) String className,
+                                          @RequestParam(required = false) String section,
+                                          @RequestParam(required = false) String monthKey) {
+        return wa.recipients(school(r), className, section, monthKey);
+    }
+
+    /** kind = announcement | fee | attendance. body: {regNos:[...], className, section, text, monthKey, onlyUnpaid, days} */
+    @PostMapping("/send/{kind}")
+    public ResponseEntity<?> sendToParents(HttpServletRequest r, @PathVariable String kind,
+                                           @RequestBody Map<String, Object> in) {
+        if (!List.of("announcement", "fee", "attendance").contains(kind))
+            return ResponseEntity.badRequest().body(Map.of("error", "Unknown message type."));
+        if (!wa.isConfigured()) return ResponseEntity.status(503).body(Map.of("error", "WhatsApp service is not configured on the server."));
+        String id = school(r);
+        if (!wa.config(id).isOn()) return ResponseEntity.status(409).body(Map.of("error", "Turn WhatsApp automation on first."));
+        if (!(in.get("regNos") instanceof List<?> ids) || ids.isEmpty())
+            return ResponseEntity.badRequest().body(Map.of("error", "Choose at least one parent."));
+        if (ids.size() > WhatsAppService.MAX_PER_SEND)
+            return ResponseEntity.badRequest().body(Map.of("error", "Only " + WhatsAppService.MAX_PER_SEND + " parents can be messaged at one time."));
+        if ("announcement".equals(kind)) {
+            Object t = in.get("text");
+            if (!(t instanceof String s) || s.isBlank()) return ResponseEntity.badRequest().body(Map.of("error", "text is required"));
+            in.put("text", clip(s));
+        }
+        Map<String, Object> out = wa.sendToParents(id, kind, in);
+        if (Boolean.FALSE.equals(out.get("gatewayOk")) && ((Number) out.get("queued")).intValue() == 0)
+            return ResponseEntity.status(409).body(Map.of("error", "WhatsApp is not connected or the service is unreachable. Nothing was sent."));
+        return ResponseEntity.ok(out);
     }
 
     /** "3, 1,1,x,99" -> "1,3": keeps only whole days 1..30, sorted, no duplicates. */
