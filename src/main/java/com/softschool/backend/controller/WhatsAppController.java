@@ -65,6 +65,9 @@ public class WhatsAppController {
         }
         if (in.containsKey("notifyVoucher")) c.setNotifyVoucher(Boolean.TRUE.equals(in.get("notifyVoucher")));
         if (in.containsKey("notifyReminder")) c.setNotifyReminder(Boolean.TRUE.equals(in.get("notifyReminder")));
+        if (in.get("reminderBeforeDays") instanceof String d) c.setReminderBeforeDays(cleanDays(d));
+        if (in.get("reminderAfterDays") instanceof String d) c.setReminderAfterDays(cleanDays(d));
+        if (in.containsKey("reminderOnDue")) c.setReminderOnDue(Boolean.TRUE.equals(in.get("reminderOnDue")));
         if (in.get("absentTemplate") instanceof String s) c.setAbsentTemplate(clip(s));
         if (in.get("voucherTemplate") instanceof String s) c.setVoucherTemplate(clip(s));
         if (in.get("reminderTemplate") instanceof String s) c.setReminderTemplate(clip(s));
@@ -91,6 +94,16 @@ public class WhatsAppController {
         String id = school(r);
         if (!wa.config(id).isOn()) return ResponseEntity.status(409).body(Map.of("error", "Turn WhatsApp automation on first."));
         return ResponseEntity.ok(wa.broadcast(id, in.get("className"), in.get("section"), clip(text)));
+    }
+
+    /** "3, 1,1,x,99" -> "1,3": keeps only whole days 1..30, sorted, no duplicates. */
+    private static String cleanDays(String csv) {
+        java.util.TreeSet<Integer> days = new java.util.TreeSet<>();
+        for (String p : csv.split(",")) {
+            try { int d = Integer.parseInt(p.trim()); if (d >= 1 && d <= 30) days.add(d); }
+            catch (NumberFormatException ignored) { }
+        }
+        return days.stream().map(String::valueOf).collect(java.util.stream.Collectors.joining(","));
     }
 
     private static String clip(String s) { return s.length() > 1000 ? s.substring(0, 1000) : s; }
