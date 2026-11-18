@@ -119,8 +119,10 @@ public class WhatsAppService {
     }
 
     /**
-     * Hands messages to the gateway QUEUE. The gateway delivers them slowly and later (limits, rests, quiet
-     * hours), so "true" means accepted, not delivered. False when WhatsApp is not connected or the queue is full.
+     * Hands messages to the gateway. The gateway decides how they go out: ONE message is sent immediately
+     * (when nothing is waiting and nothing was sent a moment ago); 2+ messages in one request, or messages
+     * right behind each other, wait in the queue and are delivered slowly (limits, rests between batches).
+     * "true" means accepted, not necessarily delivered yet. False when WhatsApp is not connected or the queue is full.
      */
     @SuppressWarnings("unchecked")
     public boolean send(String schoolId, List<Map<String, String>> messages) {
@@ -140,6 +142,24 @@ public class WhatsAppService {
         }
     }
 
+    /** A message that was handed to the gateway and must be logged (dedupe) once the gateway accepted it. */
+    private record Pending(String key, String kind, String regNo, String phone) { }
+
+    /**
+     * Sends many messages as ONE bulk request per 500 (so the gateway queues them and paces them), and logs
+     * each message as sent only after the gateway accepted its chunk. msgs and pend are index-aligned.
+     */
+    private void sendBatch(String schoolId, List<Map<String, String>> msgs, List<Pending> pend) {
+        for (int i = 0; i < msgs.size(); i += 500) {
+            int end = Math.min(msgs.size(), i + 500);
+            if (!send(schoolId, new ArrayList<>(msgs.subList(i, end)))) return;   // not connected / queue full: nothing logged, retried next time
+            for (int k = i; k < end; k++) {
+                Pending p = pend.get(k);
+                record(schoolId, p.key(), p.kind(), p.regNo(), p.phone());
+            }
+        }
+    }
+
     // ─────────────── automatic notifications ───────────────
 
     /** Called after attendance is saved. One message per absent student per day, ever. */
@@ -152,6 +172,8 @@ public class WhatsAppService {
                 if (cfg == null || !cfg.wantsAbsent()) return;
                 LocalDate today = LocalDate.now();
                 String school = schoolName(schoolId);
+                List<Map<String, String>> msgs = new ArrayList<>();
+                List<Pending> pend = new ArrayList<>();
                 for (Attendance a : copy) {
                     if (a == null || a.getMemberId() == null || a.getDate() == null || !a.getDate().equals(today)) continue;
                     if (!"STUDENT".equalsIgnoreCase(a.getMemberType())) continue;
@@ -163,10 +185,11 @@ public class WhatsAppService {
                     if (phone == null) continue;
                     String text = render(cfg.getAbsentTemplate(), WhatsAppConfig.DEFAULT_ABSENT, st, school,
                             Map.of("date", today.format(DAY)));
-                    if (send(schoolId, List.of(Map.of("to", phone, "text", text)))) {
-                        record(schoolId, key, "ABSENT", st.getRegNo(), phone);
-                    }
+                    msgs.add(Map.of("to", phone, "text", text));
+                    pend.add(new Pending(key, "ABSENT", st.getRegNo(), phone));
                 }
+                // one absent student = one request (sent immediately); a whole class = one bulk request (queued, paced)
+                if (!msgs.isEmpty()) sendBatch(schoolId, msgs, pend);
             } catch (Exception e) { log.warn("notifyAbsent failed: {}", e.getMessage()); }
         });
     }
@@ -267,6 +290,8 @@ public class WhatsAppService {
             JsonNode n = objectMapper.readTree(v.getPayloadJson());
             if (n.hasNonNull("studentId")) regNos.add(n.get("studentId").asText());
         }
+        List<Map<String, String>> msgs = new ArrayList<>();
+        List<Pending> pend = new ArrayList<>();
         for (String regNo : regNos) {
             Finance master = financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolId(
                     regNo, monthKey, Finance.TYPE_STUDENT_FEE, schoolId).orElse(null);
@@ -285,10 +310,10 @@ public class WhatsAppService {
                     "balance", money(remaining), "month", monthLabel(monthKey), "duedate", dueText));
             extra.putAll(feeCodes(schoolId, st, monthKey, null, remaining));
             String text = render(cfg.getReminderTemplate(), WhatsAppConfig.DEFAULT_REMINDER, st, school, extra);
-            if (send(schoolId, List.of(Map.of("to", phone, "text", text)))) {
-                record(schoolId, key, "REMINDER", regNo, phone);
-            }
+            msgs.add(Map.of("to", phone, "text", text));
+            pend.add(new Pending(key, "REMINDER", regNo, phone));
         }
+        if (!msgs.isEmpty()) sendBatch(schoolId, msgs, pend);   // all reminders of this month = one bulk request
     }
 
     private LocalDate dueDate(String schoolId, String monthKey) {
