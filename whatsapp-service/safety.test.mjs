@@ -6,8 +6,9 @@ const clock = { now: () => t, rand: (a) => a };
 const mk = (o = {}, s = {}) => new SendGuard({ tz: 'Asia/Karachi', ...o }, s, clock);
 
 // quiet hours: 22:00 Karachi = 17:00 UTC
-{ const g = mk(); t = Date.UTC(2026, 10, 18, 17, 0, 0); assert.equal(g.check().reason, 'quiet_hours');
-  t = Date.UTC(2026, 10, 18, 7, 0, 0); assert.equal(g.check().ok, true); }
+{ const g = mk({ windowStart: 8, windowEnd: 21 }); t = Date.UTC(2026, 10, 18, 17, 0, 0); assert.equal(g.check().reason, 'quiet_hours');
+  t = Date.UTC(2026, 10, 18, 7, 0, 0); assert.equal(g.check().ok, true);
+  const open = mk(); t = Date.UTC(2026, 10, 18, 17, 0, 0); assert.equal(open.check().ok, true, 'default: no quiet hours'); }
 
 // hourly limit + wait until oldest ages out
 { const g = mk({ hourlyLimit: 5, batchSize: 1000, dailyLimit: 1000 }); t = Date.UTC(2026, 10, 18, 7, 0, 0);

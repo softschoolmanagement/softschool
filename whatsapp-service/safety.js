@@ -13,8 +13,8 @@ export const defaultOpts = {
   batchPauseMin: 3 * MIN,     // ... rest for 3-7 minutes, like a person would
   batchPauseMax: 7 * MIN,
   perRecipientDaily: 3,       // one parent number gets at most this many messages a day (siblings share numbers)
-  windowStart: 8,             // only send between 08:00 and 21:00 (school local time); 0 and 24 = always
-  windowEnd: 21,
+  windowStart: 0,             // optional quiet hours: e.g. 8 and 21 = only send 08:00-21:00 (school local time). 0 and 24 = always
+  windowEnd: 24,
   tz: 'Asia/Karachi',
   warmupDays: 7,              // a freshly linked number ramps up slowly over its first week
   warmupStart: 30,            // messages allowed on day one

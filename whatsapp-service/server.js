@@ -28,7 +28,11 @@ const cfg = {
   apiKey: process.env.API_KEY || '',
   sessionsDir: path.resolve(process.env.SESSIONS_DIR || './sessions'),
   cc: String(process.env.DEFAULT_COUNTRY_CODE || '92').replace(/\D/g, ''),
-  minDelay: num(process.env.MIN_DELAY_MS, 8000),    // gap between two messages from one number
+  burstSize: num(process.env.BURST_SIZE, 10),        // this many messages go out quickly when the number has been idle ...
+  burstGapMin: num(process.env.BURST_GAP_MIN_MS, 2000), // ... only 2-5 seconds apart
+  burstGapMax: num(process.env.BURST_GAP_MAX_MS, 5000),
+  burstRefillMs: num(process.env.BURST_REFILL_MS, 2 * MIN), // one burst slot comes back every 2 minutes of rest
+  minDelay: num(process.env.MIN_DELAY_MS, 8000),    // gap between two messages once the burst is used up
   maxDelay: num(process.env.MAX_DELAY_MS, 20000),
   maxQueue: num(process.env.MAX_QUEUE, 5000),        // per school; beyond this new messages are refused (429)
   maxAgeMs: num(process.env.MAX_QUEUE_AGE_HOURS, 72) * 60 * MIN, // a message still waiting after this is dropped (too stale to be useful)
@@ -42,8 +46,8 @@ const cfg = {
     batchPauseMin: num(process.env.BATCH_PAUSE_MIN_MS, 3 * MIN),
     batchPauseMax: num(process.env.BATCH_PAUSE_MAX_MS, 7 * MIN),
     perRecipientDaily: num(process.env.PER_RECIPIENT_DAILY, 3),
-    windowStart: num(process.env.SEND_WINDOW_START, 8),   // 0 and 24 = send around the clock
-    windowEnd: num(process.env.SEND_WINDOW_END, 21),
+    windowStart: num(process.env.SEND_WINDOW_START, 0),   // default 0-24 = send around the clock (set e.g. 8 and 21 to hold messages at night)
+    windowEnd: num(process.env.SEND_WINDOW_END, 24),
     tz: process.env.SEND_TZ || 'Asia/Karachi',
     warmupDays: num(process.env.WARMUP_DAYS, 7),
     warmupStart: num(process.env.WARMUP_START, 30),
@@ -335,12 +339,27 @@ class Session {
         }
         this.persistSoon();
         if (!this.queue.length) break;
-        // Random gap between messages, with an occasional longer "got distracted" pause.
-        let gap = rand(cfg.minDelay, cfg.maxDelay);
-        if (sent && Math.random() < 0.1) gap += rand(20_000, 60_000);
+        // First few messages after an idle period go out quickly (burst); after that, a slow random gap
+        // with an occasional longer "got distracted" pause. The rest of a big batch simply waits in the queue.
+        let gap;
+        if (this.takeBurstSlot()) gap = rand(cfg.burstGapMin, cfg.burstGapMax);
+        else {
+          gap = rand(cfg.minDelay, cfg.maxDelay);
+          if (sent && Math.random() < 0.1) gap += rand(20_000, 60_000);
+        }
         await sleep(gap);
       }
     } finally { this.working = false; }
+  }
+
+  /** Burst allowance: refills one slot per BURST_REFILL_MS of rest, up to BURST_SIZE. True = send the next one quickly. */
+  takeBurstSlot() {
+    const now = Date.now();
+    if (this.burstTokens === undefined) { this.burstTokens = cfg.burstSize; this.burstAt = now; }
+    this.burstTokens = Math.min(cfg.burstSize, this.burstTokens + (now - this.burstAt) / cfg.burstRefillMs);
+    this.burstAt = now;
+    if (this.burstTokens >= 1) { this.burstTokens -= 1; return true; }
+    return false;
   }
 
   /** number -> WhatsApp jid (or null when the number has no WhatsApp). Cached to avoid repeated lookups. */
