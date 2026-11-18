@@ -8,6 +8,7 @@ import com.softschool.backend.model.SchoolSettings;
 import com.softschool.backend.model.Student;
 import com.softschool.backend.model.WhatsAppConfig;
 import com.softschool.backend.model.WhatsAppLog;
+import com.softschool.backend.repository.AttendanceRepository;
 import com.softschool.backend.repository.FinanceRepository;
 import com.softschool.backend.repository.SchoolSettingsRepository;
 import com.softschool.backend.repository.StudentRepository;
@@ -53,6 +54,7 @@ public class WhatsAppService {
     @Autowired private StudentRepository studentRepository;
     @Autowired private SchoolSettingsRepository settingsRepository;
     @Autowired private FinanceRepository financeRepository;
+    @Autowired private AttendanceRepository attendanceRepository;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     private final ExecutorService pool = Executors.newFixedThreadPool(2, r -> {
@@ -164,18 +166,28 @@ public class WhatsAppService {
      * Sends many messages as ONE bulk request per 500 (so the gateway queues them and paces them), and logs
      * each message as sent only after the gateway accepted its chunk. msgs and pend are index-aligned.
      */
-    private void sendBatch(String schoolId, List<Map<String, String>> msgs, List<Pending> pend) {
+    /** What the gateway did with a bulk request: accepted / refused counts, whether it was reachable, first refusal reason. */
+    private record BatchResult(int accepted, int refused, boolean gatewayOk, String reason) { }
+
+    private BatchResult sendBatch(String schoolId, List<Map<String, String>> msgs, List<Pending> pend) {
+        int ok = 0, bad = 0;
+        String reason = null;
         for (int i = 0; i < msgs.size(); i += 500) {
             int end = Math.min(msgs.size(), i + 500);
             List<Map<String, Object>> res = sendRaw(schoolId, new ArrayList<>(msgs.subList(i, end)));
-            if (res == null) return;   // not connected / bad key / queue full: nothing logged, retried next time
+            if (res == null) return new BatchResult(ok, bad, false, reason);   // not connected / bad key / queue full: nothing logged, retried next time
             for (int k = i; k < end && (k - i) < res.size(); k++) {
                 Map<String, Object> r = res.get(k - i);
                 Pending p = pend.get(k);
-                if (accepted(r)) record(schoolId, p.key(), p.kind(), p.regNo(), p.phone());
-                else log.info("WhatsApp refused {} for {} ({}): {}", p.kind(), p.regNo(), p.phone(), r == null ? "no result" : r.get("reason"));
+                if (accepted(r)) { record(schoolId, p.key(), p.kind(), p.regNo(), p.phone()); ok++; }
+                else {
+                    bad++;
+                    if (reason == null && r != null) reason = String.valueOf(r.get("reason"));
+                    log.info("WhatsApp refused {} for {} ({}): {}", p.kind(), p.regNo(), p.phone(), r == null ? "no result" : r.get("reason"));
+                }
             }
         }
+        return new BatchResult(ok, bad, true, reason);
     }
 
     // ─────────────── automatic notifications ───────────────
@@ -192,20 +204,25 @@ public class WhatsAppService {
                 String school = schoolName(schoolId);
                 List<Map<String, String>> msgs = new ArrayList<>();
                 List<Pending> pend = new ArrayList<>();
+                int absent = 0, notToday = 0, logged = 0, noNumber = 0;
                 for (Attendance a : copy) {
-                    if (a == null || a.getMemberId() == null || a.getDate() == null || !a.getDate().equals(today)) continue;
+                    if (a == null || a.getMemberId() == null || a.getDate() == null) continue;
                     if (!"STUDENT".equalsIgnoreCase(a.getMemberType())) continue;
                     if (!"absent".equals(ParentUtil.normalizeAttendance(a.getStatus()))) continue;
+                    if (!a.getDate().equals(today)) { notToday++; continue; }
+                    absent++;
                     String key = "abs:" + today + ":" + a.getMemberId();
-                    if (logRepo.existsBySchoolIdAndDedupeKey(schoolId, key)) continue;
+                    if (logRepo.existsBySchoolIdAndDedupeKey(schoolId, key)) { logged++; continue; }
                     Student st = studentRepository.findByRegNoAndSchoolId(a.getMemberId(), schoolId).orElse(null);
                     String phone = phoneOf(st);
-                    if (phone == null) continue;
+                    if (phone == null) { noNumber++; continue; }
                     String text = render(cfg.getAbsentTemplate(), WhatsAppConfig.DEFAULT_ABSENT, st, school,
                             Map.of("date", today.format(DAY)));
                     msgs.add(Map.of("to", phone, "text", text));
                     pend.add(new Pending(key, "ABSENT", st.getRegNo(), phone));
                 }
+                log.info("WhatsApp absent alerts for {}: absent today={}, to send={}, already sent earlier={}, no phone number={}, marked for another date={} (today is {})",
+                        schoolId, absent, msgs.size(), logged, noNumber, notToday, today);
                 // one absent student = one request (sent immediately); a whole class = one bulk request (queued, paced)
                 if (!msgs.isEmpty()) sendBatch(schoolId, msgs, pend);
             } catch (Exception e) { log.warn("notifyAbsent failed: {}", e.getMessage()); }
@@ -386,6 +403,147 @@ public class WhatsAppService {
         out.put("queued", queued); out.put("refused", refused);
         out.put("studentsWithoutNumber", noPhone); out.put("gatewayOk", ok);
         if (firstReason != null) out.put("reason", firstReason);
+        return out;
+    }
+
+    // ─────────────── "Send to parents" popup (whatsapp-send.js) ───────────────
+    public static final int MAX_PER_SEND = 100;
+    private static final ZoneId PK = ZoneId.of("Asia/Karachi");
+    private static final Comparator<String> CLASS_ORDER = Comparator.<String>comparingInt(c -> c.matches("\\d{1,9}") ? 0 : 1)
+            .thenComparingLong(c -> c.matches("\\d{1,9}") ? Long.parseLong(c) : 0L)
+            .thenComparing(String.CASE_INSENSITIVE_ORDER);
+
+    private static String str(Object o) { return o == null ? "" : String.valueOf(o).trim(); }
+
+    private static double remainingOf(Finance f) {
+        double net = nz(f.getNetPayable()), paid = nz(f.getPaidAmount());
+        return f.getRemainingBalance() == null ? Math.max(0.0, net - paid) : f.getRemainingBalance();
+    }
+
+    /** Class list, and (for a chosen class) its sections and students with their parent number, for the popup. */
+    public Map<String, Object> recipients(String schoolId, String className, String section, String monthKey) {
+        Set<String> classes = new LinkedHashSet<>();
+        Set<String> sections = new LinkedHashSet<>();
+        List<Map<String, Object>> rows = new ArrayList<>();
+        boolean wantFee = notBlank(monthKey);
+        for (Student st : studentRepository.findBySchoolId(schoolId)) {
+            if (st.getStatus() != null && !"active".equalsIgnoreCase(st.getStatus())) continue;
+            String cls = st.getStudentClass() == null ? "" : st.getStudentClass().trim();
+            if (!cls.isEmpty()) classes.add(cls);
+            if (!notBlank(className) || !className.trim().equalsIgnoreCase(cls)) continue;
+            String sec = st.getSection() == null ? "" : st.getSection().trim();
+            if (!sec.isEmpty()) sections.add(sec);
+            if (notBlank(section) && !section.trim().equalsIgnoreCase(sec)) continue;
+            String shown = null;
+            for (String p : new String[]{st.getPhone1(), st.getPhone2()}) if (shown == null && digits(p) != null) shown = p.trim();
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("regNo", st.getRegNo());
+            row.put("name", st.getFullName() == null ? "" : st.getFullName());
+            row.put("className", cls);
+            row.put("section", sec);
+            row.put("phone", shown);
+            row.put("hasPhone", shown != null);
+            Double bal = null;
+            if (wantFee) {
+                Finance f = financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolId(
+                        st.getRegNo(), monthKey, Finance.TYPE_STUDENT_FEE, schoolId).orElse(null);
+                if (f != null) bal = remainingOf(f);
+            }
+            row.put("balance", bal);
+            rows.add(row);
+        }
+        rows.sort(Comparator.comparing(r -> String.valueOf(r.get("name")), String.CASE_INSENSITIVE_ORDER));
+        List<String> classList = new ArrayList<>(classes);
+        classList.sort(CLASS_ORDER);
+        List<String> sectionList = new ArrayList<>(sections);
+        sectionList.sort(String.CASE_INSENSITIVE_ORDER);
+        Map<String, Object> out = new HashMap<>();
+        out.put("classes", classList);
+        out.put("sections", sectionList);
+        out.put("students", rows);
+        out.put("maxPerSend", MAX_PER_SEND);
+        return out;
+    }
+
+    /**
+     * kind = announcement | fee | attendance. in = {regNos:[...], className, section, text, monthKey, onlyUnpaid, days}.
+     * The gateway queues and paces everything; nothing here can bypass its limits.
+     */
+    public Map<String, Object> sendToParents(String schoolId, String kind, Map<String, Object> in) {
+        LocalDate today = LocalDate.now(PK);
+        String school = schoolName(schoolId);
+        WhatsAppConfig cfg = config(schoolId);
+        Set<String> regNos = new LinkedHashSet<>();
+        if (in.get("regNos") instanceof List<?> l) for (Object o : l) if (o != null) regNos.add(String.valueOf(o));
+        String text = str(in.get("text"));
+        String monthKey = notBlank(str(in.get("monthKey"))) ? str(in.get("monthKey")) : YearMonth.now(PK).toString();
+        boolean onlyUnpaid = Boolean.TRUE.equals(in.get("onlyUnpaid"));
+        int days = in.get("days") instanceof Number n ? Math.max(1, Math.min(n.intValue(), 90)) : 30;
+
+        int noPhone = 0, already = 0, noRecords = 0, noVoucher = 0, alreadyPaid = 0;
+        List<Map<String, String>> msgs = new ArrayList<>();
+        List<Pending> pend = new ArrayList<>();
+        for (String regNo : regNos) {
+            Student st = studentRepository.findByRegNoAndSchoolId(regNo, schoolId).orElse(null);
+            if (st == null) continue;
+            String phone = phoneOf(st);
+            if (phone == null) { noPhone++; continue; }
+            String key, label, body;
+            if ("fee".equals(kind)) {
+                Finance f = financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolId(
+                        regNo, monthKey, Finance.TYPE_STUDENT_FEE, schoolId).orElse(null);
+                if (f == null) { noVoucher++; continue; }
+                double net = nz(f.getNetPayable()), remaining = remainingOf(f);
+                if (onlyUnpaid && remaining <= 0.01) { alreadyPaid++; continue; }
+                Map<String, String> extra = new HashMap<>(Map.of(
+                        "amount", money(net), "balance", money(remaining),
+                        "month", monthLabel(monthKey), "duedate", dueDate(schoolId, monthKey).format(DAY)));
+                extra.putAll(feeCodes(schoolId, st, monthKey, net, remaining));
+                key = "mfee:" + regNo + ":" + monthKey + ":" + today;
+                label = "FEE";
+                body = render(cfg.getVoucherTemplate(), WhatsAppConfig.DEFAULT_VOUCHER, st, school, extra);
+            } else if ("attendance".equals(kind)) {
+                LocalDate from = today.minusDays(days - 1L);
+                int pr = 0, ab = 0, lv = 0;
+                for (Attendance r : attendanceRepository.findByMemberIdAndSchoolIdOrderByDateDesc(regNo, schoolId)) {
+                    if (r.getDate() == null || r.getDate().isBefore(from) || r.getDate().isAfter(today)) continue;
+                    if (r.getMemberType() != null && !"STUDENT".equalsIgnoreCase(r.getMemberType())) continue;
+                    String v = ParentUtil.normalizeAttendance(r.getStatus());
+                    if ("present".equals(v)) pr++; else if ("absent".equals(v)) ab++; else if ("leave".equals(v)) lv++;
+                }
+                if (pr + ab + lv == 0) { noRecords++; continue; }
+                long pct = Math.round(100.0 * pr / (pr + ab + lv));
+                key = "matt:" + regNo + ":" + days + ":" + today;
+                label = "ATTENDANCE";
+                body = "Assalam o Alaikum. Attendance report from " + school + ": " + (st.getFullName() == null ? "" : st.getFullName())
+                        + " (Class " + (st.getStudentClass() == null ? "" : st.getStudentClass()) + (notBlank(st.getSection()) ? "-" + st.getSection() : "")
+                        + ") for the last " + days + " days. Present: " + pr + ", Absent: " + ab + (lv > 0 ? ", Leave: " + lv : "")
+                        + ". Attendance: " + pct + "%.";
+            } else {
+                String t = text.toLowerCase(Locale.ROOT).contains("{student}") ? text : "Dear parent of {student} ({class}),\n" + text;
+                t = t + "\n\n\u2014 {school}";
+                key = "man:" + regNo + ":" + today + ":" + Integer.toHexString(text.hashCode());
+                label = "BROADCAST";
+                body = render(t, t, st, school, Map.of());
+            }
+            if (logRepo.existsBySchoolIdAndDedupeKey(schoolId, key)) { already++; continue; }
+            msgs.add(Map.of("to", phone, "text", body));
+            pend.add(new Pending(key, label, regNo, phone));
+        }
+        BatchResult res = msgs.isEmpty() ? new BatchResult(0, 0, true, null) : sendBatch(schoolId, msgs, pend);
+
+        Map<String, Object> skipped = new HashMap<>();
+        skipped.put("noRecords", noRecords); skipped.put("noVoucher", noVoucher); skipped.put("alreadyPaid", alreadyPaid);
+        Map<String, Object> out = new HashMap<>();
+        out.put("queued", res.accepted());
+        out.put("refused", res.refused());
+        out.put("gatewayOk", res.gatewayOk());
+        if (res.reason() != null) out.put("reason", res.reason());
+        out.put("noPhone", noPhone);
+        out.put("alreadySent", already);
+        out.put("skipped", skipped);
+        out.put("etaMinutes", Math.max(1, (int) Math.ceil(res.accepted() * 11 / 60.0)));
+        out.put("quietNow", false);
         return out;
     }
 
