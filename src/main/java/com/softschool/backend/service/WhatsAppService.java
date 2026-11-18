@@ -25,6 +25,8 @@ import org.springframework.web.client.RestClient;
 
 import java.time.LocalDate;
 import java.time.YearMonth;
+import java.time.ZoneId;
+import java.time.temporal.ChronoUnit;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
@@ -198,9 +200,9 @@ public class WhatsAppService {
     }
 
     /**
-     * Daily check (10:00 Pakistan time). For every school that switched "Fee Reminder" on: once the
-     * deadline (+ grace days) of the current month has passed, message ONLY the parents whose generated
-     * voucher still has a pending balance. Paid students are skipped; each student is reminded once per month.
+     * Daily check (10:00 Pakistan time). For every school that switched "Fee Reminder" on: if today is one of
+     * the days the school chose (N days before / on / N days after the due date), message ONLY the parents whose
+     * generated voucher still has a pending balance. Paid students are skipped; no one gets the same reminder twice.
      */
     @Scheduled(cron = "0 0 10 * * *", zone = "Asia/Karachi")
     public void sendFeeReminders() {
@@ -212,17 +214,53 @@ public class WhatsAppService {
         }
     }
 
+    /** "1,3,7" -> {1,3,7}. Ignores junk, keeps 1..30 only. */
+    private static Set<Integer> parseDays(String csv) {
+        Set<Integer> out = new TreeSet<>();
+        if (csv == null) return out;
+        for (String p : csv.split(",")) {
+            try { int d = Integer.parseInt(p.trim()); if (d >= 1 && d <= 30) out.add(d); }
+            catch (NumberFormatException ignored) { }
+        }
+        return out;
+    }
+
+    /**
+     * Decides, for today, which fee months need a reminder, using the school's own schedule:
+     * N days BEFORE the due date, ON the due date, and/or N days AFTER it. The previous / current / next
+     * month are all checked because "3 days before" can fall in the month before the due date and
+     * "10 days after" in the month after it.
+     * A school that switched reminders on but never picked a schedule keeps the old behaviour
+     * (one reminder per month once the deadline + grace days have passed).
+     */
     private void remindSchool(WhatsAppConfig cfg) throws Exception {
         String schoolId = cfg.getSchoolId();
-        LocalDate today = LocalDate.now();
-        String monthKey = YearMonth.from(today).toString();
-        SchoolSettings ss = settingsRepository.findBySchoolId(schoolId).orElse(null);
-        int grace = ss == null || ss.getLateFeeGrace() == null ? 0 : ss.getLateFeeGrace();
-        LocalDate due = dueDate(schoolId, monthKey);
-        if (!today.isAfter(due.plusDays(grace))) return; // deadline has not passed yet
+        LocalDate today = LocalDate.now(ZoneId.of("Asia/Karachi"));
+        Set<Integer> before = parseDays(cfg.getReminderBeforeDays());
+        Set<Integer> after = parseDays(cfg.getReminderAfterDays());
+        boolean onDue = Boolean.TRUE.equals(cfg.getReminderOnDue());
 
+        if (before.isEmpty() && after.isEmpty() && !onDue) {           // legacy: no schedule chosen
+            String monthKey = YearMonth.from(today).toString();
+            SchoolSettings ss = settingsRepository.findBySchoolId(schoolId).orElse(null);
+            int grace = ss == null || ss.getLateFeeGrace() == null ? 0 : ss.getLateFeeGrace();
+            if (!today.isAfter(dueDate(schoolId, monthKey).plusDays(grace))) return;
+            remindMonth(cfg, monthKey, "");
+            return;
+        }
+        for (int shift = -1; shift <= 1; shift++) {
+            String monthKey = YearMonth.from(today).plusMonths(shift).toString();
+            long offset = ChronoUnit.DAYS.between(dueDate(schoolId, monthKey), today); // <0 before, 0 due day, >0 after
+            boolean hit = offset == 0 ? onDue : offset < 0 ? before.contains((int) -offset) : after.contains((int) offset);
+            if (hit) remindMonth(cfg, monthKey, ":" + offset);
+        }
+    }
+
+    /** Sends the reminder for one fee month to every parent whose voucher still has a balance. */
+    private void remindMonth(WhatsAppConfig cfg, String monthKey, String keySuffix) throws Exception {
+        String schoolId = cfg.getSchoolId();
         String school = schoolName(schoolId);
-        String dueText = due.format(DAY);
+        String dueText = dueDate(schoolId, monthKey).format(DAY);
         Set<String> regNos = new LinkedHashSet<>();
         for (Finance v : financeRepository.findByMonthKeyAndRecordTypeAndSchoolId(monthKey, Finance.TYPE_VOUCHER, schoolId)) {
             if (v.getPayloadJson() == null) continue;
@@ -237,8 +275,8 @@ public class WhatsAppService {
             double paid = master.getPaidAmount() == null ? 0.0 : master.getPaidAmount();
             double remaining = master.getRemainingBalance() == null ? Math.max(0.0, net - paid) : master.getRemainingBalance();
             if (remaining <= 0.01) continue;                                   // already paid: no reminder
-            String key = "rem:" + regNo + ":" + monthKey;
-            if (logRepo.existsBySchoolIdAndDedupeKey(schoolId, key)) continue; // already reminded this month
+            String key = "rem:" + regNo + ":" + monthKey + keySuffix;          // once per student, per month, per reminder day
+            if (logRepo.existsBySchoolIdAndDedupeKey(schoolId, key)) continue;
             Student st = studentRepository.findByRegNoAndSchoolId(regNo, schoolId).orElse(null);
             if (st == null || (st.getStatus() != null && !"active".equalsIgnoreCase(st.getStatus()))) continue;
             String phone = phoneOf(st);
