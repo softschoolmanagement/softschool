@@ -29,7 +29,12 @@ public class WhatsAppConfig {
     private Boolean enabled = false;          // master switch
     private Boolean notifyAbsent = true;      // auto message when a student is marked absent
     private Boolean notifyVoucher = false;    // message the parent when a fee voucher is generated
-    private Boolean notifyReminder = false;   // after the fee deadline, remind ONLY parents whose fee is still pending
+    private Boolean notifyReminder = false;   // on the chosen days around the fee due date, remind ONLY parents whose fee is still pending
+    // Fee reminder schedule, relative to the due date. Days are comma lists, e.g. "1,3". Empty + reminderOnDue=false
+    // means "no schedule chosen" and the old behaviour applies (one reminder after the deadline + grace days).
+    @Column(length = 64) private String reminderBeforeDays = "";   // N days BEFORE the due date
+    private Boolean reminderOnDue = false;                          // ON the due date
+    @Column(length = 64) private String reminderAfterDays = "";    // N days AFTER the due date
     private Integer dailyLimit;               // this school's own max messages/day (null = server default); can only lower the gateway ceiling
 
     @Column(length = 1000) private String absentTemplate = DEFAULT_ABSENT;
