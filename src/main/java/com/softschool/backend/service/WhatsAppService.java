@@ -124,22 +124,37 @@ public class WhatsAppService {
      * right behind each other, wait in the queue and are delivered slowly (limits, rests between batches).
      * "true" means accepted, not necessarily delivered yet. False when WhatsApp is not connected or the queue is full.
      */
+    /**
+     * Hands messages to the gateway and returns its per-message results (same order as the input), or null when
+     * the gateway could not be reached / refused the whole request (not connected, bad key, queue full).
+     * Each result looks like {to, accepted, reason?}. HTTP 200 does NOT mean every message was accepted:
+     * the gateway refuses single messages (duplicate, recipient_cap, number not on WhatsApp ...) inside a 200.
+     */
     @SuppressWarnings("unchecked")
-    public boolean send(String schoolId, List<Map<String, String>> messages) {
-        if (!isConfigured() || messages.isEmpty()) return false;
+    public List<Map<String, Object>> sendRaw(String schoolId, List<Map<String, String>> messages) {
+        if (!isConfigured() || messages.isEmpty()) return null;
         try {
             Map<String, Object> body = new HashMap<>();
             body.put("messages", messages);
             body.put("country", countryCode);
             WhatsAppConfig cfg = configRepo.findBySchoolId(schoolId).orElse(null);
             if (cfg != null && cfg.getDailyLimit() != null) body.put("dailyLimit", cfg.getDailyLimit());
-            http().post().uri("/sessions/{id}/send", schoolId).contentType(MediaType.APPLICATION_JSON)
-                    .body(body).retrieve().toBodilessEntity();
-            return true;
+            Map<String, Object> res = http().post().uri("/sessions/{id}/send", schoolId)
+                    .contentType(MediaType.APPLICATION_JSON).body(body).retrieve().body(Map.class);
+            Object r = res == null ? null : res.get("results");
+            return r instanceof List<?> ? (List<Map<String, Object>>) r : null;
         } catch (Exception e) {
             log.warn("WhatsApp send skipped for {}: {}", schoolId, e.getMessage());
-            return false;
+            return null;
         }
+    }
+
+    private static boolean accepted(Map<String, Object> r) { return r != null && Boolean.TRUE.equals(r.get("accepted")); }
+
+    /** True when the gateway accepted at least one message (sent now, or waiting in its queue). */
+    public boolean send(String schoolId, List<Map<String, String>> messages) {
+        List<Map<String, Object>> r = sendRaw(schoolId, messages);
+        return r != null && r.stream().anyMatch(WhatsAppService::accepted);
     }
 
     /** A message that was handed to the gateway and must be logged (dedupe) once the gateway accepted it. */
@@ -152,10 +167,13 @@ public class WhatsAppService {
     private void sendBatch(String schoolId, List<Map<String, String>> msgs, List<Pending> pend) {
         for (int i = 0; i < msgs.size(); i += 500) {
             int end = Math.min(msgs.size(), i + 500);
-            if (!send(schoolId, new ArrayList<>(msgs.subList(i, end)))) return;   // not connected / queue full: nothing logged, retried next time
-            for (int k = i; k < end; k++) {
+            List<Map<String, Object>> res = sendRaw(schoolId, new ArrayList<>(msgs.subList(i, end)));
+            if (res == null) return;   // not connected / bad key / queue full: nothing logged, retried next time
+            for (int k = i; k < end && (k - i) < res.size(); k++) {
+                Map<String, Object> r = res.get(k - i);
                 Pending p = pend.get(k);
-                record(schoolId, p.key(), p.kind(), p.regNo(), p.phone());
+                if (accepted(r)) record(schoolId, p.key(), p.kind(), p.regNo(), p.phone());
+                else log.info("WhatsApp refused {} for {} ({}): {}", p.kind(), p.regNo(), p.phone(), r == null ? "no result" : r.get("reason"));
             }
         }
     }
@@ -170,7 +188,7 @@ public class WhatsAppService {
             try {
                 WhatsAppConfig cfg = configRepo.findBySchoolId(schoolId).orElse(null);
                 if (cfg == null || !cfg.wantsAbsent()) return;
-                LocalDate today = LocalDate.now();
+                LocalDate today = LocalDate.now(ZoneId.of("Asia/Karachi"));
                 String school = schoolName(schoolId);
                 List<Map<String, String>> msgs = new ArrayList<>();
                 List<Pending> pend = new ArrayList<>();
@@ -215,8 +233,11 @@ public class WhatsAppService {
                         "month", monthLabel(monthKey), "duedate", dueDate(schoolId, monthKey).format(DAY)));
                 extra.putAll(feeCodes(schoolId, st, monthKey, total, remaining));
                 String text = render(cfg.getVoucherTemplate(), WhatsAppConfig.DEFAULT_VOUCHER, st, schoolName(schoolId), extra);
-                if (send(schoolId, List.of(Map.of("to", phone, "text", text)))) {
+                List<Map<String, Object>> res = sendRaw(schoolId, List.of(Map.of("to", phone, "text", text)));
+                if (res != null && !res.isEmpty() && accepted(res.get(0))) {
                     record(schoolId, key, "VOUCHER", regNo, phone);
+                } else {
+                    log.info("WhatsApp voucher for {} not accepted: {}", regNo, res == null || res.isEmpty() ? "gateway unavailable" : res.get(0).get("reason"));
                 }
             } catch (Exception e) { log.warn("notifyVoucher failed: {}", e.getMessage()); }
         });
@@ -335,7 +356,7 @@ public class WhatsAppService {
         Set<String> seen = new HashSet<>();
         int noPhone = 0;
         boolean usesCodes = template != null && FEE_CODE.matcher(normalizeTemplate(template)).find();   // fee codes work in manual messages too
-        String monthKey = YearMonth.now().toString();
+        String monthKey = YearMonth.now(ZoneId.of("Asia/Karachi")).toString();
         for (Student st : studentRepository.findBySchoolId(schoolId)) {
             if (st.getStatus() != null && !"active".equalsIgnoreCase(st.getStatus())) continue;
             if (notBlank(className) && !className.equalsIgnoreCase(String.valueOf(st.getStudentClass()))) continue;
@@ -349,14 +370,23 @@ public class WhatsAppService {
             if (!seen.add(phone + "|" + text)) continue;
             msgs.add(Map.of("to", phone, "text", text));
         }
-        int queued = 0;
+        int queued = 0, refused = 0;
         boolean ok = true;
+        String firstReason = null;
         for (int i = 0; i < msgs.size() && ok; i += 500) {
             List<Map<String, String>> part = msgs.subList(i, Math.min(msgs.size(), i + 500));
-            ok = send(schoolId, part);
-            if (ok) queued += part.size();
+            List<Map<String, Object>> res = sendRaw(schoolId, new ArrayList<>(part));
+            if (res == null) { ok = false; break; }
+            for (Map<String, Object> r : res) {
+                if (accepted(r)) queued++;
+                else { refused++; if (firstReason == null && r != null) firstReason = String.valueOf(r.get("reason")); }
+            }
         }
-        return Map.of("queued", queued, "studentsWithoutNumber", noPhone, "gatewayOk", ok);
+        Map<String, Object> out = new HashMap<>();
+        out.put("queued", queued); out.put("refused", refused);
+        out.put("studentsWithoutNumber", noPhone); out.put("gatewayOk", ok);
+        if (firstReason != null) out.put("reason", firstReason);
+        return out;
     }
 
     // ─────────────── helpers ───────────────
@@ -396,7 +426,7 @@ public class WhatsAppService {
                 + (notBlank(st.getSection()) ? "-" + st.getSection() : ""));
         v.put("regno", st.getRegNo() == null ? "" : st.getRegNo());
         v.put("school", school);
-        v.putIfAbsent("date", LocalDate.now().format(DAY));
+        v.putIfAbsent("date", LocalDate.now(ZoneId.of("Asia/Karachi")).format(DAY));
         // %[code]% student codes: work in EVERY message (absent, fee voucher, fee reminder, message to parents)
         v.put("stName", st.getFullName() == null ? "" : st.getFullName());
         v.put("stClass", st.getStudentClass() == null ? "" : st.getStudentClass());
