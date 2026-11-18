@@ -81,9 +81,26 @@ public class WhatsAppController {
         String text = in.getOrDefault("text", "").isBlank()
                 ? "Test message from your school management system. WhatsApp automation is working."
                 : clip(in.get("text"));
-        boolean ok = wa.send(school(r), List.of(Map.of("to", phone, "text", text)));
-        return ok ? ResponseEntity.ok(Map.of("ok", true))
-                  : ResponseEntity.status(409).body(Map.of("error", "WhatsApp is not connected."));
+        // Unique suffix: the gateway refuses the same text to the same number twice in 24 h ("duplicate").
+        if (in.getOrDefault("text", "").isBlank()) text += " [" + java.time.LocalTime.now().withNano(0) + "]";
+        List<Map<String, Object>> res = wa.sendRaw(school(r), List.of(Map.of("to", phone, "text", text)));
+        if (res == null) return ResponseEntity.status(409).body(Map.of("error", "WhatsApp is not connected or the gateway is unreachable."));
+        Map<String, Object> first = res.isEmpty() ? Map.of() : res.get(0);
+        if (!Boolean.TRUE.equals(first.get("accepted"))) {
+            return ResponseEntity.status(422).body(Map.of("error", "Not sent: " + friendly(String.valueOf(first.get("reason")))));
+        }
+        return ResponseEntity.ok(Map.of("ok", true, "sent", Boolean.TRUE.equals(first.get("sent"))));
+    }
+
+    private static String friendly(String reason) {
+        return switch (reason) {
+            case "duplicate" -> "the same text was already sent to this number in the last 24 hours.";
+            case "recipient_cap" -> "this number already received the maximum messages for today.";
+            case "number not on WhatsApp" -> "this number is not on WhatsApp.";
+            case "invalid number" -> "the phone number is not valid.";
+            case "send failed" -> "WhatsApp rejected the send, try again shortly.";
+            default -> reason;
+        };
     }
 
     /** body: {"className":"5","section":"A","text":"Dear parent of {student}, ..."}  (class/section optional) */
