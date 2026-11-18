@@ -29,6 +29,8 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Talks to the Baileys gateway (whatsapp-service/). Every school links ITS OWN WhatsApp number, so a
@@ -182,9 +184,12 @@ public class WhatsAppService {
                 Student st = studentRepository.findByRegNoAndSchoolId(regNo, schoolId).orElse(null);
                 String phone = phoneOf(st);
                 if (phone == null) return;
-                String text = render(cfg.getVoucherTemplate(), WhatsAppConfig.DEFAULT_VOUCHER, st, schoolName(schoolId), Map.of(
+                waitForLedger(schoolId, regNo, monthKey);
+                Map<String, String> extra = new HashMap<>(Map.of(
                         "amount", money(total), "balance", money(remaining),
                         "month", monthLabel(monthKey), "duedate", dueDate(schoolId, monthKey).format(DAY)));
+                extra.putAll(feeCodes(schoolId, st, monthKey, total, remaining));
+                String text = render(cfg.getVoucherTemplate(), WhatsAppConfig.DEFAULT_VOUCHER, st, schoolName(schoolId), extra);
                 if (send(schoolId, List.of(Map.of("to", phone, "text", text)))) {
                     record(schoolId, key, "VOUCHER", regNo, phone);
                 }
@@ -238,8 +243,10 @@ public class WhatsAppService {
             if (st == null || (st.getStatus() != null && !"active".equalsIgnoreCase(st.getStatus()))) continue;
             String phone = phoneOf(st);
             if (phone == null) continue;
-            String text = render(cfg.getReminderTemplate(), WhatsAppConfig.DEFAULT_REMINDER, st, school, Map.of(
+            Map<String, String> extra = new HashMap<>(Map.of(
                     "balance", money(remaining), "month", monthLabel(monthKey), "duedate", dueText));
+            extra.putAll(feeCodes(schoolId, st, monthKey, null, remaining));
+            String text = render(cfg.getReminderTemplate(), WhatsAppConfig.DEFAULT_REMINDER, st, school, extra);
             if (send(schoolId, List.of(Map.of("to", phone, "text", text)))) {
                 record(schoolId, key, "REMINDER", regNo, phone);
             }
@@ -264,6 +271,8 @@ public class WhatsAppService {
         List<Map<String, String>> msgs = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         int noPhone = 0;
+        boolean usesCodes = template != null && template.contains("%[");   // fee codes work in manual messages too
+        String monthKey = YearMonth.now().toString();
         for (Student st : studentRepository.findBySchoolId(schoolId)) {
             if (st.getStatus() != null && !"active".equalsIgnoreCase(st.getStatus())) continue;
             if (notBlank(className) && !className.equalsIgnoreCase(String.valueOf(st.getStudentClass()))) continue;
@@ -272,7 +281,8 @@ public class WhatsAppService {
             if (phone == null) { noPhone++; continue; }
             // Siblings share a parent number: with {student} in the text each child still gets a message,
             // without it we send only one message per phone number.
-            String text = render(template, template, st, school, Map.of());
+            Map<String, String> extra = usesCodes ? feeCodes(schoolId, st, monthKey, null, null) : Map.of();
+            String text = render(template, template, st, school, extra);
             if (!seen.add(phone + "|" + text)) continue;
             msgs.add(Map.of("to", phone, "text", text));
         }
@@ -325,8 +335,158 @@ public class WhatsAppService {
         v.put("school", school);
         v.putIfAbsent("date", LocalDate.now().format(DAY));
         for (Map.Entry<String, String> e : v.entrySet()) t = t.replace("{" + e.getKey() + "}", e.getValue());
-        return t;
+        return applyFormatting(applyNewLines(fillCodes(t, v)));
     }
+
+    // ─────────────── new line tag: Fee Month *{nL}* Due Date  ->  two lines ───────────────
+    /**
+     * Opt-in: only the exact code *{nL}* (any letter case) is touched. A message without it is sent exactly
+     * as written. Spaces around the tag are dropped so lines start/end clean.
+     */
+    private static final Pattern NEWLINE = Pattern.compile("[ \\t]*\\*\\{nl\\}\\*[ \\t]*", Pattern.CASE_INSENSITIVE);
+
+    /** Replaces every *{nL}* with a real line break. Runs before applyFormatting so styles wrap per line. */
+    static String applyNewLines(String text) {
+        if (text == null || text.indexOf('{') < 0) return text;
+        return NEWLINE.matcher(text).replaceAll("\n");
+    }
+
+    // ─────────────── text formatting tags: *{b}*bold*{/b}*  *{i}*italic*{/i}*  *{s}*strike*{/s}* ───────────────
+    /**
+     * Opt-in: nothing happens unless the school writes the full, exact pair *{b}*text*{/b}* (same for i, s).
+     * Plain text, a lone tag, or a bare {b} is left exactly as typed.
+     */
+    private static final Pattern FMT = Pattern.compile(
+            "\\*\\{(b|i|s)\\}\\*(.*?)\\*\\{/\\1\\}\\*", Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+
+    /**
+     * Turns the tags into WhatsApp formatting: b = *bold*, i = _italic_, s = ~strike~.
+     * WhatsApp only formats when the marker touches the text, so spaces just inside a tag
+     * ("*{b}*Fee Month *{/b}*") are moved outside the marker, and each line is wrapped on its own
+     * because WhatsApp formatting cannot span a line break.
+     */
+    static String applyFormatting(String text) {
+        if (text == null || text.indexOf('{') < 0) return text;
+        Matcher m = FMT.matcher(text);
+        StringBuilder out = new StringBuilder();
+        while (m.find()) {
+            char t = Character.toLowerCase(m.group(1).charAt(0));
+            String mark = t == 'b' ? "*" : t == 'i' ? "_" : "~";
+            String[] lines = m.group(2).split("\n", -1);
+            StringBuilder r = new StringBuilder();
+            for (int i = 0; i < lines.length; i++) {
+                if (i > 0) r.append('\n');
+                String line = lines[i];
+                String core = line.strip();
+                if (core.isEmpty()) { r.append(line); continue; }
+                int lead = line.length() - line.stripLeading().length();
+                int trail = line.length() - line.stripTrailing().length();
+                r.append(line, 0, lead).append(mark).append(core).append(mark).append(line.substring(line.length() - trail));
+            }
+            m.appendReplacement(out, Matcher.quoteReplacement(r.toString()));
+        }
+        m.appendTail(out);
+        return out.toString();
+    }
+
+    // ─────────────── %[code]% placeholders (Settings > WhatsApp > "Codes" button) ───────────────
+    /** %[stName]%  (the closing % is optional so a typo like %[fine] still works). Names are case-insensitive. */
+    private static final Pattern CODE = Pattern.compile("%\\[\\s*([A-Za-z]+)\\s*\\]%?");
+
+    /** Maps each %[code]% to its value; a code we do not know is left in the text untouched. */
+    static String fillCodes(String text, Map<String, String> values) {
+        if (text == null || text.indexOf("%[") < 0) return text;
+        Map<String, String> byCode = new HashMap<>();
+        for (Map.Entry<String, String> e : values.entrySet()) byCode.put(e.getKey().toLowerCase(Locale.ROOT), e.getValue());
+        Matcher m = CODE.matcher(text);
+        StringBuilder out = new StringBuilder();
+        while (m.find()) {
+            String val = byCode.get(m.group(1).toLowerCase(Locale.ROOT));
+            m.appendReplacement(out, Matcher.quoteReplacement(val == null ? m.group() : val));
+        }
+        m.appendTail(out);
+        return out.toString();
+    }
+
+    /**
+     * Values for the fee codes, read from the student's saved fee ledger row for that month:
+     * stName feeMonth dueDate tutionFee arr transportFee ttlDisc otherFee fine ttlFee winDue AfDue.
+     *  - arr      = unpaid balance carried over from the previous month (never more than the row's "other charges")
+     *  - otherFee = the rest of the row's "other charges" (custom fee rows)
+     *  - ttlFee   = the voucher total (tuition + transport + other + fine - discount)
+     *  - winDue   = what is still payable on or before the due date
+     *  - AfDue    = winDue + the late fee set in Settings > Late Fee (same as winDue when late fee is off)
+     */
+    private Map<String, String> feeCodes(String schoolId, Student st, String monthKey,
+                                         Double fallbackTotal, Double fallbackRemaining) {
+        Map<String, String> c = new HashMap<>();
+        // These three never depend on the ledger, so they always work (before, a missing ledger row left
+        // even %[stName]% unreplaced in the message).
+        c.put("stName", st.getFullName() == null ? "" : st.getFullName());
+        c.put("feeMonth", monthLabel(monthKey));
+        c.put("dueDate", dueDate(schoolId, monthKey).format(DAY));
+        Finance f = financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolId(
+                st.getRegNo(), monthKey, Finance.TYPE_STUDENT_FEE, schoolId).orElse(null);
+        if (f == null) {
+            // No fee row for this month (yet): amounts that are unknown show 0 instead of a raw %[code]%.
+            double rem = fallbackRemaining == null ? 0.0 : fallbackRemaining;
+            for (String k : new String[]{"tutionFee", "arr", "transportFee", "ttlDisc", "otherFee", "fine"}) c.put(k, "0");
+            c.put("ttlFee", money(fallbackTotal == null ? rem : fallbackTotal));
+            c.put("winDue", money(rem));
+            c.put("AfDue", money(rem + lateFeeFor(schoolId, 0.0)));
+            return c;
+        }
+        double tuition = nz(f.getBaseTuitionFee());
+        double other = nz(f.getOtherCharges());
+        double arrears = Math.min(other, previousBalance(schoolId, st, monthKey));
+        double fine = Math.max(nz(f.getTotalFineCharged()), nz(f.getFineAmount()));
+        double payable = nz(f.getRemainingBalance());
+
+        double late = lateFeeFor(schoolId, tuition);
+        c.put("tutionFee", money(tuition));
+        c.put("arr", money(arrears));
+        c.put("transportFee", money(nz(f.getTransportFee())));
+        c.put("ttlDisc", money(nz(f.getTotalDiscountApplied())));
+        c.put("otherFee", money(Math.max(0.0, other - arrears)));
+        c.put("fine", money(fine));
+        c.put("ttlFee", money(nz(f.getNetPayable())));
+        c.put("winDue", money(payable));
+        c.put("AfDue", money(payable + late));
+        return c;
+    }
+
+    /** Late fee from Settings > Late Fee (fixed amount, or percent of tuition); 0 when late fee is off. */
+    private double lateFeeFor(String schoolId, double tuition) {
+        SchoolSettings ss = settingsRepository.findBySchoolId(schoolId).orElse(null);
+        if (ss == null || Boolean.FALSE.equals(ss.getLateFeeEnabled()) || ss.getLateFeeAmount() == null) return 0.0;
+        return "percent".equalsIgnoreCase(ss.getLateFeeType())
+                ? tuition * ss.getLateFeeAmount() / 100.0 : ss.getLateFeeAmount();
+    }
+
+    /**
+     * The voucher message is sent from a background thread the moment the voucher is generated, so the
+     * student's fee row may not be committed yet. Wait briefly (max ~4 s) so the codes get the real values.
+     */
+    private void waitForLedger(String schoolId, String regNo, String monthKey) {
+        for (int i = 0; i < 8; i++) {
+            if (financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolId(
+                    regNo, monthKey, Finance.TYPE_STUDENT_FEE, schoolId).isPresent()) return;
+            try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+        }
+    }
+
+    /** Unpaid balance of the latest earlier month, or the student's opening arrears if there is none. */
+    private double previousBalance(String schoolId, Student st, String monthKey) {
+        Finance latest = null;
+        for (Finance r : financeRepository.findBySchoolIdAndRegNo(schoolId, st.getRegNo())) {
+            if (!Finance.TYPE_STUDENT_FEE.equals(r.getRecordType()) || r.getMonthKey() == null
+                    || r.getMonthKey().compareTo(monthKey) >= 0) continue;
+            if (latest == null || r.getMonthKey().compareTo(latest.getMonthKey()) > 0) latest = r;
+        }
+        return latest != null ? nz(latest.getRemainingBalance()) : nz(st.getArrears());
+    }
+
+    private static double nz(Double d) { return d == null ? 0.0 : d; }
 
     private String schoolName(String schoolId) {
         return settingsRepository.findBySchoolId(schoolId).map(SchoolSettings::getSchoolName)
