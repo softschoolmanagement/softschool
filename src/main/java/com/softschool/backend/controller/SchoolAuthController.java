@@ -9,6 +9,7 @@ import com.softschool.backend.repository.SchoolSettingsRepository;
 import com.softschool.backend.model.SchoolSettings;
 import com.softschool.backend.security.PasswordHashUtil;
 import com.softschool.backend.service.LoginAttemptService;
+import com.softschool.backend.service.PlanEnforcementService;
 import com.softschool.backend.security.SchoolSessionService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
@@ -68,6 +69,16 @@ public class SchoolAuthController {
     @Autowired
     private TeacherPasswordService teacherPasswordService;
 
+    @Autowired
+    private PlanEnforcementService planEnforcementService;
+
+    /** Builds the browser-safe school record, including whether WhatsApp is banned (school or plan level). */
+    private SchoolPublicView viewOf(School school) {
+        SchoolPublicView v = new SchoolPublicView(school);
+        v.whatsappBanned = planEnforcementService.isWhatsAppBanned(school);
+        return v;
+    }
+
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final int REMEMBER_TOKEN_DAYS = 30;
 
@@ -116,7 +127,7 @@ public class SchoolAuthController {
         school.setLoginPasswordHash(hashPassword(password));
         School saved = schoolRepository.save(school);
 
-        return ResponseEntity.status(HttpStatus.CREATED).body(new SchoolPublicView(saved));
+        return ResponseEntity.status(HttpStatus.CREATED).body(viewOf(saved));
     }
 
     /**
@@ -222,7 +233,7 @@ public class SchoolAuthController {
         }
         School saved = schoolRepository.save(school);
 
-        SchoolPublicView view = new SchoolPublicView(saved);
+        SchoolPublicView view = viewOf(saved);
         view.rememberToken = rememberToken; // null unless "Remember Me" was checked
         view.sessionToken = schoolSessionService.issueToken(saved.getSchoolId(), saved.getUsername());
         return ResponseEntity.ok(view);
@@ -372,7 +383,7 @@ public class SchoolAuthController {
         String newToken = issueRememberToken(school);
         School saved = schoolRepository.save(school);
 
-        SchoolPublicView view = new SchoolPublicView(saved);
+        SchoolPublicView view = viewOf(saved);
         view.rememberToken = newToken;
         view.sessionToken = schoolSessionService.issueToken(saved.getSchoolId(), saved.getUsername());
         return ResponseEntity.ok(view);
@@ -402,7 +413,7 @@ public class SchoolAuthController {
         if (!found.isPresent()) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(errorBody("not_found"));
         }
-        return ResponseEntity.ok(new SchoolPublicView(found.get()));
+        return ResponseEntity.ok(viewOf(found.get()));
     }
 
     // ── helpers ──────────────────────────────────────────────
@@ -524,6 +535,8 @@ public class SchoolAuthController {
         public Integer staffLimit;
         public Integer archiveStudentLimit;
         public String locks;
+        /** Effective WhatsApp ban: this school's own flag OR its plan's. The UI hides the feature when true. */
+        public boolean whatsappBanned;
         public String status;
         public String registeredAt;
         public String expiryDate;

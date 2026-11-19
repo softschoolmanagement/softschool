@@ -1,5 +1,6 @@
 package com.softschool.backend.controller;
 
+import com.softschool.backend.exception.WhatsAppBannedException;
 import com.softschool.backend.model.WhatsAppConfig;
 import com.softschool.backend.repository.WhatsAppConfigRepository;
 import com.softschool.backend.security.SchoolSessionService;
@@ -28,9 +29,20 @@ public class WhatsAppController {
         return (String) r.getAttribute(SchoolSessionService.SCHOOL_ID_ATTRIBUTE);
     }
 
+    /**
+     * Super-admin ban (school-specific or whole plan). Called first in every endpoint except status
+     * (which reports the ban so the UI can hide the tab) and logout (so a school can still unlink).
+     * Throws WhatsAppBannedException -> HTTP 403 {"error": "...", "code": "whatsapp_banned"}.
+     */
+    private void requireNotBanned(HttpServletRequest r) {
+        String id = school(r);
+        if (wa.isBanned(id)) throw new WhatsAppBannedException(id);
+    }
+
     @GetMapping("/status")
     public Map<String, Object> status(HttpServletRequest r) {
         String id = school(r);
+        if (wa.isBanned(id)) return Map.of("state", "banned", "connected", false, "banned", true);
         Map<String, Object> out = new java.util.HashMap<>(wa.status(id));
         out.put("config", wa.config(id));
         // fields the "Send to parents" popup shows
@@ -49,6 +61,7 @@ public class WhatsAppController {
     /** body: {} for QR mode, or {"phone":"03001234567"} for the 8-character pairing-code mode. */
     @PostMapping("/connect")
     public ResponseEntity<?> connect(HttpServletRequest r, @RequestBody(required = false) Map<String, String> body) {
+        requireNotBanned(r);
         if (!wa.isConfigured()) return ResponseEntity.status(503).body(Map.of("error", "WhatsApp service is not configured on the server."));
         try {
             return ResponseEntity.ok(wa.connect(school(r), body == null ? null : body.get("phone")));
@@ -65,6 +78,7 @@ public class WhatsAppController {
 
     @PutMapping("/config")
     public WhatsAppConfig saveConfig(HttpServletRequest r, @RequestBody Map<String, Object> in) {
+        requireNotBanned(r);
         WhatsAppConfig c = wa.config(school(r));
         if (in.containsKey("enabled")) c.setEnabled(Boolean.TRUE.equals(in.get("enabled")));
         if (in.containsKey("notifyAbsent")) c.setNotifyAbsent(Boolean.TRUE.equals(in.get("notifyAbsent")));
@@ -86,6 +100,7 @@ public class WhatsAppController {
 
     @PostMapping("/test")
     public ResponseEntity<?> test(HttpServletRequest r, @RequestBody Map<String, String> in) {
+        requireNotBanned(r);
         String phone = in.get("phone");
         if (phone == null || phone.isBlank()) return ResponseEntity.badRequest().body(Map.of("error", "phone is required"));
         String text = in.getOrDefault("text", "").isBlank()
@@ -116,6 +131,7 @@ public class WhatsAppController {
     /** body: {"className":"5","section":"A","text":"Dear parent of {student}, ..."}  (class/section optional) */
     @PostMapping("/broadcast")
     public ResponseEntity<?> broadcast(HttpServletRequest r, @RequestBody Map<String, String> in) {
+        requireNotBanned(r);
         String text = in.get("text");
         if (text == null || text.isBlank()) return ResponseEntity.badRequest().body(Map.of("error", "text is required"));
         String id = school(r);
@@ -129,6 +145,7 @@ public class WhatsAppController {
                                           @RequestParam(required = false) String className,
                                           @RequestParam(required = false) String section,
                                           @RequestParam(required = false) String monthKey) {
+        requireNotBanned(r);
         return wa.recipients(school(r), className, section, monthKey);
     }
 
@@ -136,6 +153,7 @@ public class WhatsAppController {
     @PostMapping("/send/{kind}")
     public ResponseEntity<?> sendToParents(HttpServletRequest r, @PathVariable String kind,
                                            @RequestBody Map<String, Object> in) {
+        requireNotBanned(r);
         if (!List.of("announcement", "fee", "attendance").contains(kind))
             return ResponseEntity.badRequest().body(Map.of("error", "Unknown message type."));
         if (!wa.isConfigured()) return ResponseEntity.status(503).body(Map.of("error", "WhatsApp service is not configured on the server."));
