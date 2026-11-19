@@ -72,8 +72,8 @@ public class SuperAdminController {
     @Autowired
     private com.softschool.backend.repository.TeacherFeedbackRepository teacherFeedbackRepository;
 
-    // WhatsApp ban: ban state is resolved by PlanEnforcementService; the service also unlinks the
-    // school's number right away when a ban is switched on.
+    // WhatsApp is a normal lockable feature ("whatsapp"). When it becomes locked for a school,
+    // that school's linked WhatsApp number is unlinked right away.
     @Autowired
     private com.softschool.backend.service.PlanEnforcementService planEnforcementService;
 
@@ -151,7 +151,6 @@ public class SuperAdminController {
             school.setStudentLimit(req.getStudentLimit());
             school.setStaffLimit(req.getStaffLimit());
             school.setLogo(req.getLogo());
-            if (req.getWhatsappBanned() != null) school.setWhatsappBanned(req.getWhatsappBanned());
             
             // Handle locks safely
             if (req.getLocks() != null && !req.getLocks().isEmpty()) {
@@ -200,8 +199,6 @@ public class SuperAdminController {
         private Integer staffLimit;
         private List<String> locks;
         private String logo;
-        // null = leave unchanged (older clients never send it)
-        private Boolean whatsappBanned;
 
         public String getName() { return name; }
         public void setName(String name) { this.name = name; }
@@ -217,8 +214,6 @@ public class SuperAdminController {
         public void setLocks(List<String> locks) { this.locks = locks; }
         public String getLogo() { return logo; }
         public void setLogo(String logo) { this.logo = logo; }
-        public Boolean getWhatsappBanned() { return whatsappBanned; }
-        public void setWhatsappBanned(Boolean whatsappBanned) { this.whatsappBanned = whatsappBanned; }
     }
 
     // ... (Keep other helper methods like buildSchoolId, nextSchoolIdSuffix, etc. exactly as they were)
@@ -310,20 +305,21 @@ public ResponseEntity<?> deletePlan(@PathVariable String id) {
 @PutMapping("/plans/{id}")
 public ResponseEntity<?> updatePlan(@PathVariable String id, @RequestBody Plan plan) {
     return planRepository.findById(id).map(existing -> {
-        boolean wasBanned = Boolean.TRUE.equals(existing.getWhatsappBanned());
         existing.setLabel(plan.getLabel());
         existing.setPrice(plan.getPrice());
         existing.setStudentLimit(plan.getStudentLimit());
         existing.setStaffLimit(plan.getStaffLimit());
         existing.setLocks(plan.getLocks());
-        // null = the caller didn't send it: keep the current ban state.
-        if (plan.getWhatsappBanned() != null) existing.setWhatsappBanned(plan.getWhatsappBanned());
         Plan saved = planRepository.save(existing);
 
         // Cascade: every school currently on this plan automatically picks up
         // the plan's new student limit, staff limit, and locked
         // features, overriding any per-school customization they had before.
         List<School> schoolsOnPlan = schoolRepository.findByPlanId(id);
+        java.util.Set<String> hadWhatsApp = new java.util.HashSet<>();
+        for (School school : schoolsOnPlan) {
+            if (!planEnforcementService.isWhatsAppBanned(school)) hadWhatsApp.add(school.getSchoolId());
+        }
         for (School school : schoolsOnPlan) {
             school.setStudentLimit(saved.getStudentLimit());
             school.setStaffLimit(saved.getStaffLimit());
@@ -331,12 +327,11 @@ public ResponseEntity<?> updatePlan(@PathVariable String id, @RequestBody Plan p
         }
         schoolRepository.saveAll(schoolsOnPlan);
 
-        // The plan-wide ban was just switched ON: unlink every school on this plan right away.
-        // (Sending is refused anyway because the ban is checked live; this also frees the numbers.)
-        // Note: school.whatsappBanned is NOT touched above, so lifting the plan ban later restores
-        // access exactly to the schools that were not individually banned.
-        if (!wasBanned && Boolean.TRUE.equals(saved.getWhatsappBanned())) {
-            for (School school : schoolsOnPlan) whatsAppService.disconnectQuietly(school.getSchoolId());
+        // WhatsApp just became locked for these schools: unlink their numbers.
+        for (School school : schoolsOnPlan) {
+            if (hadWhatsApp.contains(school.getSchoolId()) && planEnforcementService.isWhatsAppBanned(school)) {
+                whatsAppService.disconnectQuietly(school.getSchoolId());
+            }
         }
 
         return ResponseEntity.ok(saved);
@@ -353,7 +348,7 @@ public ResponseEntity<?> updatePlan(@PathVariable String id, @RequestBody Plan p
             // change onto every student/staff record this school already has.
             String oldPrefix = school.getPrefix();
             String newPrefix = req.getPrefix();
-            boolean wasWhatsAppBanned = planEnforcementService.isWhatsAppBanned(school);
+            boolean wasWhatsAppLocked = planEnforcementService.isWhatsAppBanned(school);
 
             school.setName(req.getName());
             school.setPrefix(newPrefix);
@@ -376,16 +371,10 @@ public ResponseEntity<?> updatePlan(@PathVariable String id, @RequestBody Plan p
             if (req.getLocks() != null) {
                 school.setLocks(String.join(",", req.getLocks()));
             }
-
-            // null = the caller didn't send it: keep the current ban state.
-            if (req.getWhatsappBanned() != null) {
-                school.setWhatsappBanned(req.getWhatsappBanned());
-            }
             
             schoolRepository.save(school);
 
-            // Banned just now (by this school's own flag, or because it moved onto a banned plan): unlink its number.
-            if (!wasWhatsAppBanned && planEnforcementService.isWhatsAppBanned(school)) {
+            if (!wasWhatsAppLocked && planEnforcementService.isWhatsAppBanned(school)) {
                 whatsAppService.disconnectQuietly(school.getSchoolId());
             }
 
