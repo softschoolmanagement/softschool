@@ -133,6 +133,73 @@ public class SiblingLinkService {
         return me;
     }
 
+    /**
+     * Called after an edit changed the student's father name / CNIC.
+     *
+     * If the student was in a sibling group (oldGroupId, read BEFORE the edit
+     * was applied) and their father details no longer match ANY other active
+     * member of that group, they are taken out of the family:
+     *   - their own sibling columns are cleared (siblingGroupId, isSibling,
+     *     siblingOf, hasSiblings);
+     *   - the remaining members are rebuilt without them; if only one member
+     *     is left, that member is cleared too (one person is not a family).
+     *
+     * If the new father details still match someone in the group, nothing
+     * changes. Fees (siblingDiscount) are never touched. Call
+     * linkByFatherDetails() afterwards so the student can join a different
+     * family if the new father details match one.
+     */
+    @Transactional
+    public synchronized Student unlinkIfFatherChanged(Long studentId, String oldGroupId) {
+        Student me = studentRepository.findById(studentId).orElse(null);
+        if (me == null || me.getSchoolId() == null || !isActive(me)) return me;
+        String gid = oldGroupId == null ? "" : oldGroupId.trim();
+        if (gid.isEmpty()) return me;
+
+        List<Student> others = new ArrayList<>();
+        for (Student s : studentRepository.findBySchoolIdAndSiblingGroupId(me.getSchoolId(), gid)) {
+            if (!s.getId().equals(me.getId()) && isActive(s)) others.add(s);
+        }
+
+        String cnic = normalizeCnic(me.getFatherCnic());
+        String name = normalizeName(me.getFatherFullName());
+        if (cnic != null && name != null) {
+            for (Student o : others) {
+                if (cnic.equals(normalizeCnic(o.getFatherCnic()))
+                        && name.equals(normalizeName(o.getFatherFullName()))) {
+                    return me; // still the same father as someone in the family
+                }
+            }
+        }
+
+        List<Student> toSave = new ArrayList<>();
+        clearSiblingFields(me);
+        toSave.add(me);
+
+        if (others.size() == 1) {
+            Student last = others.get(0);
+            clearSiblingFields(last);
+            toSave.add(last);
+        } else {
+            for (Student member : others) {
+                List<Student> rest = new ArrayList<>();
+                for (Student o : others) if (!o.getId().equals(member.getId())) rest.add(o);
+                member.setSiblingOf(joinNames(rest));
+                member.setHasSiblings(toJson(rest));
+                toSave.add(member);
+            }
+        }
+        studentRepository.saveAll(toSave);
+        return me;
+    }
+
+    private static void clearSiblingFields(Student s) {
+        s.setSiblingGroupId(null);
+        s.setIsSibling(false);
+        s.setSiblingOf(null);
+        s.setHasSiblings(null);
+    }
+
     /** Lowest existing numeric group among the family, else the next free "00X" code for the school. */
     private String pickGroupId(String schoolId, Set<String> existingGroups) {
         Long lowest = null;
