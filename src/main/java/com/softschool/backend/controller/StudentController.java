@@ -93,6 +93,8 @@ public class StudentController {
         // Set when an edit changes the father's name or CNIC — triggers the
         // automatic sibling match below (SiblingLinkService).
         boolean fatherDetailsChanged = false;
+        // Sibling group the student belonged to BEFORE this edit (the edit overwrites it).
+        String oldSiblingGroupId = null;
         if (incoming.getRegNo() != null) {
             Student existing = studentRepository
                     .findByRegNoAndSchoolId(incoming.getRegNo(), incoming.getSchoolId())
@@ -103,6 +105,7 @@ public class StudentController {
                 // only the feature lock applies here — not the seat limit.
                 planEnforcementService.requireFeature(incoming.getSchoolId(), PlanEnforcementService.FEATURE_STUDENTS);
                 toSave = existing;                     // the managed row already in the DB
+                oldSiblingGroupId = existing.getSiblingGroupId();
                 String oldFatherName = com.softschool.backend.service.SiblingLinkService.normalizeName(existing.getFatherFullName());
                 String oldFatherCnic = com.softschool.backend.service.SiblingLinkService.normalizeCnic(existing.getFatherCnic());
                 copyUpdatableFields(incoming, toSave);  // overlay only the fields the form sent
@@ -132,6 +135,12 @@ public class StudentController {
         // A failure here must never fail the student save itself.
         if (fatherDetailsChanged) {
             try {
+                // 1) Father details changed and no longer match the family -> leave the sibling group.
+                if (oldSiblingGroupId != null && !oldSiblingGroupId.trim().isEmpty()) {
+                    Student unlinked = siblingLinkService.unlinkIfFatherChanged(saved.getId(), oldSiblingGroupId);
+                    if (unlinked != null) saved = unlinked;
+                }
+                // 2) ...then join another family if the new father details match one.
                 Student linked = siblingLinkService.linkByFatherDetails(saved.getId());
                 if (linked != null) saved = linked;
             } catch (Exception e) {
