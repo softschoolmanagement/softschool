@@ -43,6 +43,12 @@ public class StudentController {
     @Autowired
     private com.softschool.backend.security.SchoolSessionService schoolSessionService;
 
+    @Autowired
+    private com.softschool.backend.service.SiblingLinkService siblingLinkService;
+
+    private static final org.slf4j.Logger siblingLog =
+            org.slf4j.LoggerFactory.getLogger(StudentController.class);
+
     @PostMapping({"", "/"})
     public ResponseEntity<?> saveStudent(@RequestBody(required = false) Student incoming) {
         if (incoming == null) {
@@ -84,6 +90,9 @@ public class StudentController {
         // out any column the frontend didn't happen to send in that request
         // (this is what was silently deleting student.photo on every edit).
         Student toSave;
+        // Set when an edit changes the father's name or CNIC — triggers the
+        // automatic sibling match below (SiblingLinkService).
+        boolean fatherDetailsChanged = false;
         if (incoming.getRegNo() != null) {
             Student existing = studentRepository
                     .findByRegNoAndSchoolId(incoming.getRegNo(), incoming.getSchoolId())
@@ -94,7 +103,12 @@ public class StudentController {
                 // only the feature lock applies here — not the seat limit.
                 planEnforcementService.requireFeature(incoming.getSchoolId(), PlanEnforcementService.FEATURE_STUDENTS);
                 toSave = existing;                     // the managed row already in the DB
+                String oldFatherName = com.softschool.backend.service.SiblingLinkService.normalizeName(existing.getFatherFullName());
+                String oldFatherCnic = com.softschool.backend.service.SiblingLinkService.normalizeCnic(existing.getFatherCnic());
                 copyUpdatableFields(incoming, toSave);  // overlay only the fields the form sent
+                fatherDetailsChanged =
+                        !java.util.Objects.equals(oldFatherName, com.softschool.backend.service.SiblingLinkService.normalizeName(toSave.getFatherFullName()))
+                        || !java.util.Objects.equals(oldFatherCnic, com.softschool.backend.service.SiblingLinkService.normalizeCnic(toSave.getFatherCnic()));
             } else {
                 // Genuinely new student: enforce both the "students" feature
                 // lock and the plan's studentLimit (Security Audit #2 — this
@@ -112,6 +126,18 @@ public class StudentController {
         }
 
         Student saved = studentRepository.save(toSave);
+
+        // Father name / CNIC just changed: if another active student of this
+        // school has the same father name AND CNIC, link them as siblings.
+        // A failure here must never fail the student save itself.
+        if (fatherDetailsChanged) {
+            try {
+                Student linked = siblingLinkService.linkByFatherDetails(saved.getId());
+                if (linked != null) saved = linked;
+            } catch (Exception e) {
+                siblingLog.warn("Auto sibling link failed for student {}: {}", saved.getRegNo(), e.toString());
+            }
+        }
         return ResponseEntity.ok(saved);
     }
 
