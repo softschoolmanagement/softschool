@@ -3,6 +3,7 @@ package com.softschool.backend.service;
 import com.softschool.backend.exception.FeatureLockedException;
 import com.softschool.backend.exception.PlanLimitExceededException;
 import com.softschool.backend.exception.SchoolAccessException;
+import com.softschool.backend.exception.WhatsAppBannedException;
 import com.softschool.backend.model.Plan;
 import com.softschool.backend.model.School;
 import com.softschool.backend.repository.PlanRepository;
@@ -96,6 +97,31 @@ public class PlanEnforcementService {
             throw new PlanLimitExceededException(schoolId, "staff", limit, current);
         }
         return school;
+    }
+
+    // ── WHATSAPP BAN ────────────────────────────────────────────────
+
+    /**
+     * True when the super admin banned WhatsApp for this school directly OR for the school's plan.
+     * Deliberately separate from `locks`: a school with its own lock override must not be able to
+     * escape a plan-wide ban, and a plan edit must not silently wipe a school-specific ban.
+     */
+    public boolean isWhatsAppBanned(School school) {
+        if (school == null) return false;
+        if (Boolean.TRUE.equals(school.getWhatsappBanned())) return true;
+        Plan plan = school.getPlanId() == null ? null : planRepository.findById(school.getPlanId()).orElse(null);
+        return plan != null && Boolean.TRUE.equals(plan.getWhatsappBanned());
+    }
+
+    /** Same, looked up by public school id. An unknown school is not "banned" (other checks reject it). */
+    public boolean isWhatsAppBanned(String schoolId) {
+        if (schoolId == null || schoolId.trim().isEmpty()) return false;
+        return schoolRepository.findBySchoolId(schoolId).map(this::isWhatsAppBanned).orElse(false);
+    }
+
+    /** Throws WhatsAppBannedException (HTTP 403) when WhatsApp is banned for this school. */
+    public void requireWhatsApp(String schoolId) {
+        if (isWhatsAppBanned(schoolId)) throw new WhatsAppBannedException(schoolId);
     }
 
     // ── RESOLUTION LOGIC (mirrors access-control.js) ────────────────

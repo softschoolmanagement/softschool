@@ -55,6 +55,7 @@ public class WhatsAppService {
     @Autowired private SchoolSettingsRepository settingsRepository;
     @Autowired private FinanceRepository financeRepository;
     @Autowired private AttendanceRepository attendanceRepository;
+    @Autowired private PlanEnforcementService planEnforcement;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     private final ExecutorService pool = Executors.newFixedThreadPool(2, r -> {
@@ -77,6 +78,22 @@ public class WhatsAppService {
 
     public boolean isConfigured() { return apiKey != null && !apiKey.isBlank(); }
 
+    /**
+     * True when the super admin banned WhatsApp for this school (directly or via its plan).
+     * Every outgoing path below checks this, so a ban stops automatic alerts, fee reminders,
+     * broadcasts and manual sends alike - not just the Settings screen.
+     */
+    public boolean isBanned(String schoolId) { return planEnforcement.isWhatsAppBanned(schoolId); }
+
+    /** Unlinks the school's WhatsApp number in the background (used when a ban is switched on). Never throws. */
+    public void disconnectQuietly(String schoolId) {
+        if (!isConfigured() || schoolId == null) return;
+        pool.submit(() -> {
+            try { logout(schoolId); }
+            catch (Exception ignored) { /* nothing was linked, or the gateway is down */ }
+        });
+    }
+
     // ─────────────── config ───────────────
     public WhatsAppConfig config(String schoolId) {
         return configRepo.findBySchoolId(schoolId).orElseGet(() -> {
@@ -89,6 +106,7 @@ public class WhatsAppService {
     // ─────────────── session control (used by the Settings tab) ───────────────
     @SuppressWarnings("unchecked")
     public Map<String, Object> status(String schoolId) {
+        if (isBanned(schoolId)) return Map.of("state", "banned", "connected", false, "banned", true);
         if (!isConfigured()) return Map.of("state", "not_configured", "connected", false);
         try {
             return http().get().uri("/sessions/{id}/status", schoolId).retrieve().body(Map.class);
@@ -135,6 +153,7 @@ public class WhatsAppService {
     @SuppressWarnings("unchecked")
     public List<Map<String, Object>> sendRaw(String schoolId, List<Map<String, String>> messages) {
         if (!isConfigured() || messages.isEmpty()) return null;
+        if (isBanned(schoolId)) return null;          // banned by the super admin: nothing leaves, whatever called us
         try {
             Map<String, Object> body = new HashMap<>();
             body.put("messages", messages);
@@ -195,6 +214,7 @@ public class WhatsAppService {
     /** Called after attendance is saved. One message per absent student per day, ever. */
     public void notifyAbsent(String schoolId, Collection<Attendance> saved) {
         if (!isConfigured() || schoolId == null || saved == null || saved.isEmpty()) return;
+        if (isBanned(schoolId)) return;
         List<Attendance> copy = new ArrayList<>(saved);
         pool.submit(() -> {
             try {
@@ -235,6 +255,7 @@ public class WhatsAppService {
      */
     public void notifyVoucher(String schoolId, String regNo, String monthKey, double total, double remaining) {
         if (!isConfigured() || schoolId == null || regNo == null) return;
+        if (isBanned(schoolId)) return;
         pool.submit(() -> {
             try {
                 WhatsAppConfig cfg = configRepo.findBySchoolId(schoolId).orElse(null);
@@ -270,6 +291,7 @@ public class WhatsAppService {
         if (!isConfigured()) return;
         for (WhatsAppConfig cfg : configRepo.findAll()) {
             if (cfg == null || !cfg.wantsReminder()) continue;
+            if (isBanned(cfg.getSchoolId())) continue;
             try { remindSchool(cfg); }
             catch (Exception e) { log.warn("fee reminder failed for {}: {}", cfg.getSchoolId(), e.getMessage()); }
         }
