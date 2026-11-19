@@ -388,46 +388,6 @@ public class WhatsAppService {
         catch (Exception e) { return monthKey == null ? "" : monthKey; }
     }
 
-    /** Manual broadcast (announcement / fee reminder) to parents of a class, a section, or everyone. */
-    public Map<String, Object> broadcast(String schoolId, String className, String section, String template) {
-        String school = schoolName(schoolId);
-        List<Map<String, String>> msgs = new ArrayList<>();
-        Set<String> seen = new HashSet<>();
-        int noPhone = 0;
-        boolean usesCodes = template != null && FEE_CODE.matcher(normalizeTemplate(template)).find();   // fee codes work in manual messages too
-        String monthKey = YearMonth.now(ZoneId.of("Asia/Karachi")).toString();
-        for (Student st : studentRepository.findBySchoolId(schoolId)) {
-            if (st.getStatus() != null && !"active".equalsIgnoreCase(st.getStatus())) continue;
-            if (notBlank(className) && !className.equalsIgnoreCase(String.valueOf(st.getStudentClass()))) continue;
-            if (notBlank(section) && !section.equalsIgnoreCase(String.valueOf(st.getSection()))) continue;
-            String phone = phoneOf(st);
-            if (phone == null) { noPhone++; continue; }
-            // Siblings share a parent number: with {student} in the text each child still gets a message,
-            // without it we send only one message per phone number.
-            Map<String, String> extra = usesCodes ? feeCodes(schoolId, st, monthKey, null, null) : Map.of();
-            String text = render(template, template, st, school, extra);
-            if (!seen.add(phone + "|" + text)) continue;
-            msgs.add(Map.of("to", phone, "text", text));
-        }
-        int queued = 0, refused = 0;
-        boolean ok = true;
-        String firstReason = null;
-        for (int i = 0; i < msgs.size() && ok; i += 500) {
-            List<Map<String, String>> part = msgs.subList(i, Math.min(msgs.size(), i + 500));
-            List<Map<String, Object>> res = sendRaw(schoolId, new ArrayList<>(part));
-            if (res == null) { ok = false; break; }
-            for (Map<String, Object> r : res) {
-                if (accepted(r)) queued++;
-                else { refused++; if (firstReason == null && r != null) firstReason = String.valueOf(r.get("reason")); }
-            }
-        }
-        Map<String, Object> out = new HashMap<>();
-        out.put("queued", queued); out.put("refused", refused);
-        out.put("studentsWithoutNumber", noPhone); out.put("gatewayOk", ok);
-        if (firstReason != null) out.put("reason", firstReason);
-        return out;
-    }
-
     // ─────────────── "Send to parents" popup (whatsapp-send.js) ───────────────
     public static final int MAX_PER_SEND = 100;
     private static final ZoneId PK = ZoneId.of("Asia/Karachi");
@@ -488,7 +448,7 @@ public class WhatsAppService {
     }
 
     /**
-     * kind = announcement | fee | attendance. in = {regNos:[...], className, section, text, monthKey, onlyUnpaid, days}.
+     * kind = fee | attendance. in = {regNos:[...], className, section, monthKey, onlyUnpaid, days}.
      * The gateway queues and paces everything; nothing here can bypass its limits.
      */
     public Map<String, Object> sendToParents(String schoolId, String kind, Map<String, Object> in) {
@@ -497,7 +457,6 @@ public class WhatsAppService {
         WhatsAppConfig cfg = config(schoolId);
         Set<String> regNos = new LinkedHashSet<>();
         if (in.get("regNos") instanceof List<?> l) for (Object o : l) if (o != null) regNos.add(String.valueOf(o));
-        String text = str(in.get("text"));
         String monthKey = notBlank(str(in.get("monthKey"))) ? str(in.get("monthKey")) : YearMonth.now(PK).toString();
         boolean onlyUnpaid = Boolean.TRUE.equals(in.get("onlyUnpaid"));
         int days = in.get("days") instanceof Number n ? Math.max(1, Math.min(n.intValue(), 90)) : 30;
@@ -542,11 +501,7 @@ public class WhatsAppService {
                         + ") for the last " + days + " days. Present: " + pr + ", Absent: " + ab + (lv > 0 ? ", Leave: " + lv : "")
                         + ". Attendance: " + pct + "%.";
             } else {
-                String t = text.toLowerCase(Locale.ROOT).contains("{student}") ? text : "Dear parent of {student} ({class}),\n" + text;
-                t = t + "\n\n\u2014 {school}";
-                key = "man:" + regNo + ":" + today + ":" + Integer.toHexString(text.hashCode());
-                label = "BROADCAST";
-                body = render(t, t, st, school, Map.of());
+                continue;   // only fee and attendance sends exist (the controller rejects anything else)
             }
             if (logRepo.existsBySchoolIdAndDedupeKey(schoolId, key)) { already++; continue; }
             msgs.add(Map.of("to", phone, "text", body));
