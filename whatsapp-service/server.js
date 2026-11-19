@@ -60,13 +60,24 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
 
 /** "0300-1234567" | "+92 300 1234567" | "923001234567" -> "923001234567" (or null) */
-function normalizePhone(raw, country = cfg.cc) {
+function normalizePhone(raw, country = cfg.cc, strict = false) {
   let d = String(raw || '').replace(/[^\d]/g, '');
   if (!d) return null;
   if (d.startsWith('00')) d = d.slice(2);
   else if (d.startsWith('0')) d = country + d.slice(1);
   else if (!d.startsWith(country) && d.length <= 10) d = country + d;
-  return d.length >= 10 && d.length <= 15 ? d : null;
+  if (d.length < 10 || d.length > 15) return null;
+  return strict && looksFakeNumber(d, country) ? null : d;
+}
+
+/** Numbers nobody really owns: 11111, 0300-0000000, 03111111111, 03001234567 ... and non-mobile Pakistani numbers. */
+function looksFakeNumber(d, country = cfg.cc) {
+  const n = d.startsWith(country) ? d.slice(country.length) : d;
+  if (country === '92' && d.startsWith('92') && !/^3\d{9}$/.test(n)) return true; // PK mobile = 3XX XXXXXXX
+  if (new Set(n).size <= 2) return true;                                        // 0000000000, 3111111111
+  const tail = n.slice(-7);
+  if (new Set(tail).size === 1) return true;                                    // 0300-1111111
+  return '01234567890123456789'.includes(tail) || '98765432109876543210'.includes(tail); // 0300-1234567
 }
 
 // Look up the current WhatsApp Web version at most once an hour, with a timeout. Doing it on every
@@ -262,7 +273,7 @@ class Session {
     const out = [];
     const queuedKeys = new Set(this.queue.map((m) => m.to + '\n' + m.text));
     for (const it of items) {
-      const to = normalizePhone(it?.to, country);
+      const to = normalizePhone(it?.to, country, true);
       if (!to) { out.push({ to: it?.to, accepted: false, reason: 'invalid number' }); continue; }
       const text = String(it?.text ?? '').trim().slice(0, cfg.maxText);
       if (!text) { out.push({ to, accepted: false, reason: 'empty message' }); continue; }
@@ -294,7 +305,7 @@ class Session {
     if (!this.canSendDirect(items, bulk)) return { mode: 'queue', results: this.enqueue(items, country) };
 
     const it = items[0];
-    const to = normalizePhone(it?.to, country);
+    const to = normalizePhone(it?.to, country, true);
     if (!to) return { mode: 'direct', results: [{ to: it?.to, accepted: false, reason: 'invalid number' }] };
     const text = String(it?.text ?? '').trim().slice(0, cfg.maxText);
     if (!text) return { mode: 'direct', results: [{ to, accepted: false, reason: 'empty message' }] };
