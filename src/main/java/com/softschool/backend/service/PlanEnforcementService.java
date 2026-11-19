@@ -47,6 +47,7 @@ public class PlanEnforcementService {
     public static final String FEATURE_BIOMETRIC = "biometric";
     public static final String FEATURE_FINANCE = "finance";
     public static final String FEATURE_SETTINGS = "settings";
+    public static final String FEATURE_WHATSAPP = "whatsapp";
 
     @Autowired private SchoolRepository schoolRepository;
     @Autowired private PlanRepository planRepository;
@@ -99,27 +100,20 @@ public class PlanEnforcementService {
         return school;
     }
 
-    // ── WHATSAPP BAN ────────────────────────────────────────────────
+    // ── WHATSAPP (a normal lockable feature, key "whatsapp") ────────
 
-    /**
-     * True when the super admin banned WhatsApp for this school directly OR for the school's plan.
-     * Deliberately separate from `locks`: a school with its own lock override must not be able to
-     * escape a plan-wide ban, and a plan edit must not silently wipe a school-specific ban.
-     */
+    /** True when "whatsapp" is locked for this school (its own locks, else its plan's default locks). */
     public boolean isWhatsAppBanned(School school) {
-        if (school == null) return false;
-        if (Boolean.TRUE.equals(school.getWhatsappBanned())) return true;
-        Plan plan = school.getPlanId() == null ? null : planRepository.findById(school.getPlanId()).orElse(null);
-        return plan != null && Boolean.TRUE.equals(plan.getWhatsappBanned());
+        return school != null && resolveLocks(school).contains(FEATURE_WHATSAPP);
     }
 
-    /** Same, looked up by public school id. An unknown school is not "banned" (other checks reject it). */
+    /** Same, by public school id. An unknown school is not "banned" (other checks reject it). */
     public boolean isWhatsAppBanned(String schoolId) {
         if (schoolId == null || schoolId.trim().isEmpty()) return false;
         return schoolRepository.findBySchoolId(schoolId).map(this::isWhatsAppBanned).orElse(false);
     }
 
-    /** Throws WhatsAppBannedException (HTTP 403) when WhatsApp is banned for this school. */
+    /** Throws WhatsAppBannedException (HTTP 403) when the WhatsApp feature is locked for this school. */
     public void requireWhatsApp(String schoolId) {
         if (isWhatsAppBanned(schoolId)) throw new WhatsAppBannedException(schoolId);
     }
