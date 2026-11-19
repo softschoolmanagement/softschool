@@ -30,6 +30,16 @@ public class PlanEnforcementExceptionHandler {
                 "feature_locked", ex.getMessage(), "featureKey", ex.getFeatureKey()));
     }
 
+    /** WhatsApp banned by the super admin. `error` carries the readable text because the WhatsApp UI shows data.error. */
+    @ExceptionHandler(WhatsAppBannedException.class)
+    public ResponseEntity<Map<String, Object>> handleWhatsAppBanned(WhatsAppBannedException ex) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("error", ex.getMessage());
+        map.put("code", "whatsapp_banned");
+        map.put("banned", true);
+        return ResponseEntity.status(HttpStatus.FORBIDDEN).body(map);
+    }
+
     @ExceptionHandler(PlanLimitExceededException.class)
     public ResponseEntity<Map<String, Object>> handleLimitExceeded(PlanLimitExceededException ex) {
         return ResponseEntity.status(HttpStatus.PAYMENT_REQUIRED).body(body(
