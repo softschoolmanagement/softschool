@@ -35,7 +35,7 @@ public class WhatsAppConfig {
     @Column(length = 64) private String reminderBeforeDays = "";   // N days BEFORE the due date
     private Boolean reminderOnDue = false;                          // ON the due date
     @Column(length = 64) private String reminderAfterDays = "";    // N days AFTER the due date
-    private Integer dailyLimit;               // this school's own max messages/day (null = server default); can only lower the gateway ceiling
+    private Integer dailyLimit;               // this school's own max messages/day (null = no daily limit)
 
     @Column(length = 1000) private String absentTemplate = DEFAULT_ABSENT;
     @Column(length = 1000) private String voucherTemplate = DEFAULT_VOUCHER;
