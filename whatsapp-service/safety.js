@@ -3,22 +3,19 @@
 import crypto from 'node:crypto';
 
 const MIN = 60_000;
-const HOUR = 3_600_000;
 const DAY = 86_400_000;
 
 export const defaultOpts = {
-  dailyLimit: 250,            // hard ceiling per number per day (a school can lower it, never raise it)
-  hourlyLimit: 40,            // never more than this many in any rolling hour
   batchSize: 15,              // after ~this many messages in a row ...
   batchPauseMin: 3 * MIN,     // ... rest for 3-7 minutes, like a person would
   batchPauseMax: 7 * MIN,
-  perRecipientDaily: 3,       // one parent number gets at most this many messages a day (siblings share numbers)
+  perRecipientDaily: 4,       // one parent number gets at most this many messages a day (siblings share numbers)
   tz: 'Asia/Karachi',         // only used to decide when the "day" rolls over for the daily counters
-  warmupDays: 7,              // a freshly linked number ramps up slowly over its first week
-  warmupStart: 30,            // messages allowed on day one
   failLimit: 5,               // this many send failures in a row ...
   failPause: 15 * MIN,        // ... pauses the number for 15 minutes
 };
+// There is no server-side daily/hourly ceiling and no warm-up for new numbers any more.
+// The only caps are: the school's own daily limit (Settings), and perRecipientDaily per parent number.
 
 export class SendGuard {
   /**
@@ -31,10 +28,8 @@ export class SendGuard {
     this.now = clock.now || (() => Date.now());
     this.rand = clock.rand || ((a, b) => a + Math.floor(Math.random() * (b - a + 1)));
     this.s = {
-      linkedAt: null,         // set only for a number linked while this service runs (=> warm-up applies)
-      userDailyLimit: null,   // the school's own limit from Settings
+      userDailyLimit: null,   // the school's own limit from Settings (null = no daily limit)
       day: null, sentToday: 0,
-      sentTimes: [],          // timestamps of the last hour
       perRecipient: {},       // number -> messages today
       recent: {},             // hash(number+text) -> timestamp (24h duplicate guard)
       batchSent: 0, batchTarget: 0,
@@ -54,36 +49,16 @@ export class SendGuard {
     const k = this.dayKey();
     if (this.s.day !== k) { this.s.day = k; this.s.sentToday = 0; this.s.perRecipient = {}; }
     const t = this.now();
-    this.s.sentTimes = this.s.sentTimes.filter((x) => t - x < HOUR);
     for (const h of Object.keys(this.s.recent)) if (t - this.s.recent[h] > DAY) delete this.s.recent[h];
   }
 
   // ───────── limits ─────────
-  /** Today's real cap: min(server ceiling, the school's own limit, warm-up allowance). */
-  effectiveDaily() {
-    let lim = this.o.dailyLimit;
-    if (this.s.userDailyLimit) lim = Math.min(lim, Math.max(1, this.s.userDailyLimit));
-    const w = this.warmupDay();
-    if (w !== null) {
-      const step = Math.ceil(Math.max(0, this.o.dailyLimit - this.o.warmupStart) / Math.max(1, this.o.warmupDays));
-      lim = Math.min(lim, this.o.warmupStart + w * step);
-    }
-    return lim;
-  }
-  effectiveHourly() {
-    return Math.min(this.o.hourlyLimit, Math.max(5, Math.ceil(this.effectiveDaily() / 4)));
-  }
-  /** 0-based day of the warm-up period, or null when the number is no longer (or never was) warming up. */
-  warmupDay() {
-    if (!this.s.linkedAt) return null;
-    const d = Math.floor((this.now() - this.s.linkedAt) / DAY);
-    return d < this.o.warmupDays ? d : null;
-  }
+  /** Today's cap: the school's own limit from Settings, or null when it has not set one (= unlimited). */
+  effectiveDaily() { return this.s.userDailyLimit || null; }
   setUserLimit(n) {
     const v = Math.floor(Number(n));
-    this.s.userDailyLimit = Number.isFinite(v) && v > 0 ? Math.min(v, this.o.dailyLimit) : null;
+    this.s.userDailyLimit = Number.isFinite(v) && v > 0 ? v : null;
   }
-  markLinked() { if (!this.s.linkedAt) this.s.linkedAt = this.now(); }
 
   newBatchTarget() {
     const b = this.o.batchSize;
@@ -96,11 +71,8 @@ export class SendGuard {
     this.rollDay();
     const t = this.now();
     if (this.s.pauseUntil > t) return { ok: false, waitMs: this.s.pauseUntil - t, reason: this.s.pauseReason || 'cooldown' };
-    if (this.s.sentToday >= this.effectiveDaily()) return { ok: false, waitMs: 10 * MIN, reason: 'daily_limit' };
-    if (this.s.sentTimes.length >= this.effectiveHourly()) {
-      const wait = this.s.sentTimes[0] + HOUR - t + this.rand(5_000, 60_000);
-      return { ok: false, waitMs: Math.max(wait, 5_000), reason: 'hourly_limit' };
-    }
+    const daily = this.effectiveDaily();
+    if (daily && this.s.sentToday >= daily) return { ok: false, waitMs: 10 * MIN, reason: 'daily_limit' };
     return { ok: true };
   }
 
@@ -116,7 +88,6 @@ export class SendGuard {
     this.rollDay();
     const t = this.now();
     this.s.sentToday++;
-    this.s.sentTimes.push(t);
     this.s.perRecipient[to] = (this.s.perRecipient[to] || 0) + 1;
     this.s.recent[hash(to, text)] = t;
     this.s.fails = 0;
@@ -141,9 +112,7 @@ export class SendGuard {
     if (!queued) return 0;
     const per = (minDelay + maxDelay) / 2 + 3000;
     const rests = Math.floor(queued / Math.max(1, this.o.batchSize)) * ((this.o.batchPauseMin + this.o.batchPauseMax) / 2);
-    const hourly = this.effectiveHourly();
-    const hourWaits = Math.floor(queued / hourly) * HOUR * 0.5;
-    return Math.ceil((queued * per + rests + hourWaits) / MIN);
+    return Math.ceil((queued * per + rests) / MIN);
   }
 
   snapshot() {
@@ -151,12 +120,8 @@ export class SendGuard {
     const t = this.now();
     return {
       sentToday: this.s.sentToday,
-      sentThisHour: this.s.sentTimes.length,
-      dailyLimit: this.effectiveDaily(),
-      userDailyLimit: this.s.userDailyLimit,
-      maxDailyLimit: this.o.dailyLimit,
-      hourlyLimit: this.effectiveHourly(),
-      warmupDay: this.warmupDay(),
+      dailyLimit: this.effectiveDaily(),   // null = no daily limit
+      perRecipientDaily: this.o.perRecipientDaily,
       pausedReason: this.s.pauseUntil > t ? this.s.pauseReason : null,
       pausedForMs: this.s.pauseUntil > t ? this.s.pauseUntil - t : 0,
     };

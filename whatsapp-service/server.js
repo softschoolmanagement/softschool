@@ -2,8 +2,8 @@
 // Only the Spring Boot backend talks to this service (shared API key, bind to localhost).
 //
 // Ban protection (see safety.js): every school number has its own queue that drains slowly and
-// "like a person" — random gaps, typing time, rests between batches, hourly/daily caps,
-// a slow warm-up for newly linked numbers, per-parent and duplicate limits, and a pause after errors.
+// "like a person" — random gaps, typing time, rests between batches, the school's own daily limit,
+// a per-parent daily limit, a duplicate-text guard, and a pause after repeated errors.
 // A single message is sent immediately. Bulk requests (2+ messages) and messages that follow another one
 // within a short time ("in a row") wait in the queue (saved to disk, so a restart does not lose them) and
 // are delivered a little late instead. There is no time-of-day restriction.
@@ -38,15 +38,11 @@ const cfg = {
   maxText: num(process.env.MAX_TEXT_LENGTH, 1500),   // very long messages look like spam
   apiPerMinute: num(process.env.API_RATE_PER_MIN, 1500), // generous: generating vouchers for a whole school makes one call per student
   guard: {
-    dailyLimit: num(process.env.DAILY_LIMIT, 250),
-    hourlyLimit: num(process.env.HOURLY_LIMIT, 40),
     batchSize: num(process.env.BATCH_SIZE, 15),
     batchPauseMin: num(process.env.BATCH_PAUSE_MIN_MS, 3 * MIN),
     batchPauseMax: num(process.env.BATCH_PAUSE_MAX_MS, 7 * MIN),
-    perRecipientDaily: num(process.env.PER_RECIPIENT_DAILY, 3),
+    perRecipientDaily: num(process.env.PER_RECIPIENT_DAILY, 4),
     tz: process.env.SEND_TZ || 'Asia/Karachi',
-    warmupDays: num(process.env.WARMUP_DAYS, 7),
-    warmupStart: num(process.env.WARMUP_START, 30),
   },
 };
 if (!cfg.apiKey || cfg.apiKey === 'change-me') {
@@ -203,9 +199,7 @@ class Session {
         this.state = 'connected';
         this.qr = null; this.pairingCode = null; this.pairPhone = null; this.retries = 0;
         this.me = (sock.user?.id || '').split(':')[0].split('@')[0] || null;
-        // A number linked just now is "new" to WhatsApp: start slowly (warm-up). Numbers that were already
-        // linked before this version are left alone so upgrading never throttles an established school.
-        if (this.freshLink) { this.guard.markLinked(); this.freshLink = false; this.persistSoon(); }
+        this.freshLink = false;
         log.info({ school: this.schoolId, me: this.me }, 'WhatsApp connected');
         this.pump();
       }
@@ -255,7 +249,7 @@ class Session {
       pairingCode: this.pairingCode,
       queued: this.queue.length,
       etaMinutes: this.guard.etaMinutes(this.queue.length, cfg.minDelay, cfg.maxDelay),
-      waiting: busy ? (g.pausedReason || this.waitReason) : null, // why the queue is idle: cooldown | hourly_limit | ...
+      waiting: busy ? (g.pausedReason || this.waitReason) : null, // why the queue is idle: cooldown | daily_limit | errors | ...
       ...g,
     };
   }
@@ -293,7 +287,7 @@ class Session {
   }
 
   /**
-   * Entry point for /send. Single message -> delivered right now (still typing-delay + all caps).
+   * Entry point for /send. Single message -> delivered right now (still typing-delay + the daily / per-parent limits).
    * Bulk / in a row / guard says wait -> goes to the queue and is delivered at a safe pace.
    */
   async submit(items, country, bulk = false) {
@@ -333,7 +327,7 @@ class Session {
     }
   }
 
-  /** Re-checks the limits later (rest, hourly cap ...) and carries on by itself. */
+  /** Re-checks the limits later (rest, daily limit ...) and carries on by itself. */
   wakeIn(ms, reason) {
     this.waitReason = reason;
     clearTimeout(this.wakeTimer);
@@ -473,8 +467,8 @@ app.post('/sessions/:schoolId/logout', async (req, res) => {
   res.json({ ok: true });
 });
 
-// The school's own daily sending limit from Settings. It can only LOWER the server ceiling.
-// body: { dailyLimit: 150 }   (null / 0 = use the server default)
+// The school's own daily sending limit from Settings. 0 / null = no daily limit.
+// body: { dailyLimit: 150 }   (null / 0 = no daily limit)
 app.put('/sessions/:schoolId/limits', (req, res) => {
   const s = getSession(req.params.schoolId, true);
   if (!s) return res.status(400).json({ error: 'bad schoolId' });
