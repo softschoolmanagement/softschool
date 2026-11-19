@@ -241,7 +241,7 @@ public class WhatsAppService {
                     msgs.add(Map.of("to", phone, "text", text));
                     pend.add(new Pending(key, "ABSENT", st.getRegNo(), phone));
                 }
-                log.info("WhatsApp absent alerts for {}: absent today={}, to send={}, already sent earlier={}, no phone number={}, marked for another date={} (today is {})",
+                log.info("WhatsApp absent alerts for {}: absent today={}, to send={}, already sent earlier={}, no valid WhatsApp number={}, marked for another date={} (today is {})",
                         schoolId, absent, msgs.size(), logged, noNumber, notToday, today);
                 // one absent student = one request (sent immediately); a whole class = one bulk request (queued, paced)
                 if (!msgs.isEmpty()) sendBatch(schoolId, msgs, pend);
@@ -416,8 +416,8 @@ public class WhatsAppService {
             String sec = st.getSection() == null ? "" : st.getSection().trim();
             if (!sec.isEmpty()) sections.add(sec);
             if (notBlank(section) && !section.trim().equalsIgnoreCase(sec)) continue;
-            String shown = null;
-            for (String p : new String[]{st.getPhone1(), st.getPhone2()}) if (shown == null && digits(p) != null) shown = p.trim();
+            // WhatsApp number only (phone2). A blank, wrong or placeholder number shows as "no number" and can't be selected.
+            String shown = digits(st.getPhone2()) != null ? st.getPhone2().trim() : null;
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("regNo", st.getRegNo());
             row.put("name", st.getFullName() == null ? "" : st.getFullName());
@@ -461,14 +461,18 @@ public class WhatsAppService {
         boolean onlyUnpaid = Boolean.TRUE.equals(in.get("onlyUnpaid"));
         int days = in.get("days") instanceof Number n ? Math.max(1, Math.min(n.intValue(), 90)) : 30;
 
-        int noPhone = 0, already = 0, noRecords = 0, noVoucher = 0, alreadyPaid = 0;
+        int noPhone = 0, invalidNumber = 0, already = 0, noRecords = 0, noVoucher = 0, alreadyPaid = 0;
         List<Map<String, String>> msgs = new ArrayList<>();
         List<Pending> pend = new ArrayList<>();
         for (String regNo : regNos) {
             Student st = studentRepository.findByRegNoAndSchoolId(regNo, schoolId).orElse(null);
             if (st == null) continue;
-            String phone = phoneOf(st);
-            if (phone == null) { noPhone++; continue; }
+            String phone = phoneOf(st);   // WhatsApp number (phone2) only
+            if (phone == null) {
+                // skipped, never messaged: either no WhatsApp number at all, or a wrong / placeholder one
+                if (notBlank(st.getPhone2())) invalidNumber++; else noPhone++;
+                continue;
+            }
             String key, label, body;
             if ("fee".equals(kind)) {
                 Finance f = financeRepository.findByRegNoAndMonthKeyAndRecordTypeAndSchoolId(
@@ -517,6 +521,7 @@ public class WhatsAppService {
         out.put("gatewayOk", res.gatewayOk());
         if (res.reason() != null) out.put("reason", res.reason());
         out.put("noPhone", noPhone);
+        out.put("invalidNumber", invalidNumber);
         out.put("alreadySent", already);
         out.put("skipped", skipped);
         out.put("etaMinutes", Math.max(1, (int) Math.ceil(res.accepted() * 11 / 60.0)));
@@ -533,16 +538,20 @@ public class WhatsAppService {
         } catch (Exception ignored) { /* duplicate key = already recorded */ }
     }
 
+    /**
+     * The number every WhatsApp message goes to: the student's WhatsApp number (stored in phone2) and
+     * nothing else. The primary phone (phone1) is never messaged, not even as a fallback. If the
+     * WhatsApp number is empty, wrong or a placeholder (11111, 0300-0000000, 03001234567 ...) the
+     * student is skipped and no message is sent.
+     */
     private String phoneOf(Student st) {
-        if (st == null) return null;
-        for (String p : new String[]{st.getPhone1(), st.getPhone2()}) {
-            String d = digits(p);
-            if (d != null) return d;
-        }
-        return null;
+        return st == null ? null : digits(st.getPhone2());
     }
 
-    /** Local 03xx.. numbers become international (92 + ...); anything that is not a plausible phone is dropped. */
+    /**
+     * Local 03xx.. numbers become international (92 + ...). Returns null for anything that is not a
+     * real, plausible phone number: empty, too short/long, or a placeholder / default value.
+     */
     String digits(String raw) {
         if (raw == null) return null;
         String d = raw.replaceAll("[^0-9]", "");
@@ -550,7 +559,26 @@ public class WhatsAppService {
         if (d.startsWith("00")) d = d.substring(2);
         else if (d.startsWith("0")) d = countryCode + d.substring(1);
         else if (!d.startsWith(countryCode) && d.length() <= 10) d = countryCode + d;
-        return d.length() >= 10 && d.length() <= 15 ? d : null;
+        if (d.length() < 10 || d.length() > 15) return null;
+        return looksFake(d) ? null : d;
+    }
+
+    /**
+     * True for numbers nobody really owns: "11111", 0300-0000000, 03111111111, 03001234567,
+     * 03009876543 ... Also, for Pakistan (92), anything that is not a mobile number (3XX XXXXXXX),
+     * because WhatsApp cannot be registered on a landline.
+     */
+    boolean looksFake(String intl) {
+        String n = intl.startsWith(countryCode) ? intl.substring(countryCode.length()) : intl;
+        // Pakistan: national part must be a 10-digit mobile starting with 3
+        if ("92".equals(countryCode) && intl.startsWith("92") && !n.matches("3\\d{9}")) return true;
+        // only one or two different digits in the whole number (0000000000, 3111111111, 3030303030)
+        if (n.chars().distinct().count() <= 2) return true;
+        String tail = n.length() > 7 ? n.substring(n.length() - 7) : n;
+        // last 7 digits all the same (0300-1111111)
+        if (tail.chars().distinct().count() == 1) return true;
+        // last 7 digits are a straight run up or down (0300-1234567, 0300-7654321)
+        return "01234567890123456789".contains(tail) || "98765432109876543210".contains(tail);
     }
 
     private String render(String tpl, String fallback, Student st, String school, Map<String, String> extra) {
