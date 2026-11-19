@@ -127,17 +127,6 @@ public class WhatsAppController {
         };
     }
 
-    /** body: {"className":"5","section":"A","text":"Dear parent of {student}, ..."}  (class/section optional) */
-    @PostMapping("/broadcast")
-    public ResponseEntity<?> broadcast(HttpServletRequest r, @RequestBody Map<String, String> in) {
-        requireNotBanned(r);
-        String text = in.get("text");
-        if (text == null || text.isBlank()) return ResponseEntity.badRequest().body(Map.of("error", "text is required"));
-        String id = school(r);
-        if (!wa.config(id).isOn()) return ResponseEntity.status(409).body(Map.of("error", "Turn WhatsApp automation on first."));
-        return ResponseEntity.ok(wa.broadcast(id, in.get("className"), in.get("section"), clip(text)));
-    }
-
     /** Popup data: classes, then (for a chosen class) sections and students with parent numbers and fee balance. */
     @GetMapping("/recipients")
     public Map<String, Object> recipients(HttpServletRequest r,
@@ -148,12 +137,12 @@ public class WhatsAppController {
         return wa.recipients(school(r), className, section, monthKey);
     }
 
-    /** kind = announcement | fee | attendance. body: {regNos:[...], className, section, text, monthKey, onlyUnpaid, days} */
+    /** kind = fee | attendance. body: {regNos:[...], className, section, monthKey, onlyUnpaid, days} */
     @PostMapping("/send/{kind}")
     public ResponseEntity<?> sendToParents(HttpServletRequest r, @PathVariable String kind,
                                            @RequestBody Map<String, Object> in) {
         requireNotBanned(r);
-        if (!List.of("announcement", "fee", "attendance").contains(kind))
+        if (!List.of("fee", "attendance").contains(kind))
             return ResponseEntity.badRequest().body(Map.of("error", "Unknown message type."));
         if (!wa.isConfigured()) return ResponseEntity.status(503).body(Map.of("error", "WhatsApp service is not configured on the server."));
         String id = school(r);
@@ -162,11 +151,6 @@ public class WhatsAppController {
             return ResponseEntity.badRequest().body(Map.of("error", "Choose at least one parent."));
         if (ids.size() > WhatsAppService.MAX_PER_SEND)
             return ResponseEntity.badRequest().body(Map.of("error", "Only " + WhatsAppService.MAX_PER_SEND + " parents can be messaged at one time."));
-        if ("announcement".equals(kind)) {
-            Object t = in.get("text");
-            if (!(t instanceof String s) || s.isBlank()) return ResponseEntity.badRequest().body(Map.of("error", "text is required"));
-            in.put("text", clip(s));
-        }
         Map<String, Object> out = wa.sendToParents(id, kind, in);
         if (Boolean.FALSE.equals(out.get("gatewayOk")) && ((Number) out.get("queued")).intValue() == 0)
             return ResponseEntity.status(409).body(Map.of("error", "WhatsApp is not connected or the service is unreachable. Nothing was sent."));
