@@ -26,7 +26,7 @@ Each school links **its own number** (one Baileys session per `schoolId`). Paren
 2. Log in → **Settings → WhatsApp** → **Show QR code**.
 3. On that phone: WhatsApp → **Linked devices → Link a device** → scan. (No camera access? Enter the number, click *Get link code*, then on the phone choose *Link with phone number instead* and type the code.)
 4. Status turns **Connected**. Tick **Turn automation ON**, choose *absent* and/or *fee receipt*, edit the message text, **Save**, then **Send test** to your own number.
-5. Make sure each student has the parent's number in **Phone 1/Phone 2** (`03001234567` or `+923001234567` both work).
+5. Make sure each student has the parent's **WhatsApp Number** filled in (Students → WhatsApp Number, e.g. `03XX-XXXXXXX` or `+92 3XX XXXXXXX`). Messages go to this number only, never to the primary phone. Empty, wrong or placeholder numbers (like `11111`, `0300-0000000`, `0300-1234567`) are skipped automatically.
 6. Keep that phone charged and online (opens WhatsApp at least once every ~2 weeks, or WhatsApp unlinks it).
 
 After that: marking a student **absent** (by teacher, admin or biometric save) messages the parent once per day; recording a fee payment sends a receipt; *Send a message to parents now* broadcasts announcements/fee reminders to a class or everyone.
