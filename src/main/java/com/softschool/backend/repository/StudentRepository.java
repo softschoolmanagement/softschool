@@ -126,4 +126,20 @@ public interface StudentRepository extends JpaRepository<Student, Long> {
             "where s.schoolId = :schoolId " +
             "and (s.status is null or s.status = 'active')")
     long countActiveBySchoolId(@Param("schoolId") String schoolId);
+
+    // ── Auto-sibling linking (SiblingLinkService) ────────────────────────
+    // Active students of a school whose father CNIC equals :cnicDigits once
+    // dashes/spaces are stripped (CNICs are stored as typed, e.g. 12345-1234567-1).
+    @Query("select s from Student s where s.schoolId = :schoolId and s.id <> :id " +
+           "and (s.status is null or lower(s.status) = 'active') " +
+           "and s.fatherCnic is not null " +
+           "and replace(replace(s.fatherCnic, '-', ''), ' ', '') = :cnicDigits")
+    List<Student> findActiveByFatherCnicDigits(@Param("schoolId") String schoolId,
+                                               @Param("id") Long id,
+                                               @Param("cnicDigits") String cnicDigits);
+
+    List<Student> findBySchoolIdAndSiblingGroupId(String schoolId, String siblingGroupId);
+
+    @Query("select s.siblingGroupId from Student s where s.schoolId = :schoolId and s.siblingGroupId is not null")
+    List<String> findSiblingGroupIdsBySchoolId(@Param("schoolId") String schoolId);
 }
