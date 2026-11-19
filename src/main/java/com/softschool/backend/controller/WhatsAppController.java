@@ -52,7 +52,6 @@ public class WhatsAppController {
             out.put("dailyCap", l.intValue());
             out.put("remainingToday", Math.max(0, l.intValue() - s.intValue() - q));
         }
-        out.put("warmup", out.get("warmupDay") != null);
         out.put("quietNow", false);
         out.put("maxPerSend", WhatsAppService.MAX_PER_SEND);
         return out;
@@ -120,7 +119,7 @@ public class WhatsAppController {
     private static String friendly(String reason) {
         return switch (reason) {
             case "duplicate" -> "the same text was already sent to this number in the last 24 hours.";
-            case "recipient_cap" -> "this number already received the maximum messages for today.";
+            case "recipient_cap" -> "this parent number already received the maximum of 4 messages today.";
             case "number not on WhatsApp" -> "this number is not on WhatsApp.";
             case "invalid number" -> "the phone number is not valid.";
             case "send failed" -> "WhatsApp rejected the send, try again shortly.";
