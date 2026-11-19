@@ -94,6 +94,11 @@ public class School {
     @Column(name = "locks", columnDefinition = "TEXT")
     private String locks;
 
+    // Super-admin switch: when true THIS school is banned from the WhatsApp messaging feature,
+    // regardless of its plan. (The plan can also ban it for all of its schools: Plan.whatsappBanned.)
+    // null (never set / older rows) is treated as false.
+    private Boolean whatsappBanned;
+
     private LocalDate registeredAt;
     
     private LocalDate expiryDate;
