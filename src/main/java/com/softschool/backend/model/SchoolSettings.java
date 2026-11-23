@@ -52,6 +52,9 @@ public class SchoolSettings {
     private String  lateFeeType = "fixed";   // "fixed" | "percent"
     private Double  lateFeeAmount = 200.0;
     private Integer lateFeeGrace = 0;
+    // Repeating fine: add lateFeeAmount again every lateFeeIntervalDays after the first fine
+    private Boolean lateFeeRepeatEnabled = false;
+    private Integer lateFeeIntervalDays = 1;
 
     // ── Global Pay Variables ─────────────────────
     private String  payPenaltyType = "percent"; // "percent" | "fixed"
@@ -260,6 +263,22 @@ public class SchoolSettings {
 
     public void setLateFeeAmount(Double lateFeeAmount) {
         this.lateFeeAmount = lateFeeAmount;
+    }
+
+    public Boolean getLateFeeRepeatEnabled() {
+        return lateFeeRepeatEnabled;
+    }
+
+    public void setLateFeeRepeatEnabled(Boolean lateFeeRepeatEnabled) {
+        this.lateFeeRepeatEnabled = lateFeeRepeatEnabled;
+    }
+
+    public Integer getLateFeeIntervalDays() {
+        return lateFeeIntervalDays;
+    }
+
+    public void setLateFeeIntervalDays(Integer lateFeeIntervalDays) {
+        this.lateFeeIntervalDays = lateFeeIntervalDays;
     }
 
     public Integer getLateFeeGrace() {
