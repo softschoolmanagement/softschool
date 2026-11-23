@@ -266,6 +266,8 @@ public class ParentPortalController {
         boolean lateOn = ss != null && !Boolean.FALSE.equals(ss.getLateFeeEnabled());
         boolean percent = ss != null && "percent".equalsIgnoreCase(ss.getLateFeeType());
         double lateAmount = ss == null || ss.getLateFeeAmount() == null ? 0.0 : ss.getLateFeeAmount();
+        boolean repeatOn = ss != null && Boolean.TRUE.equals(ss.getLateFeeRepeatEnabled());
+        int intervalDays = ss == null || ss.getLateFeeIntervalDays() == null ? 1 : Math.max(1, ss.getLateFeeIntervalDays());
 
         List<Finance> rows = new ArrayList<>();
         for (Finance f : financeRepository.findBySchoolIdAndRegNo(schoolId, regNo)) {
@@ -285,6 +287,15 @@ public class ParentPortalController {
             double remaining = f.getRemainingBalance() == null ? Math.max(0.0, net - paid) : f.getRemainingBalance();
             boolean isPaid = remaining <= 0.01;
             double late = (!isPaid && lateOn) ? (percent ? net * lateAmount / 100.0 : lateAmount) : 0.0;
+            if (late > 0 && repeatOn) {
+                // Repeating late fine: same rule as the admin voucher (first fine the day after
+                // deadline+grace, then added again every `intervalDays`, stops at end of due month).
+                YearMonth dueMonth = ym.plusMonths(1);
+                LocalDate graceEnd = dueMonth.atDay(Math.min(Math.max(deadlineDay, 1) + grace, dueMonth.lengthOfMonth()));
+                LocalDate effNow = today.isAfter(dueMonth.atEndOfMonth()) ? dueMonth.atEndOfMonth() : today;
+                long daysLate = ChronoUnit.DAYS.between(graceEnd, effNow);
+                if (daysLate >= 1) late = late * (1 + (daysLate - 1) / intervalDays);
+            }
 
             String status = isPaid ? "paid" : (today.isAfter(due.plusDays(grace)) ? "overdue" : "due");
             if (!isPaid) outstanding += remaining;

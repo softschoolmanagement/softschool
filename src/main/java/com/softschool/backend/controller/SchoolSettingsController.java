@@ -137,6 +137,8 @@ public class SchoolSettingsController {
         settings.setLateFeeType(incoming.getLateFeeType());
         settings.setLateFeeAmount(incoming.getLateFeeAmount());
         settings.setLateFeeGrace(incoming.getLateFeeGrace());
+        if (incoming.getLateFeeRepeatEnabled() != null) settings.setLateFeeRepeatEnabled(incoming.getLateFeeRepeatEnabled());
+        if (incoming.getLateFeeIntervalDays() != null && incoming.getLateFeeIntervalDays() > 0) settings.setLateFeeIntervalDays(incoming.getLateFeeIntervalDays());
 
         // Pay variables
         settings.setPayPenaltyType(incoming.getPayPenaltyType());
