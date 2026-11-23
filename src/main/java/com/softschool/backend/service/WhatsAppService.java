@@ -30,8 +30,11 @@ import java.time.ZoneId;
 import java.time.temporal.ChronoUnit;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -58,11 +61,32 @@ public class WhatsAppService {
     @Autowired private PlanEnforcementService planEnforcement;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    private final ExecutorService pool = Executors.newFixedThreadPool(2, r -> {
-        Thread t = new Thread(r, "whatsapp-notify");
-        t.setDaemon(true);
-        return t;
-    });
+    /**
+     * One background worker PER SCHOOL. Before, a single shared pool of 2 threads served every school, so one
+     * school's slow step (waiting for its fee ledger, a slow or hung gateway call for its number) made the
+     * other schools' absent / voucher messages wait behind it. Now each school's jobs run one after another
+     * on that school's own thread, and a school that is stuck or busy never delays another school.
+     * Idle workers shut down by themselves after a minute, so thousands of schools cost nothing.
+     */
+    private final Map<String, ExecutorService> schoolPools = new ConcurrentHashMap<>();
+
+    private ExecutorService poolFor(String schoolId) {
+        return schoolPools.computeIfAbsent(schoolId, id -> {
+            ThreadPoolExecutor ex = new ThreadPoolExecutor(1, 1, 60L, TimeUnit.SECONDS, new LinkedBlockingQueue<>(), r -> {
+                Thread t = new Thread(r, "whatsapp-notify-" + id);
+                t.setDaemon(true);
+                return t;
+            });
+            ex.allowCoreThreadTimeOut(true);
+            return ex;
+        });
+    }
+
+    /** Runs a job on this school's own worker (same order as submitted, never blocked by another school). */
+    private void submitFor(String schoolId, Runnable job) {
+        poolFor(schoolId == null ? "_none" : schoolId).submit(job);
+    }
+
     private volatile RestClient client;
 
     private RestClient http() {
@@ -88,7 +112,7 @@ public class WhatsAppService {
     /** Unlinks the school's WhatsApp number in the background (used when a ban is switched on). Never throws. */
     public void disconnectQuietly(String schoolId) {
         if (!isConfigured() || schoolId == null) return;
-        pool.submit(() -> {
+        submitFor(schoolId, () -> {
             try { logout(schoolId); }
             catch (Exception ignored) { /* nothing was linked, or the gateway is down */ }
         });
@@ -152,12 +176,19 @@ public class WhatsAppService {
      */
     @SuppressWarnings("unchecked")
     public List<Map<String, Object>> sendRaw(String schoolId, List<Map<String, String>> messages) {
+        return sendRaw(schoolId, messages, false);
+    }
+
+    /** bulk = true tells the gateway to always queue (never send instantly), so the message is paced like the rest of a big run. */
+    @SuppressWarnings("unchecked")
+    public List<Map<String, Object>> sendRaw(String schoolId, List<Map<String, String>> messages, boolean bulk) {
         if (!isConfigured() || messages.isEmpty()) return null;
         if (isBanned(schoolId)) return null;          // banned by the super admin: nothing leaves, whatever called us
         try {
             Map<String, Object> body = new HashMap<>();
             body.put("messages", messages);
             body.put("country", countryCode);
+            if (bulk) body.put("bulk", true);
             WhatsAppConfig cfg = configRepo.findBySchoolId(schoolId).orElse(null);
             if (cfg != null && cfg.getDailyLimit() != null) body.put("dailyLimit", cfg.getDailyLimit());
             Map<String, Object> res = http().post().uri("/sessions/{id}/send", schoolId)
@@ -193,7 +224,7 @@ public class WhatsAppService {
         String reason = null;
         for (int i = 0; i < msgs.size(); i += 500) {
             int end = Math.min(msgs.size(), i + 500);
-            List<Map<String, Object>> res = sendRaw(schoolId, new ArrayList<>(msgs.subList(i, end)));
+            List<Map<String, Object>> res = sendRaw(schoolId, new ArrayList<>(msgs.subList(i, end)), true);
             if (res == null) return new BatchResult(ok, bad, false, reason);   // not connected / bad key / queue full: nothing logged, retried next time
             for (int k = i; k < end && (k - i) < res.size(); k++) {
                 Map<String, Object> r = res.get(k - i);
@@ -216,7 +247,7 @@ public class WhatsAppService {
         if (!isConfigured() || schoolId == null || saved == null || saved.isEmpty()) return;
         if (isBanned(schoolId)) return;
         List<Attendance> copy = new ArrayList<>(saved);
-        pool.submit(() -> {
+        submitFor(schoolId, () -> {
             try {
                 WhatsAppConfig cfg = configRepo.findBySchoolId(schoolId).orElse(null);
                 if (cfg == null || !cfg.wantsAbsent()) return;
@@ -256,7 +287,7 @@ public class WhatsAppService {
     public void notifyVoucher(String schoolId, String regNo, String monthKey, double total, double remaining) {
         if (!isConfigured() || schoolId == null || regNo == null) return;
         if (isBanned(schoolId)) return;
-        pool.submit(() -> {
+        submitFor(schoolId, () -> {
             try {
                 WhatsAppConfig cfg = configRepo.findBySchoolId(schoolId).orElse(null);
                 if (cfg == null || !cfg.wantsVoucher()) return;
@@ -271,7 +302,8 @@ public class WhatsAppService {
                         "month", monthLabel(monthKey), "duedate", dueDate(schoolId, monthKey).format(DAY)));
                 extra.putAll(feeCodes(schoolId, st, monthKey, total, remaining));
                 String text = render(cfg.getVoucherTemplate(), WhatsAppConfig.DEFAULT_VOUCHER, st, schoolName(schoolId), extra);
-                List<Map<String, Object>> res = sendRaw(schoolId, List.of(Map.of("to", phone, "text", text)));
+                // fee generation sends one voucher per student: always go through the school's own paced queue (8-16 s random gaps)
+                List<Map<String, Object>> res = sendRaw(schoolId, List.of(Map.of("to", phone, "text", text)), true);
                 if (res != null && !res.isEmpty() && accepted(res.get(0))) {
                     record(schoolId, key, "VOUCHER", regNo, phone);
                 } else {
@@ -292,8 +324,10 @@ public class WhatsAppService {
         for (WhatsAppConfig cfg : configRepo.findAll()) {
             if (cfg == null || !cfg.wantsReminder()) continue;
             if (isBanned(cfg.getSchoolId())) continue;
-            try { remindSchool(cfg); }
-            catch (Exception e) { log.warn("fee reminder failed for {}: {}", cfg.getSchoolId(), e.getMessage()); }
+            submitFor(cfg.getSchoolId(), () -> {
+                try { remindSchool(cfg); }
+                catch (Exception e) { log.warn("fee reminder failed for {}: {}", cfg.getSchoolId(), e.getMessage()); }
+            });
         }
     }
 
@@ -524,7 +558,7 @@ public class WhatsAppService {
         out.put("invalidNumber", invalidNumber);
         out.put("alreadySent", already);
         out.put("skipped", skipped);
-        out.put("etaMinutes", Math.max(1, (int) Math.ceil(res.accepted() * 11 / 60.0)));
+        out.put("etaMinutes", Math.max(1, (int) Math.ceil(res.accepted() * 15 / 60.0)));
         out.put("quietNow", false);
         return out;
     }
