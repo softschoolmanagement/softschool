@@ -29,8 +29,9 @@ const cfg = {
   apiKey: process.env.API_KEY || '',
   sessionsDir: path.resolve(process.env.SESSIONS_DIR || './sessions'),
   cc: String(process.env.DEFAULT_COUNTRY_CODE || '92').replace(/\D/g, ''),
-  minDelay: num(process.env.MIN_DELAY_MS, 8000),    // gap between two messages from one number
-  maxDelay: num(process.env.MAX_DELAY_MS, 20000),
+  minDelay: num(process.env.MIN_DELAY_MS, 8000),    // gap between two messages from one number (random 8-16 s)
+  maxDelay: num(process.env.MAX_DELAY_MS, 16000),
+  bulkFrom: num(process.env.BULK_FROM, 10),          // this many waiting messages = "bulk": extra human-like randomness kicks in
   maxQueue: num(process.env.MAX_QUEUE, 5000),        // per school; beyond this new messages are refused (429)
   rowGapMs: num(process.env.DIRECT_ROW_GAP_MS, 30_000), // a single message within this time of the previous send counts as "in a row" -> queued
   maxAgeMs: num(process.env.MAX_QUEUE_AGE_HOURS, 72) * 60 * MIN, // a message still waiting after this is dropped (too stale to be useful)
@@ -270,22 +271,30 @@ class Session {
 
   /** Adds messages to this school's queue. Nothing is sent from here: pump() drains it at a safe pace. */
   enqueue(items, country) {
-    const out = [];
     const queuedKeys = new Set(this.queue.map((m) => m.to + '\n' + m.text));
-    for (const it of items) {
+    // A big batch (fee vouchers for a whole class, absent alerts ...) is NOT sent in roll-number order:
+    // a strictly ordered run to one class looks like a script. Shuffle it, but give every result back in
+    // the caller's original order (the backend matches results by index).
+    const order = items.map((_, i) => i);
+    if (items.length >= cfg.bulkFrom) {
+      for (let i = order.length - 1; i > 0; i--) { const j = rand(0, i); [order[i], order[j]] = [order[j], order[i]]; }
+    }
+    const results = new Array(items.length);
+    for (const idx of order) {
+      const it = items[idx];
       const to = normalizePhone(it?.to, country, true);
-      if (!to) { out.push({ to: it?.to, accepted: false, reason: 'invalid number' }); continue; }
+      if (!to) { results[idx] = { to: it?.to, accepted: false, reason: 'invalid number' }; continue; }
       const text = String(it?.text ?? '').trim().slice(0, cfg.maxText);
-      if (!text) { out.push({ to, accepted: false, reason: 'empty message' }); continue; }
+      if (!text) { results[idx] = { to, accepted: false, reason: 'empty message' }; continue; }
       const key = to + '\n' + text;
-      if (queuedKeys.has(key)) { out.push({ to, accepted: false, reason: 'duplicate already queued' }); continue; }
+      if (queuedKeys.has(key)) { results[idx] = { to, accepted: false, reason: 'duplicate already queued' }; continue; }
       queuedKeys.add(key);
       this.queue.push({ to, text, at: Date.now() });
-      out.push({ to, accepted: true });
+      results[idx] = { to, accepted: true };
     }
     this.persistSoon();
     this.pump();
-    return out;
+    return results;
   }
 
   /** True when this request may skip the queue: exactly one message, nothing waiting, not "in a row", guard happy. */
@@ -398,9 +407,17 @@ class Session {
         }
         this.persistSoon();
         if (!this.queue.length) break;
-        // Random gap between messages, with an occasional longer "got distracted" pause.
+        // Random gap between messages: always 8-16 s (MIN/MAX_DELAY_MS). For a big queue (fee vouchers for a
+        // whole school, 10+ waiting) the pattern is made less regular still, because a steady rhythm is what
+        // automation detection looks for: sometimes a quick follow-up, sometimes a longer think, and an
+        // occasional "got distracted" pause. Every school has its own loop, so none of this slows another school.
         let gap = rand(cfg.minDelay, cfg.maxDelay);
-        if (sent && Math.random() < 0.1) gap += rand(20_000, 60_000);
+        if (sent && this.queue.length >= cfg.bulkFrom) {
+          const r = Math.random();
+          if (r < 0.15) gap = cfg.minDelay + rand(0, 2000);                       // quick follow-up
+          else if (r < 0.30) gap = cfg.maxDelay - rand(0, 2000);                  // slower one
+          if (Math.random() < 0.08) gap += rand(15_000, 45_000);                  // distracted for a moment
+        } else if (sent && Math.random() < 0.1) gap += rand(20_000, 60_000);
         await sleep(gap);
       }
     } finally { this.working = false; }
