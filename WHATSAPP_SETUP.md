@@ -33,5 +33,5 @@ After that: marking a student **absent** (by teacher, admin or biometric save) m
 
 ## C. Rules that keep the number safe
 - Baileys is **unofficial** — WhatsApp can ban numbers that look like spam. Use a dedicated number, let it live a few days on WhatsApp first, ask parents to save the number, and only send useful messages.
-- The gateway already spaces messages 4–9 s apart, caps 400 per day per school, and skips numbers not on WhatsApp.
+- The gateway already spaces messages 8–16 s apart (random, per school queue), caps 400 per day per school, and skips numbers not on WhatsApp.
 - If you need guaranteed delivery at scale, the official WhatsApp Business Cloud API is the only fully safe route.
