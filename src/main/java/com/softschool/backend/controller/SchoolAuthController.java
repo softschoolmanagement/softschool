@@ -76,6 +76,8 @@ public class SchoolAuthController {
     private SchoolPublicView viewOf(School school) {
         SchoolPublicView v = new SchoolPublicView(school);
         v.whatsappBanned = planEnforcementService.isWhatsAppBanned(school);
+        v.offlineApp = Boolean.TRUE.equals(school.getOfflineApp());
+        v.databaseSupported = Boolean.TRUE.equals(school.getDatabaseSupported());
         return v;
     }
 
@@ -537,6 +539,10 @@ public class SchoolAuthController {
         public String locks;
         /** Effective WhatsApp ban: this school's own flag OR its plan's. The UI hides the feature when true. */
         public boolean whatsappBanned;
+        /** true = this school runs in OFFLINE mode on the phone (set by the super admin). */
+        public boolean offlineApp;
+        /** Offline schools only: true = records are also synced to the online database when internet returns. */
+        public boolean databaseSupported;
         public String status;
         public String registeredAt;
         public String expiryDate;
