@@ -104,4 +104,26 @@ public class School {
     private LocalDate expiryDate;
 
     private String status; // "active" | "blocked"
+
+    // ── DEPLOYMENT / BILLING (set by the super admin) ──
+    // City the school is in (shown under the school name in the super-admin list).
+    private String city;
+
+    // true  = this school runs the OFFLINE desktop app
+    // false/null = it uses the normal ONLINE app
+    private Boolean offlineApp;
+
+    // Offline schools only: whether the optional database add-on is included.
+    private Boolean databaseSupported;
+
+    // Online schools only: whether the WhatsApp automation add-on is included.
+    private Boolean whatsappAutomation;
+
+    // Price (Rs) the super admin charges THIS school in total.
+    private Long price;
+
+    // Add-on prices (Rs). Only the ones that apply to the school's deployment are used.
+    private Long offlinePrice;
+    private Long databasePrice;
+    private Long whatsappPrice;
 }
