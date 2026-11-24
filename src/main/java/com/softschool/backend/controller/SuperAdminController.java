@@ -151,6 +151,7 @@ public class SuperAdminController {
             school.setStudentLimit(req.getStudentLimit());
             school.setStaffLimit(req.getStaffLimit());
             school.setLogo(req.getLogo());
+            applyDeploymentFields(school, req);
             
             // Handle locks safely
             if (req.getLocks() != null && !req.getLocks().isEmpty()) {
@@ -214,6 +215,64 @@ public class SuperAdminController {
         public void setLocks(List<String> locks) { this.locks = locks; }
         public String getLogo() { return logo; }
         public void setLogo(String logo) { this.logo = logo; }
+
+        // ── city / offline-app / database / WhatsApp automation / prices ──
+        private String city;
+        private Boolean offlineApp;
+        private Boolean databaseSupported;
+        private Boolean whatsappAutomation;
+        private Long price;
+        private Long offlinePrice;
+        private Long databasePrice;
+        private Long whatsappPrice;
+
+        public String getCity() { return city; }
+        public void setCity(String city) { this.city = city; }
+        public Boolean getOfflineApp() { return offlineApp; }
+        public void setOfflineApp(Boolean offlineApp) { this.offlineApp = offlineApp; }
+        public Boolean getDatabaseSupported() { return databaseSupported; }
+        public void setDatabaseSupported(Boolean databaseSupported) { this.databaseSupported = databaseSupported; }
+        public Boolean getWhatsappAutomation() { return whatsappAutomation; }
+        public void setWhatsappAutomation(Boolean whatsappAutomation) { this.whatsappAutomation = whatsappAutomation; }
+        public Long getPrice() { return price; }
+        public void setPrice(Long price) { this.price = price; }
+        public Long getOfflinePrice() { return offlinePrice; }
+        public void setOfflinePrice(Long offlinePrice) { this.offlinePrice = offlinePrice; }
+        public Long getDatabasePrice() { return databasePrice; }
+        public void setDatabasePrice(Long databasePrice) { this.databasePrice = databasePrice; }
+        public Long getWhatsappPrice() { return whatsappPrice; }
+        public void setWhatsappPrice(Long whatsappPrice) { this.whatsappPrice = whatsappPrice; }
+    }
+
+    // Copies city / deployment / price fields from the request onto the school.
+    // Fields missing from the request (null) are left untouched, so older
+    // frontends that don't send them can't wipe existing values.
+    // Rules: an offline school can't have WhatsApp automation; an online school
+    // can't have the database add-on. Prices are clamped to >= 0.
+    private void applyDeploymentFields(School school, CreateSchoolRequest req) {
+        if (req.getCity() != null) {
+            String c = req.getCity().trim();
+            if (c.length() > 80) c = c.substring(0, 80);
+            school.setCity(c.isEmpty() ? null : c);
+        }
+        if (req.getOfflineApp() != null) school.setOfflineApp(req.getOfflineApp());
+        if (req.getDatabaseSupported() != null) school.setDatabaseSupported(req.getDatabaseSupported());
+        if (req.getWhatsappAutomation() != null) school.setWhatsappAutomation(req.getWhatsappAutomation());
+        if (req.getPrice() != null) school.setPrice(Math.max(0L, req.getPrice()));
+        if (req.getOfflinePrice() != null) school.setOfflinePrice(Math.max(0L, req.getOfflinePrice()));
+        if (req.getDatabasePrice() != null) school.setDatabasePrice(Math.max(0L, req.getDatabasePrice()));
+        if (req.getWhatsappPrice() != null) school.setWhatsappPrice(Math.max(0L, req.getWhatsappPrice()));
+
+        if (Boolean.TRUE.equals(school.getOfflineApp())) {
+            school.setWhatsappAutomation(false);
+            school.setWhatsappPrice(0L);
+        } else {
+            school.setDatabaseSupported(false);
+            school.setDatabasePrice(0L);
+            school.setOfflinePrice(0L);
+        }
+        if (!Boolean.TRUE.equals(school.getDatabaseSupported())) school.setDatabasePrice(0L);
+        if (!Boolean.TRUE.equals(school.getWhatsappAutomation())) school.setWhatsappPrice(0L);
     }
 
     // ... (Keep other helper methods like buildSchoolId, nextSchoolIdSuffix, etc. exactly as they were)
@@ -355,6 +414,7 @@ public ResponseEntity<?> updatePlan(@PathVariable String id, @RequestBody Plan p
             school.setPlanId(req.getPlanId());
             school.setStudentLimit(req.getStudentLimit());
             school.setStaffLimit(req.getStaffLimit());
+            applyDeploymentFields(school, req);
 
             // IMPORTANT: only touch the logo if the request actually included one.
             // The frontend omits "logo" from the JSON entirely when the user
