@@ -2,6 +2,7 @@ package com.softschool.backend.controller;
 
 import com.softschool.backend.model.SchoolSettings;
 import com.softschool.backend.model.Student;
+import com.softschool.backend.repository.SchoolRepository;
 import com.softschool.backend.repository.SchoolSettingsRepository;
 import com.softschool.backend.repository.StudentRepository;
 import com.softschool.backend.service.PlanEnforcementService;
@@ -38,12 +39,15 @@ public class SchoolSettingsController {
     private final SchoolSettingsRepository repository;
     private final StudentRepository studentRepository;
     private final PlanEnforcementService planEnforcementService;
+    private final SchoolRepository schoolRepository;
 
     @Autowired
     public SchoolSettingsController(
             SchoolSettingsRepository repository,
             StudentRepository studentRepository,
-            PlanEnforcementService planEnforcementService) {
+            PlanEnforcementService planEnforcementService,
+            SchoolRepository schoolRepository) {
+        this.schoolRepository = schoolRepository;
         this.repository = repository;
         this.studentRepository = studentRepository;
         this.planEnforcementService = planEnforcementService;
@@ -122,7 +126,20 @@ public class SchoolSettingsController {
                         : incoming.getClasses();
 
         // School info
-        settings.setSchoolName(incoming.getSchoolName());
+        // School name is optional in Settings. If it is left blank, keep the
+        // name already stored, else fall back to the name the super admin gave
+        // the school, so documents never print an empty heading.
+        String incomingName = incoming.getSchoolName() == null ? "" : incoming.getSchoolName().trim();
+        if (incomingName.isEmpty()) {
+            String existing = settings.getSchoolName();
+            if (existing != null && !existing.isBlank()) {
+                incomingName = existing;
+            } else {
+                incomingName = schoolRepository.findBySchoolId(schoolId)
+                        .map(com.softschool.backend.model.School::getName).orElse(null);
+            }
+        }
+        settings.setSchoolName(incomingName);
         settings.setSchoolAddress(incoming.getSchoolAddress());
         settings.setSchoolPhone(incoming.getSchoolPhone());
         settings.setSchoolPhoneAlt(incoming.getSchoolPhoneAlt());
