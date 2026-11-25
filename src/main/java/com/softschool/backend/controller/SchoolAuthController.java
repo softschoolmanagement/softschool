@@ -76,8 +76,6 @@ public class SchoolAuthController {
     private SchoolPublicView viewOf(School school) {
         SchoolPublicView v = new SchoolPublicView(school);
         v.whatsappBanned = planEnforcementService.isWhatsAppBanned(school);
-        v.offlineApp = Boolean.TRUE.equals(school.getOfflineApp());
-        v.databaseSupported = Boolean.TRUE.equals(school.getDatabaseSupported());
         return v;
     }
 
@@ -190,7 +188,7 @@ public class SchoolAuthController {
     }
 
     @PostMapping("/login")
-    public ResponseEntity<?> login(@RequestBody LoginRequest req) {
+    public ResponseEntity<?> login(@RequestBody LoginRequest req, jakarta.servlet.http.HttpServletRequest http) {
         String username = trim(req.getUsername());
         String password = req.getPassword();
 
@@ -218,6 +216,10 @@ public class SchoolAuthController {
         }
         if (school.getExpiryDate() != null && school.getExpiryDate().isBefore(LocalDate.now())) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body(errorBody("expired"));
+        }
+
+        if (offlineOnlyBrowser(school, http)) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(errorBody("offline_only"));
         }
 
         // Correct credentials, account in good standing - clear any failure history.
@@ -251,7 +253,7 @@ public class SchoolAuthController {
      * same 5-attempt lockout as school logins.
      */
     @PostMapping("/teacher-login")
-    public ResponseEntity<?> teacherLogin(@RequestBody Map<String, String> req) {
+    public ResponseEntity<?> teacherLogin(@RequestBody Map<String, String> req, jakarta.servlet.http.HttpServletRequest http) {
         String staffId = trim(req == null ? null : req.get("staffId"));
         String password = req == null ? null : req.get("password");
         if (staffId == null || staffId.isEmpty() || password == null || password.isEmpty()) {
@@ -277,6 +279,10 @@ public class SchoolAuthController {
             }
             if (school.getExpiryDate() != null && school.getExpiryDate().isBefore(LocalDate.now())) {
                 return ResponseEntity.status(HttpStatus.FORBIDDEN).body(errorBody("This school's subscription has expired."));
+            }
+
+            if (offlineOnlyBrowser(school, http)) {
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body(errorBody("This school works offline only."));
             }
 
             loginAttemptService.recordSuccess(lockKey);
@@ -348,7 +354,7 @@ public class SchoolAuthController {
      * (a new one issued and returned) on every successful use.
      */
     @PostMapping("/login-token")
-    public ResponseEntity<?> loginWithToken(@RequestBody TokenLoginRequest req) {
+    public ResponseEntity<?> loginWithToken(@RequestBody TokenLoginRequest req, jakarta.servlet.http.HttpServletRequest http) {
         String username = trim(req.getUsername());
         String token = req.getToken();
 
@@ -380,6 +386,10 @@ public class SchoolAuthController {
         }
         if (school.getExpiryDate() != null && school.getExpiryDate().isBefore(LocalDate.now())) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body(errorBody("expired"));
+        }
+
+        if (offlineOnlyBrowser(school, http)) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(errorBody("offline_only"));
         }
 
         String newToken = issueRememberToken(school);
@@ -419,6 +429,21 @@ public class SchoolAuthController {
     }
 
     // ── helpers ──────────────────────────────────────────────
+
+    /**
+     * Offline-only school (offlineApp = true, databaseSupported = false): its data lives on the phone and it must not
+     * use the website. Only the Android app (WebView origin localhost / capacitor://localhost) may log in.
+     */
+    private boolean offlineOnlyBrowser(School school, jakarta.servlet.http.HttpServletRequest http) {
+        if (!Boolean.TRUE.equals(school.getOfflineApp()) || Boolean.TRUE.equals(school.getDatabaseSupported())) return false;
+        String origin = http == null ? null : http.getHeader("Origin");
+        if (origin != null) {
+            String o = origin.trim().toLowerCase();
+            if (o.equals("https://localhost") || o.equals("http://localhost") || o.equals("capacitor://localhost")
+                    || o.equals("ionic://localhost")) return false;
+        }
+        return true;
+    }
 
     private String trim(String s) {
         return s == null ? null : s.trim();
@@ -539,10 +564,6 @@ public class SchoolAuthController {
         public String locks;
         /** Effective WhatsApp ban: this school's own flag OR its plan's. The UI hides the feature when true. */
         public boolean whatsappBanned;
-        /** true = this school runs in OFFLINE mode on the phone (set by the super admin). */
-        public boolean offlineApp;
-        /** Offline schools only: true = records are also synced to the online database when internet returns. */
-        public boolean databaseSupported;
         public String status;
         public String registeredAt;
         public String expiryDate;
