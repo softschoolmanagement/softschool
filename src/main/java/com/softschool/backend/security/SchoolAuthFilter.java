@@ -44,6 +44,37 @@ public class SchoolAuthFilter extends OncePerRequestFilter {
     @Autowired
     private TeacherAccessGuard teacherAccessGuard;
 
+    @Autowired
+    private com.softschool.backend.repository.SchoolRepository schoolRepository;
+
+    // school -> [blocked(1/0), offlineOnly(1/0), checkedAtMillis]; refreshed every 15 s so a block takes effect almost at once
+    private final java.util.concurrent.ConcurrentHashMap<String, long[]> schoolState = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private long[] stateOf(String schoolId) {
+        long[] st = schoolState.get(schoolId);
+        long now = System.currentTimeMillis();
+        if (st != null && now - st[2] < 15000) return st;
+        long blocked = 0, offlineOnly = 0;
+        try {
+            com.softschool.backend.model.School sc = schoolRepository.findBySchoolId(schoolId).orElse(null);
+            if (sc != null) {
+                blocked = "blocked".equalsIgnoreCase(sc.getStatus()) ? 1 : 0;
+                offlineOnly = (Boolean.TRUE.equals(sc.getOfflineApp()) && !Boolean.TRUE.equals(sc.getDatabaseSupported())) ? 1 : 0;
+            }
+        } catch (Exception e) { return st != null ? st : new long[]{0, 0, now}; }   // database trouble: do not lock anybody out
+        st = new long[]{blocked, offlineOnly, now};
+        schoolState.put(schoolId, st);
+        return st;
+    }
+
+    private static boolean fromApp(HttpServletRequest r) {
+        String o = r.getHeader("Origin");
+        if (o == null || o.isEmpty()) o = r.getHeader("Referer");
+        if (o == null || o.isEmpty()) return true;                     // no browser headers (agents, same-site GET): not treated as the website
+        o = o.trim().toLowerCase();
+        return o.startsWith("https://localhost") || o.startsWith("http://localhost") || o.startsWith("capacitor://localhost") || o.startsWith("ionic://localhost");
+    }
+
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Override
@@ -92,6 +123,15 @@ public class SchoolAuthFilter extends OncePerRequestFilter {
         }
 
         String schoolId = principal.getSchoolId();
+        long[] schoolFlags = stateOf(schoolId);
+        if (schoolFlags[0] == 1) {                                     // blocked by the super admin: every open session is cut off
+            writeError(response, HttpServletResponse.SC_FORBIDDEN, "blocked");
+            return;
+        }
+        if (schoolFlags[1] == 1 && !fromApp(request)) {                // offline-only school: the website is not allowed
+            writeError(response, HttpServletResponse.SC_FORBIDDEN, "offline_only");
+            return;
+        }
         String requestedSchoolId = request.getParameter("schoolId");
         if (requestedSchoolId != null && !schoolId.equals(requestedSchoolId.trim())) {
             writeError(response, HttpServletResponse.SC_FORBIDDEN,
