@@ -22,8 +22,8 @@ import java.util.Map;
  * (School.schoolId, e.g. "SS_77_12") — settings are no longer a single
  * global row.
  *
- *   GET   /api/settings/{schoolId}         -> load everything (School Info tab wires all fields at once)
- *   PUT   /api/settings/{schoolId}         -> "Save All" button (school info + classes + late fee + pay variables)
+ *   GET   /api/settings/{schoolId}         -> load everything (Info & Setting tab wires all fields at once)
+ *   PUT   /api/settings/{schoolId}         -> "Save All" button (school info + admission mandatory fields + classes + late fee + pay variables)
  *   PUT   /api/settings/{schoolId}/timing  -> "Save" button (Attendance Setting tab: auto-save times + daily absent notice, saved separately)
  *   GET   /api/settings/{schoolId}/classes -> just the class fee structure grid
  *   POST  /api/settings/{schoolId}/reset   -> "Reset" button (restores defaults for that school)
@@ -162,12 +162,36 @@ public class SchoolSettingsController {
         settings.setPayPenaltyValue(incoming.getPayPenaltyValue());
         settings.setPayBonus(incoming.getPayBonus());
 
+        // Admission form: which mandatory fields have been switched to optional.
+        // null = the caller did not send the field (older client) -> keep what is stored.
+        // Only known field keys are kept, so nothing arbitrary is ever persisted.
+        if (incoming.getAdmissionOptionalFields() != null) {
+            settings.setAdmissionOptionalFields(sanitizeAdmissionOptionalFields(incoming.getAdmissionOptionalFields()));
+        }
+
         // Classes (replace entire list, mirrors frontend's saveAll() rebuild)
         settings.setClasses(incomingClasses);
 
         syncExistingStudentFees(schoolId, previousFees, incomingClasses);
 
         return ResponseEntity.ok(repository.save(settings));
+    }
+
+    /** The admission-form fields whose mandatory "*" can be switched on/off (keys = input name attributes). */
+    private static final java.util.Set<String> ADMISSION_TOGGLEABLE_FIELDS = new java.util.LinkedHashSet<>(java.util.Arrays.asList(
+            "admissionDate", "studentClass", "section",
+            "fullName", "gender", "dob", "studentBform", "orphanStatus",
+            "guardianName", "guardianRole", "guardianCnic",
+            "phone1", "phone2", "permanentAddress", "mailingAddress"));
+
+    /** Keeps only known field keys, de-duplicated, as a clean comma-separated string. */
+    private String sanitizeAdmissionOptionalFields(String raw) {
+        java.util.Set<String> clean = new java.util.LinkedHashSet<>();
+        for (String part : raw.split(",")) {
+            String key = part.trim();
+            if (ADMISSION_TOGGLEABLE_FIELDS.contains(key)) clean.add(key);
+        }
+        return String.join(",", clean);
     }
 
     /**
