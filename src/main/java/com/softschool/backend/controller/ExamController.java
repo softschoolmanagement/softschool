@@ -3,6 +3,7 @@ package com.softschool.backend.controller;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.softschool.backend.exception.ExamValidationException;
 import com.softschool.backend.model.ExamDateSheetEntry;
 import com.softschool.backend.model.ExamGrading;
@@ -13,6 +14,7 @@ import com.softschool.backend.repository.ExamGradingRepository;
 import com.softschool.backend.repository.ExamPaperRepository;
 import com.softschool.backend.repository.ExamPaperResultRepository;
 import com.softschool.backend.security.SchoolSessionService;
+import com.softschool.backend.service.ExamPictureService;
 import com.softschool.backend.service.ExamValidator;
 import com.softschool.backend.service.PlanEnforcementService;
 import jakarta.servlet.http.HttpServletRequest;
@@ -21,8 +23,13 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -35,7 +42,10 @@ import java.util.stream.Collectors;
  *   GET    /api/exams/papers               list (newest first)
  *   GET    /api/exams/papers/{id}
  *   PUT    /api/exams/papers/{id}          create or update (the browser chooses the id)
- *   DELETE /api/exams/papers/{id}          also deletes the paper's results
+ *   DELETE /api/exams/papers/{id}          also deletes the paper's results and its pictures
+ *
+ *   POST   /api/exams/images               upload one picture (multipart "file") -> {path}
+ *   GET    /api/exams/images/{name}        the picture's bytes (this school's only)
  *
  *   GET    /api/exams/results/{paperId}
  *   PUT    /api/exams/results/{paperId}    save draft / publish / unpublish
@@ -71,6 +81,7 @@ public class ExamController {
     @Autowired private ExamDateSheetRepository dateSheetRepository;
     @Autowired private ExamGradingRepository gradingRepository;
     @Autowired private PlanEnforcementService planEnforcementService;
+    @Autowired private ExamPictureService pictures;
 
     private final ObjectMapper mapper = new ObjectMapper();
 
@@ -123,7 +134,6 @@ public class ExamController {
         if (sid == null) return unauthorized();
         planEnforcementService.loadActiveSchool(sid);
         ExamValidator.id(id, "paper");
-        ExamValidator.Paper d = ExamValidator.paper(body);
 
         ExamPaper p = paperRepository.findBySchoolIdAndPaperId(sid, id).orElse(null);
         if (p == null) {
@@ -134,8 +144,17 @@ public class ExamController {
             p.setSchoolId(sid);
             p.setPaperId(id);
         }
-        applyPaper(p, d);
-        return ResponseEntity.ok(paperView(paperRepository.save(p)));
+        Set<String> before = pictures.namesIn(p.getLayoutJson());
+        List<String> created = new ArrayList<>();
+        try {
+            Set<String> after = fillPaper(sid, p, body, created);
+            ExamPaper saved = paperRepository.save(p);
+            discardUnusedPictures(sid, id, before, after);
+            return ResponseEntity.ok(paperView(saved));
+        } catch (RuntimeException e) {
+            for (String path : created) pictures.deleteQuietly(sid, path);   // nothing saved -> no stray files
+            throw e;
+        }
     }
 
     @Transactional
@@ -145,9 +164,54 @@ public class ExamController {
         if (sid == null) return unauthorized();
         planEnforcementService.loadActiveSchool(sid);
         ExamValidator.id(id, "paper");
+        ExamPaper existing = paperRepository.findBySchoolIdAndPaperId(sid, id).orElse(null);
+        Set<String> names = existing == null ? Collections.<String>emptySet() : pictures.namesIn(existing.getLayoutJson());
         resultRepository.deleteBySchoolIdAndPaperId(sid, id);
         long removed = paperRepository.deleteBySchoolIdAndPaperId(sid, id);
+        if (removed > 0) discardUnusedPictures(sid, id, names, Collections.<String>emptySet());
         return removed > 0 ? ResponseEntity.noContent().build() : error(HttpStatus.NOT_FOUND, "Paper not found.");
+    }
+
+    // ---------------------------------------------------------------- pictures
+
+    /**
+     * Stores one picture of a paper as a file and returns its path. The browser uploads
+     * each new picture here when the paper is saved, then sends only the short path in
+     * the paper itself. The school is taken from the session.
+     */
+    @PostMapping("/images")
+    public ResponseEntity<?> uploadImage(@RequestParam("file") MultipartFile file, HttpServletRequest req) {
+        String sid = school(req);
+        if (sid == null) return unauthorized();
+        planEnforcementService.loadActiveSchool(sid);
+        if (file == null || file.isEmpty()) throw new ExamValidationException("Choose a picture to upload.");
+        try {
+            String path = pictures.storeBytes(sid, file.getBytes());
+            return ResponseEntity.ok(Collections.singletonMap("path", path));
+        } catch (IOException | UncheckedIOException e) {
+            return error(HttpStatus.INTERNAL_SERVER_ERROR, "Could not store the picture.");
+        }
+    }
+
+    /** A picture's bytes. The name is a random UUID and the lookup is limited to the caller's own school folder. */
+    @GetMapping("/images/{name:.+}")
+    public ResponseEntity<?> getImage(@PathVariable String name, HttpServletRequest req) {
+        String sid = school(req);
+        if (sid == null) return unauthorized();
+        ExamPictureService.Loaded img;
+        try {
+            img = pictures.read(sid, name);
+        } catch (UncheckedIOException e) {
+            return error(HttpStatus.INTERNAL_SERVER_ERROR, "Could not read the picture.");
+        }
+        if (img == null) return error(HttpStatus.NOT_FOUND, "Picture not found.");
+        return ResponseEntity.ok()
+                .header("Content-Type", img.mediaType())
+                .header("X-Content-Type-Options", "nosniff")
+                // the file behind a name never changes (a replaced picture gets a new name), so the browser may keep it
+                .header("Cache-Control", "private, max-age=31536000, immutable")
+                .header("Content-Length", String.valueOf(img.bytes().length))
+                .body(img.bytes());
     }
 
     // ---------------------------------------------------------------- results
@@ -323,7 +387,7 @@ public class ExamController {
                     ExamPaper p = new ExamPaper();
                     p.setSchoolId(sid);
                     p.setPaperId(id);
-                    applyPaper(p, ExamValidator.paper(item));
+                    fillPaper(sid, p, item, new ArrayList<>());
                     paperRepository.save(p);
                     paperIds.add(id);
                     paperCount++;
@@ -421,6 +485,48 @@ public class ExamController {
 
     // ---------------------------------------------------------------- mapping
 
+    /**
+     * Validates the paper and copies it onto the entity. The pictures and shapes are taken
+     * out of the body first, so ExamValidator sees exactly the document it always has; they
+     * are then stored as files + layout JSON. Returns every picture path the paper now uses.
+     */
+    private Set<String> fillPaper(String sid, ExamPaper p, JsonNode body, List<String> created) {
+        JsonNode forValidator = body;
+        ExamPictureService.Extracted ex = null;
+        if (body != null && body.isObject()) {
+            ObjectNode work = ((ObjectNode) body).deepCopy();
+            ex = pictures.extract(work);
+            forValidator = work;
+        }
+        ExamValidator.Paper d = ExamValidator.paper(forValidator);
+        applyPaper(p, d);
+        if (ex == null) {
+            p.setLayoutJson(null);
+            return Collections.emptySet();
+        }
+        ExamPictureService.Layout layout = pictures.build(sid, ex, d.sectionsJson);
+        created.addAll(layout.created);
+        p.setLayoutJson(layout.json);
+        return layout.names;
+    }
+
+    /** Deletes pictures a paper stopped using, unless another paper still shows them, and only once the change is committed. */
+    private void discardUnusedPictures(String sid, String paperId, Set<String> before, Set<String> after) {
+        List<String> gone = new ArrayList<>();
+        for (String path : before) {
+            if (!after.contains(path) && paperRepository.countOtherLayoutReferences(sid, paperId, path) == 0) gone.add(path);
+        }
+        if (gone.isEmpty()) return;
+        Runnable cleanup = () -> { for (String path : gone) pictures.deleteQuietly(sid, path); };
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override public void afterCommit() { cleanup.run(); }
+            });
+        } else {
+            cleanup.run();
+        }
+    }
+
     private void applyPaper(ExamPaper p, ExamValidator.Paper d) {
         p.setTitle(d.title);
         p.setTerm(d.term);
@@ -470,7 +576,8 @@ public class ExamController {
         m.put("instr", nz(p.getInstructions()));
         m.put("total", tidy(p.getTotalMarks()));
         m.put("at", p.getUpdatedAt().toEpochMilli());
-        m.put("sections", json(p.getSectionsJson()));
+        m.put("sections", pictures.attach(json(p.getSectionsJson()), p.getLayoutJson()));
+        m.put("items", pictures.items(p.getLayoutJson()));
         return m;
     }
 
