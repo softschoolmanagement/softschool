@@ -13,6 +13,10 @@ import java.time.Instant;
  * one validated JSON document in {@code sectionsJson}; nothing ever queries
  * inside it, so a column per question would only add joins.
  *
+ * Pictures and shapes placed on the paper are NOT in the database as image data.
+ * Each picture is a file in the exam-images folder (see ExamPictureService) and
+ * {@code layoutJson} holds only their small description: paths, positions, sizes.
+ *
  * {@code paperId} is the id the browser uses (e.g. "xlq3k9a1b2"), unique per
  * school. Every query is scoped by schoolId, like Student/Staff/Finance.
  */
@@ -65,6 +69,10 @@ public class ExamPaper {
 
     @Column(name = "sections_json", nullable = false, columnDefinition = "LONGTEXT")
     private String sectionsJson;
+
+    // Pictures/shapes on the paper: paths + numbers only (a few KB). Null = none.
+    @Column(name = "layout_json", columnDefinition = "MEDIUMTEXT")
+    private String layoutJson;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
