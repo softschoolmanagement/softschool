@@ -40,7 +40,7 @@ import java.util.stream.Stream;
  *
  * What goes into {@code ExamPaper.layoutJson} (small: paths and numbers only):
  *   {"v":1,
- *    "qimgs":[{"s":0,"q":2,"p":"exam-images/....jpg"}],     picture printed under a question
+ *    "qimgs":[{"s":0,"q":2,"p":"exam-images/....jpg","w":60}], pictures under a question, in order (w optional)
  *    "items":[{"id":..,"type":"image|rect|ellipse|triangle|hline|vline","x":..,"y":..,"w":..,"h":..,
  *              "fill":..,"stroke":..,"sw":..,"op":..,"behind":..,"ar":..,"src":"exam-images/....png"}]}
  *
@@ -56,7 +56,8 @@ public class ExamPictureService {
 
     public static final int MAX_IMAGE_BYTES = 3 * 1024 * 1024;
     private static final int MAX_ITEMS = 40;
-    private static final int MAX_QUESTION_PICTURES = 100;
+    private static final int MAX_QUESTION_PICTURES = 200;
+    private static final int MAX_PICTURES_PER_QUESTION = 8;
     private static final int MAX_FILES_PER_SCHOOL = 5000;
     private static final String PREFIX = "exam-images/";
     private static final String UUID_RE = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -97,7 +98,8 @@ public class ExamPictureService {
     private static final class Pic {
         final int flat;
         final String value;
-        Pic(int flat, String value) { this.flat = flat; this.value = value; }
+        final int width;                       // % chosen on the paper, 0 = automatic
+        Pic(int flat, String value, int width) { this.flat = flat; this.value = value; this.width = width; }
     }
 
     /** The layout to store, the paths it uses and the files this call newly wrote. */
@@ -126,8 +128,9 @@ public class ExamPictureService {
                     if (!q.isObject()) continue;
                     ObjectNode qo = (ObjectNode) q;
                     JsonNode img = qo.remove("img");
+                    JsonNode imgs = qo.remove("imgs");
                     if (qo.path("text").asText("").trim().isEmpty()) continue;
-                    if (img != null && img.isTextual() && !img.asText().trim().isEmpty()) ex.pics.add(new Pic(flat, img.asText()));
+                    ex.pics.addAll(questionPics(flat, img, imgs));
                     flat++;
                 }
             }
@@ -135,6 +138,33 @@ public class ExamPictureService {
         ex.filled = flat;
         ex.items = body.remove("items");
         return ex;
+    }
+
+    /**
+     * {@code imgs: [{src, w}]} is the current shape and {@code img: "..."} the old one. A current
+     * browser sends both, with img equal to the first of imgs. If they disagree, the paper was
+     * edited by an older page that only knows img, so img wins.
+     */
+    private static List<Pic> questionPics(int flat, JsonNode img, JsonNode imgs) {
+        String single = img != null && img.isTextual() ? img.asText().trim() : null;
+        List<Pic> list = new ArrayList<>();
+        if (imgs != null && imgs.isArray()) {
+            for (JsonNode n : imgs) {
+                String src = n.path("src").asText("").trim();
+                if (src.isEmpty()) continue;
+                int w = n.path("w").asInt(0);
+                list.add(new Pic(flat, src, w <= 0 ? 0 : Math.min(100, Math.max(20, w))));
+            }
+            if (single == null || (!list.isEmpty() && list.get(0).value.equals(single))) {
+                if (list.size() > MAX_PICTURES_PER_QUESTION) {
+                    throw new ExamValidationException("A question can have at most " + MAX_PICTURES_PER_QUESTION + " pictures.");
+                }
+                return list;
+            }
+            list.clear();
+        }
+        if (single != null && !single.isEmpty()) list.add(new Pic(flat, single, 0));
+        return list;
     }
 
     /**
@@ -174,6 +204,7 @@ public class ExamPictureService {
                 o.put("s", c[0]);
                 o.put("q", c[1]);
                 o.put("p", path);
+                if (pic.width > 0) o.put("w", pic.width);
                 names.add(path);
             }
             ArrayNode ia = root.putArray("items");
@@ -245,7 +276,7 @@ public class ExamPictureService {
 
     // ------------------------------------------------------------------ layout -> what the browser gets
 
-    /** Puts each question's picture path back into the sections the browser expects. */
+    /** Puts each question's pictures back into the sections the browser expects (img = the first one). */
     public JsonNode attach(JsonNode sections, String layoutJson) {
         JsonNode qa = parse(layoutJson).path("qimgs");
         if (!qa.isArray() || sections == null || !sections.isArray()) return sections;
@@ -255,7 +286,15 @@ public class ExamPictureService {
             if (s < 0 || q < 0 || p.isEmpty()) continue;
             JsonNode sec = sections.get(s);
             JsonNode qn = sec == null ? null : sec.path("questions").get(q);
-            if (qn instanceof ObjectNode) ((ObjectNode) qn).put("img", p);
+            if (!(qn instanceof ObjectNode)) continue;
+            ObjectNode qo = (ObjectNode) qn;
+            if (!qo.has("imgs")) {
+                qo.put("img", p);
+                qo.putArray("imgs");
+            }
+            ObjectNode pic = ((ArrayNode) qo.get("imgs")).addObject();
+            pic.put("src", p);
+            pic.put("w", e.path("w").asInt(0));
         }
         return sections;
     }
