@@ -14,6 +14,7 @@ import java.util.List;
  *   - Late fee rules
  *   - Global pay variables (leave penalty / bonus)
  *   - Attendance auto-save timings
+ *   - Admission form mandatory-field switches (which fields show the red "*")
  *
  * Deleted automatically (via SchoolSettingsRepository.deleteBySchoolId)
  * whenever the parent School is permanently deleted in SuperAdminController.
@@ -77,6 +78,15 @@ public class SchoolSettings {
     // Off by default. When on, every time student attendance is saved for today,
     // the parent of each absent student gets one notice in the School Office chat.
     private Boolean dailyAbsentNotify = false;
+
+    // ── Admission Form: mandatory-field switches ─────────────────────────
+    // Comma-separated keys of the admission-form fields whose red "*" has been
+    // switched OFF in Settings -> Info & Setting (e.g. "phone2,mailingAddress,gender").
+    // Stored as the OPTIONAL list (not the required list) so that a null/empty
+    // value — every existing school, and every freshly reset school — keeps
+    // today's behaviour: ALL mandatory fields stay mandatory.
+    @Column(length = 1000)
+    private String admissionOptionalFields;
 
     // ── Class Fee Structure ──────────────────────
     @ElementCollection(fetch = FetchType.EAGER)
@@ -385,6 +395,15 @@ public class SchoolSettings {
     public void setDailyAbsentNotify(Boolean dailyAbsentNotify) {
         this.dailyAbsentNotify = dailyAbsentNotify != null && dailyAbsentNotify;
     }
+
+    public String getAdmissionOptionalFields() {
+        return admissionOptionalFields == null ? "" : admissionOptionalFields;
+    }
+
+    public void setAdmissionOptionalFields(String admissionOptionalFields) {
+        this.admissionOptionalFields = admissionOptionalFields;
+    }
+
     public List<ClassFee> getClasses() {
         return classes;
     }
