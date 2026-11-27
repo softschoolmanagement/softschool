@@ -370,11 +370,8 @@ public class SchoolAuthController {
                 && verifyPassword(token, school.getRememberTokenHash());
 
         if (!tokenOk) {
-            // Whatever is stored (expired/mismatched/reused) is no longer
-            // good for anything — clear it so it can't be retried.
-            school.setRememberTokenHash(null);
-            school.setRememberTokenExpiry(null);
-            schoolRepository.save(school);
+            // Do NOT wipe the stored token here: two app screens can ask at the same moment, and a failed
+            // attempt must not sign out a phone whose token is fine.
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(errorBody("Invalid session."));
         }
         if ("blocked".equalsIgnoreCase(school.getStatus())) {
@@ -384,7 +381,10 @@ public class SchoolAuthController {
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body(errorBody("expired"));
         }
 
-        String newToken = issueRememberToken(school);
+        // Keep the SAME token and just extend its life (30 days from every use). Changing it each time made the
+        // phone sign out when two requests used the old one together, or the app closed before saving the new one.
+        String newToken = token;
+        school.setRememberTokenExpiry(Instant.now().plus(REMEMBER_TOKEN_DAYS, ChronoUnit.DAYS));
         School saved = schoolRepository.save(school);
 
         SchoolPublicView view = viewOf(saved);
